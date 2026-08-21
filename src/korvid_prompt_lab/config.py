@@ -7,12 +7,14 @@ from typing import Any
 import yaml  # type: ignore[import-untyped]
 
 from .contracts import (
+    DEFAULT_BRIDGE_TIMEOUT_SECONDS,
     AKSPortForwardServing,
     Campaign,
     Candidate,
     EvalCase,
     ProcessServing,
     _ensure_keys,
+    _require_bridge_timeout,
     _require_mapping,
     _require_string,
     _require_unique_string_items,
@@ -82,7 +84,19 @@ def _parse_aks_serving(mapping: Mapping[str, Any]) -> AKSPortForwardServing:
 
 def load_campaign(path: Path | str) -> Campaign:
     data = _require_mapping(_load_yaml(path), "campaign")
-    _ensure_keys(data, {"schema_version", "campaign_id", "repetitions", "models", "cases", "serving"}, "campaign")
+    _ensure_keys(
+        data,
+        {
+            "schema_version",
+            "campaign_id",
+            "repetitions",
+            "bridge_timeout_seconds",
+            "models",
+            "cases",
+            "serving",
+        },
+        "campaign",
+    )
 
     if data.get("schema_version") != 1:
         raise ValueError("campaign schema_version must be 1")
@@ -90,6 +104,11 @@ def load_campaign(path: Path | str) -> Campaign:
     repetitions = data.get("repetitions")
     if not isinstance(repetitions, int) or repetitions <= 0:
         raise ValueError("campaign repetitions must be a positive integer")
+
+    bridge_timeout_seconds = _require_bridge_timeout(
+        data.get("bridge_timeout_seconds", DEFAULT_BRIDGE_TIMEOUT_SECONDS),
+        "campaign bridge_timeout_seconds",
+    )
 
     models = _resolve_string_items(data.get("models"), "campaign.models")
 
@@ -123,4 +142,5 @@ def load_campaign(path: Path | str) -> Campaign:
         models=models,
         cases=cases,
         serving=serving,
+        bridge_timeout_seconds=bridge_timeout_seconds,
     )

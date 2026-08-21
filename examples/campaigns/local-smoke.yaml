@@ -1,6 +1,7 @@
 schema_version: 1
 campaign_id: local-smoke
 repetitions: 5
+bridge_timeout_seconds: 60
 models:
   - mock-small
 cases:

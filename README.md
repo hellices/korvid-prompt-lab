@@ -77,6 +77,7 @@ uv run --python 3.12 korvid-prompt-lab optimize \
   --artifact-root artifacts/optimize/local-smoke \
   --max-metric-calls 2 \
   --reflection-model openai/gpt-4.1-mini \
+  --seed 0 \
   --train-case-id smoke-happy \
   --validation-case-id smoke-guardrail
 ```
@@ -84,6 +85,38 @@ uv run --python 3.12 korvid-prompt-lab optimize \
 `optimization-summary.json` records `train_case_ids`, `validation_case_ids`, the
 seed fingerprint, and `best_candidate_differs_from_seed` so a silent no-op search
 is visible in the artifact.
+
+#### Run identity, seeds, and contamination safety
+
+GEPA resumes any `gepa_state.bin` it finds in its `run_dir`. A shared, stable
+directory therefore turns a second `optimize` into a silent no-op that reports the
+*previous* search's candidate and provenance. Korvid Prompt Lab makes every
+invocation self-contained instead:
+
+- every run derives a `run_id` from its full immutable identity — campaign id,
+  candidate id, seed candidate fingerprint, train case ids, validation case ids,
+  `--max-metric-calls`, `--seed`, and the proposal source
+  (`none` / `reflection_lm` / `candidate_proposer`);
+- all artifacts live under `<artifact-root>/invocations/<run_id>/`, so a changed
+  seed always starts a fresh search and never inherits stale state;
+- previous invocations stay immutable: nothing is written outside the current
+  invocation directory;
+- there is **no resume feature**. Re-running an identical identity fails closed
+  with `optimization invocation directory already exists: ...`, and an existing
+  `gepa_state.bin` is refused rather than resumed.
+
+```text
+artifacts/optimize/local-smoke/invocations/<run_id>/
+  run-identity.json          # the exact identity the run_id was derived from
+  gepa/                      # GEPA run_dir (state, logs) for this invocation only
+  runs/                      # bridge request/response artifacts for this invocation
+  best-candidate.yaml
+  optimization-summary.json
+```
+
+`--seed` (default `0`) must be a non-negative integer; it is passed to GEPA and is
+part of the run identity, so changing it is the normal way to run a second,
+independent search into the same artifact root.
 
 #### GEPA proposal contract
 
@@ -183,6 +216,28 @@ uv run --python 3.12 korvid-prompt-lab publish \
   --minimum-model-improvement 0.02
 ```
 
+## Campaign runtime policy
+
+A campaign owns every runtime knob; candidates and the optimizer can never change
+them. Alongside `repetitions`, `models`, `cases`, and `serving`, a campaign may
+declare how long one bridge invocation is allowed to take:
+
+```yaml
+schema_version: 1
+campaign_id: local-smoke
+repetitions: 5
+bridge_timeout_seconds: 60
+```
+
+- `bridge_timeout_seconds` is optional and defaults to `300` (five minutes), which
+  is sized for a real Korvid bridge doing a full model-backed operation.
+- It must be a strictly positive, finite number; `0`, negatives, `null`, strings,
+  booleans, `.inf`, and `.nan` are rejected at load time.
+- `evaluate` and `optimize` pass it into every `KorvidProcessRunner`, so both the
+  direct evaluation loop and the GEPA search enforce exactly the same per-bridge
+  budget. Exceeding it is a systemic failure (`bridge timed out after N seconds`),
+  never a low score.
+
 ## Bridge request/response schema
 
 The process bridge receives a request JSON and must write a response JSON.
@@ -277,6 +332,19 @@ safety-gated.
 case/model groups whose **first k repetitions all passed**. A single lucky
 repetition never counts as a pass.
 
+A repetition passes only when the bridge reports authoritative success:
+
+- `status` is `completed` — an executed `model_failure` never passes;
+- the run carries no hard safety failure;
+- `grade.completion` is exactly `1.0`, meaning the requested operation actually
+  finished.
+
+The weighted score is deliberately **not** the pass criterion. A half-finished
+operation still earns a positive score through `verification` and `efficiency`
+(for example `completion: 0.0, verification: 1.0, efficiency: 1.0` scores `0.40`),
+and counting that as a pass would overstate reliability. Such a run raises the
+aggregate score and still fails `pass^k`.
+
 When a campaign records fewer than `k` repetitions for any group, the summary
 reports `null` (`insufficient-evidence` in the text output) instead of inventing
 a score, and `publish` refuses the bundle until the required repetitions exist.
@@ -308,8 +376,9 @@ Typical outputs:
 - `artifacts/evaluate/.../runs/.../request.json`
 - `artifacts/evaluate/.../runs/.../response.json`
 - `artifacts/evaluate/.../evaluation-summary.json`
-- `artifacts/optimize/.../best-candidate.yaml`
-- `artifacts/optimize/.../optimization-summary.json`
+- `artifacts/optimize/.../invocations/<run_id>/run-identity.json`
+- `artifacts/optimize/.../invocations/<run_id>/best-candidate.yaml`
+- `artifacts/optimize/.../invocations/<run_id>/optimization-summary.json`
 - `registry/index.json`
 - `registry/scoreboard.md`
 - `registry/bundles/<model-family>/<version>/prompt-bundle.yaml`

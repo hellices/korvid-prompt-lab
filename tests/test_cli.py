@@ -212,7 +212,7 @@ def test_evaluate_runs_fake_bridge_and_emits_json_summary(tmp_path: Path) -> Non
 
     summary = json.loads(stdout)
     assert summary["bundle_kind"] == "common"
-    assert summary["aggregate_score"] == pytest.approx(0.85)
+    assert summary["aggregate_score"] == pytest.approx(0.91)
     assert summary["hard_safety_failures"] == 0
     assert summary["systemic_failures"] == 0
     assert summary["milestone_passed"] is True
@@ -482,6 +482,8 @@ def test_optimize_requires_reflection_model_and_invokes_optimizer(
                 "best_candidate": kwargs["seed_candidate"],
                 "best_candidate_path": best_candidate_path,
                 "summary_path": summary_path,
+                "run_id": "1111222233334444",
+                "invocation_dir": tmp_path,
             },
         )()
 
@@ -1646,6 +1648,8 @@ def test_optimize_runs_the_whole_search_inside_one_aks_forward(
                 "best_candidate": kwargs["seed_candidate"],
                 "best_candidate_path": best_candidate_path,
                 "summary_path": summary_path,
+                "run_id": "5555666677778888",
+                "invocation_dir": tmp_path,
             },
         )()
 
@@ -1681,6 +1685,46 @@ def test_optimize_runs_the_whole_search_inside_one_aks_forward(
     assert calls["instances"] == 1
     assert calls["workspace_dir"] == tmp_path / "optimization"
     assert calls["runner"].model_endpoint == "http://127.0.0.1:41001"
+
+
+def test_evaluate_pass_hat_k_requires_full_operation_completion_not_a_positive_score(tmp_path: Path) -> None:
+    candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
+    campaign_payload = _process_campaign_payload(
+        "smoke-happy", extra_case_ids=("smoke-partial[partial-completion]",)
+    )
+    campaign_payload["repetitions"] = 3
+    campaign_path = _write_yaml(tmp_path / "campaign.yaml", campaign_payload)
+    artifact_root = tmp_path / "artifacts"
+
+    exit_code, stdout, stderr = _run_cli(
+        _evaluate_args(
+            candidate_path,
+            campaign_path,
+            artifact_root,
+            validation=("smoke-partial[partial-completion]",),
+            extra=("--json",),
+        )
+    )
+
+    assert exit_code == 0, stderr
+    summary = json.loads(stdout)
+
+    partial_responses = [
+        json.loads((run_dir / "response.json").read_text(encoding="utf-8"))
+        for run_dir in sorted((artifact_root / "runs").iterdir())
+        if run_dir.name.startswith("smoke-partial")
+    ]
+    assert len(partial_responses) == 3
+    for response in partial_responses:
+        assert response["status"] == "completed"
+        assert response["grade"]["hard_failures"] == []
+        assert response["grade"]["completion"] == 0.0
+        assert response["grade"]["verification"] > 0.0
+        assert response["grade"]["efficiency"] > 0.0
+
+    assert summary["aggregate_score"] > 0.0
+    assert summary["hard_safety_failures"] == 0
+    assert summary["pass_at_3"] == pytest.approx(0.5)
 
 
 def test_evaluate_reports_insufficient_pass_hat_k_evidence_for_short_campaigns(tmp_path: Path) -> None:
@@ -1911,6 +1955,272 @@ def test_optimize_requires_explicit_disjoint_case_splits(
     assert exit_code == 2
     assert stdout == ""
     assert message in stderr
+
+
+def test_optimize_threads_an_explicit_seed_and_reports_the_invocation_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: dict[str, Any] = {}
+    monkeypatch.setattr("korvid_prompt_lab.cli._build_reflection_lm", lambda model: {"model": model})
+
+    def fake_optimize_campaign(**kwargs: Any) -> object:
+        calls["optimize"] = kwargs
+        invocation_dir = tmp_path / "optimization" / "invocations" / "abc123def4567890"
+        invocation_dir.mkdir(parents=True)
+        summary_path = invocation_dir / "optimization-summary.json"
+        best_candidate_path = invocation_dir / "best-candidate.yaml"
+        summary_path.write_text("{}", encoding="utf-8")
+        best_candidate_path.write_text(
+            "schema_version: 1\ncandidate_id: shipped-small\ncomponents:\n  system: ok\n", encoding="utf-8"
+        )
+        return type(
+            "Artifacts",
+            (),
+            {
+                "best_candidate": kwargs["seed_candidate"],
+                "best_candidate_path": best_candidate_path,
+                "summary_path": summary_path,
+                "run_id": "abc123def4567890",
+                "invocation_dir": invocation_dir,
+            },
+        )()
+
+    monkeypatch.setattr("korvid_prompt_lab.cli.optimize_campaign", fake_optimize_campaign)
+    candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
+    campaign_path = _write_yaml(
+        tmp_path / "campaign.yaml",
+        _process_campaign_payload("smoke-happy", extra_case_ids=("smoke-guardrail",)),
+    )
+
+    exit_code, stdout, stderr = _run_cli(
+        [
+            "optimize",
+            "--candidate",
+            str(candidate_path),
+            "--campaign",
+            str(campaign_path),
+            "--artifact-root",
+            str(tmp_path / "optimization"),
+            "--max-metric-calls",
+            "2",
+            "--reflection-model",
+            "openai/gpt-4.1-mini",
+            "--seed",
+            "13",
+            "--train-case-id",
+            "smoke-happy",
+            "--validation-case-id",
+            "smoke-guardrail",
+        ]
+    )
+
+    assert exit_code == 0, stderr
+    assert calls["optimize"]["seed"] == 13
+    assert "run_id=abc123def4567890" in stdout
+    assert str(tmp_path / "optimization" / "invocations" / "abc123def4567890") in stdout
+
+
+def test_optimize_defaults_to_a_zero_seed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls: dict[str, Any] = {}
+    monkeypatch.setattr("korvid_prompt_lab.cli._build_reflection_lm", lambda model: {"model": model})
+
+    def fake_optimize_campaign(**kwargs: Any) -> object:
+        calls["optimize"] = kwargs
+        invocation_dir = tmp_path / "invocation"
+        invocation_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = invocation_dir / "optimization-summary.json"
+        best_candidate_path = invocation_dir / "best-candidate.yaml"
+        summary_path.write_text("{}", encoding="utf-8")
+        best_candidate_path.write_text(
+            "schema_version: 1\ncandidate_id: shipped-small\ncomponents:\n  system: ok\n", encoding="utf-8"
+        )
+        return type(
+            "Artifacts",
+            (),
+            {
+                "best_candidate": kwargs["seed_candidate"],
+                "best_candidate_path": best_candidate_path,
+                "summary_path": summary_path,
+                "run_id": "0000000000000000",
+                "invocation_dir": invocation_dir,
+            },
+        )()
+
+    monkeypatch.setattr("korvid_prompt_lab.cli.optimize_campaign", fake_optimize_campaign)
+    candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
+    campaign_path = _write_yaml(
+        tmp_path / "campaign.yaml",
+        _process_campaign_payload("smoke-happy", extra_case_ids=("smoke-guardrail",)),
+    )
+
+    exit_code, _stdout, stderr = _run_cli(
+        [
+            "optimize",
+            "--candidate",
+            str(candidate_path),
+            "--campaign",
+            str(campaign_path),
+            "--artifact-root",
+            str(tmp_path / "optimization"),
+            "--max-metric-calls",
+            "2",
+            "--reflection-model",
+            "openai/gpt-4.1-mini",
+            "--train-case-id",
+            "smoke-happy",
+            "--validation-case-id",
+            "smoke-guardrail",
+        ]
+    )
+
+    assert exit_code == 0, stderr
+    assert calls["optimize"]["seed"] == 0
+
+
+def test_optimize_rejects_a_negative_seed(tmp_path: Path) -> None:
+    candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
+    campaign_path = _write_yaml(
+        tmp_path / "campaign.yaml",
+        _process_campaign_payload("smoke-happy", extra_case_ids=("smoke-guardrail",)),
+    )
+
+    exit_code, stdout, stderr = _run_cli(
+        [
+            "optimize",
+            "--candidate",
+            str(candidate_path),
+            "--campaign",
+            str(campaign_path),
+            "--artifact-root",
+            str(tmp_path / "optimization"),
+            "--max-metric-calls",
+            "2",
+            "--reflection-model",
+            "openai/gpt-4.1-mini",
+            "--seed",
+            "-1",
+            "--train-case-id",
+            "smoke-happy",
+            "--validation-case-id",
+            "smoke-guardrail",
+        ]
+    )
+
+    assert exit_code == 2
+    assert stdout == ""
+    assert "seed must be a non-negative integer" in stderr
+
+
+def test_evaluate_and_optimize_use_the_campaign_bridge_timeout_for_every_bridge_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from korvid_prompt_lab import cli as cli_module
+
+    real_runner_class = cli_module.KorvidProcessRunner
+    created: list[Any] = []
+
+    def recording_runner(**kwargs: Any) -> Any:
+        runner = real_runner_class(**kwargs)
+        created.append(runner)
+        return runner
+
+    monkeypatch.setattr("korvid_prompt_lab.cli.KorvidProcessRunner", recording_runner)
+    monkeypatch.setattr("korvid_prompt_lab.cli._build_reflection_lm", lambda model: {"model": model})
+    monkeypatch.setattr(
+        "korvid_prompt_lab.cli.optimize_campaign",
+        lambda **kwargs: _fake_optimization_artifacts(tmp_path / "invocation", kwargs),
+    )
+
+    candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
+    campaign_payload = _process_campaign_payload("smoke-happy", extra_case_ids=("smoke-guardrail",))
+    campaign_payload["bridge_timeout_seconds"] = 12.5
+    campaign_path = _write_yaml(tmp_path / "campaign.yaml", campaign_payload)
+
+    evaluate_code, _stdout, evaluate_stderr = _run_cli(
+        _evaluate_args(candidate_path, campaign_path, tmp_path / "artifacts")
+    )
+    assert evaluate_code == 0, evaluate_stderr
+
+    optimize_code, _optimize_stdout, optimize_stderr = _run_cli(
+        [
+            "optimize",
+            "--candidate",
+            str(candidate_path),
+            "--campaign",
+            str(campaign_path),
+            "--artifact-root",
+            str(tmp_path / "optimization"),
+            "--max-metric-calls",
+            "2",
+            "--reflection-model",
+            "openai/gpt-4.1-mini",
+            "--train-case-id",
+            "smoke-happy",
+            "--validation-case-id",
+            "smoke-guardrail",
+        ]
+    )
+    assert optimize_code == 0, optimize_stderr
+
+    assert len(created) == 2
+    assert [runner.timeout_seconds for runner in created] == [pytest.approx(12.5), pytest.approx(12.5)]
+
+
+def test_evaluate_aborts_when_the_bridge_exceeds_the_campaign_bridge_timeout(tmp_path: Path) -> None:
+    candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
+    campaign_payload = _process_campaign_payload("smoke-slow[timeout]", extra_case_ids=("smoke-guardrail",))
+    campaign_payload["bridge_timeout_seconds"] = 0.1
+    campaign_path = _write_yaml(tmp_path / "campaign.yaml", campaign_payload)
+
+    exit_code, stdout, stderr = _run_cli(
+        _evaluate_args(
+            candidate_path,
+            campaign_path,
+            tmp_path / "artifacts",
+            train=("smoke-slow[timeout]",),
+            validation=("smoke-guardrail",),
+        )
+    )
+
+    assert exit_code == 1
+    assert stdout == ""
+    assert "bridge timed out after 0.1 seconds" in stderr
+
+
+def test_evaluate_rejects_a_non_positive_campaign_bridge_timeout(tmp_path: Path) -> None:
+    candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
+    campaign_payload = _process_campaign_payload("smoke-happy", extra_case_ids=("smoke-guardrail",))
+    campaign_payload["bridge_timeout_seconds"] = 0
+    campaign_path = _write_yaml(tmp_path / "campaign.yaml", campaign_payload)
+
+    exit_code, stdout, stderr = _run_cli(
+        _evaluate_args(candidate_path, campaign_path, tmp_path / "artifacts")
+    )
+
+    assert exit_code == 2
+    assert stdout == ""
+    assert "bridge_timeout_seconds must be a positive number" in stderr
+
+
+def _fake_optimization_artifacts(invocation_dir: Path, kwargs: dict[str, Any]) -> Any:
+    invocation_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = invocation_dir / "optimization-summary.json"
+    best_candidate_path = invocation_dir / "best-candidate.yaml"
+    summary_path.write_text("{}", encoding="utf-8")
+    best_candidate_path.write_text(
+        "schema_version: 1\ncandidate_id: shipped-small\ncomponents:\n  system: ok\n", encoding="utf-8"
+    )
+    return type(
+        "Artifacts",
+        (),
+        {
+            "best_candidate": kwargs["seed_candidate"],
+            "best_candidate_path": best_candidate_path,
+            "summary_path": summary_path,
+            "run_id": "9999888877776666",
+            "invocation_dir": invocation_dir,
+        },
+    )()
 
 
 def _publish_summary_payload(*, bundle_kind: str, aggregate_score: float) -> dict[str, Any]:

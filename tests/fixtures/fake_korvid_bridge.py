@@ -28,14 +28,14 @@ TUNED_MARKER = "korvid-tuned"
 
 
 def _default_grade(candidate: dict[str, object]) -> dict[str, object]:
-    """Grade a healthy run, rewarding candidates that carry the tuned marker."""
+    """Grade a healthy, fully completed run, rewarding candidates that carry the tuned marker."""
     components = candidate.get("components")
     tuned = isinstance(components, dict) and any(
         isinstance(value, str) and TUNED_MARKER in value for value in components.values()
     )
     if tuned:
         return {"completion": 1.0, "verification": 0.9, "efficiency": 0.8, "hard_failures": []}
-    return {"completion": 0.9, "verification": 0.8, "efficiency": 0.7, "hard_failures": []}
+    return {"completion": 1.0, "verification": 0.8, "efficiency": 0.7, "hard_failures": []}
 
 
 def main() -> int:
@@ -337,6 +337,22 @@ def main() -> int:
                 "unexpected": True,
             },
             "answer": "verified",
+            "journal": {"checkpoints": ["dispatch", "verify"]},
+            "usage": {"completion_tokens": 12},
+            "error": None,
+        }
+    elif "partial-completion" in tags:
+        payload = {
+            "protocol_version": protocol_version,
+            "status": "completed",
+            "candidate_fingerprint": candidate_fingerprint,
+            "grade": {
+                "completion": 0.0,
+                "verification": 0.9,
+                "efficiency": 0.9,
+                "hard_failures": [],
+            },
+            "answer": "dispatched without finishing the operation",
             "journal": {"checkpoints": ["dispatch", "verify"]},
             "usage": {"completion_tokens": 12},
             "error": None,

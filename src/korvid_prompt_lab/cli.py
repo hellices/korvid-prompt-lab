@@ -13,10 +13,14 @@ from .aks import AKSPortForward, AKSPortForwardError
 from .artifacts import write_json_artifact
 from .config import load_campaign, load_candidate
 from .contracts import AKSPortForwardServing, Campaign, Candidate, EvalCase
-from .optimize import OptimizationArtifacts, optimize_campaign
+from .optimize import (
+    DEFAULT_OPTIMIZATION_SEED,
+    OptimizationArtifacts,
+    optimize_campaign,
+)
 from .publish import DEFAULT_MINIMUM_MODEL_IMPROVEMENT, publish_bundle
 from .runner import BridgeSystemError, KorvidProcessRunner
-from .scoring import RepetitionOutcome, pass_hat_k, score_result
+from .scoring import RepetitionOutcome, pass_hat_k, result_passed, score_result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -89,6 +93,15 @@ def build_parser() -> argparse.ArgumentParser:
     optimize_parser.add_argument(
         "--reflection-model",
         help="DSPy LM spec used for reflection proposals, for example openai/gpt-4.1-mini.",
+    )
+    optimize_parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_OPTIMIZATION_SEED,
+        help=(
+            "Non-negative GEPA search seed; part of the immutable run identity, so a new seed "
+            f"always starts a fresh invocation directory (default {DEFAULT_OPTIMIZATION_SEED})."
+        ),
     )
     optimize_parser.add_argument(
         "--train-case-id",
@@ -190,7 +203,11 @@ def command_evaluate(args: argparse.Namespace) -> int:
     artifact_root = Path(args.artifact_root)
     try:
         with _serving_session(campaign, artifact_root) as model_endpoint:
-            runner = KorvidProcessRunner(campaign=campaign, model_endpoint=model_endpoint)
+            runner = KorvidProcessRunner(
+                campaign=campaign,
+                timeout_seconds=campaign.bridge_timeout_seconds,
+                model_endpoint=model_endpoint,
+            )
             summary = _evaluate_campaign(
                 candidate=candidate,
                 campaign=campaign,
@@ -247,6 +264,7 @@ def command_optimize(args: argparse.Namespace) -> int:
 
     try:
         candidate, campaign = _load_candidate_campaign(args.candidate, args.campaign)
+        _require_non_negative_seed(args.seed)
         _require_case_selection("--train-case-id", args.train_case_ids)
         _require_case_selection("--validation-case-id", args.validation_case_ids)
         _require_disjoint_case_selections(args.train_case_ids, args.validation_case_ids)
@@ -259,12 +277,17 @@ def command_optimize(args: argparse.Namespace) -> int:
     try:
         with _serving_session(campaign, Path(args.artifact_root)) as model_endpoint:
             artifacts = optimize_campaign(
-                runner=KorvidProcessRunner(campaign=campaign, model_endpoint=model_endpoint),
+                runner=KorvidProcessRunner(
+                    campaign=campaign,
+                    timeout_seconds=campaign.bridge_timeout_seconds,
+                    model_endpoint=model_endpoint,
+                ),
                 seed_candidate=candidate,
                 train_cases=train_cases,
                 validation_cases=validation_cases,
                 artifact_root=args.artifact_root,
                 max_metric_calls=args.max_metric_calls,
+                seed=args.seed,
                 reflection_lm=_build_reflection_lm(args.reflection_model),
             )
     except (OSError, RuntimeError, ValueError) as exc:
@@ -400,6 +423,12 @@ def _require_disjoint_case_selections(train_case_ids: Sequence[str], validation_
         raise ValueError(f"train and validation case sets must be disjoint: {', '.join(overlap)}")
 
 
+def _require_non_negative_seed(seed: int) -> int:
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("seed must be a non-negative integer")
+    return seed
+
+
 def _resolve_case_sets(args: argparse.Namespace, evaluated_case_ids: Sequence[str]) -> dict[str, list[str]]:
     train_case_ids = _require_case_selection("--train-case-id", args.train_case_ids)
     validation_case_ids = _require_case_selection("--validation-case-id", args.validation_case_ids)
@@ -464,7 +493,7 @@ def _evaluate_campaign(
                     case_id=case.case_id,
                     model=case.models[0],
                     repetition=repetition,
-                    passed=scored.score > 0.0 and not scored.unsafe,
+                    passed=result_passed(scored),
                 )
             )
             scores.append(scored.score)
@@ -723,7 +752,9 @@ def _build_reflection_lm(model_name: str) -> object:
 
 def _print_optimization_summary(artifacts: OptimizationArtifacts) -> None:
     print(
-        f"optimized candidate={artifacts.best_candidate.candidate_id} best_candidate={artifacts.best_candidate_path} summary={artifacts.summary_path}"
+        f"optimized candidate={artifacts.best_candidate.candidate_id} run_id={artifacts.run_id} "
+        f"invocation={artifacts.invocation_dir} best_candidate={artifacts.best_candidate_path} "
+        f"summary={artifacts.summary_path}"
     )
 
 

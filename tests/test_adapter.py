@@ -88,7 +88,7 @@ def test_adapter_evaluate_returns_one_output_score_and_safe_trajectory_per_case(
 
     assert candidate == original
     assert [result.status for result in eval_batch.outputs] == ["completed", "model_failure"]
-    assert eval_batch.scores == pytest.approx([0.85, 0.0])
+    assert eval_batch.scores == pytest.approx([0.91, 0.0])
     assert eval_batch.trajectories is not None
     assert len(eval_batch.trajectories) == 2
     assert eval_batch.trajectories[0].checkpoint_names == ("dispatch", "verify")

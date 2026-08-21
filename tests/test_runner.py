@@ -330,6 +330,48 @@ def test_runner_raises_typed_errors_for_systemic_failures(
         _runner(case, timeout_seconds=timeout_seconds).run(_candidate(), case, tmp_path / "run")
 
 
+def test_runner_defaults_its_timeout_to_the_campaign_bridge_timeout() -> None:
+    case = _case("case[completed]")
+    campaign = Campaign(
+        schema_version=1,
+        campaign_id="campaign-1",
+        repetitions=1,
+        models=("mock-small",),
+        cases=(case,),
+        serving=ProcessServing(backend="process", command=("bridge", "{request}", "{response}")),
+        bridge_timeout_seconds=123.5,
+    )
+
+    assert KorvidProcessRunner(campaign).timeout_seconds == pytest.approx(123.5)
+    assert KorvidProcessRunner(campaign, timeout_seconds=2.0).timeout_seconds == pytest.approx(2.0)
+
+
+def test_runner_enforces_the_campaign_bridge_timeout_on_the_bridge_process(tmp_path: Path) -> None:
+    case = _case("case[timeout]")
+    campaign = Campaign(
+        schema_version=1,
+        campaign_id="campaign-1",
+        repetitions=1,
+        models=("mock-small",),
+        cases=(case,),
+        serving=ProcessServing(
+            backend="process",
+            command=(
+                sys.executable,
+                str(ROOT / "tests" / "fixtures" / "fake_korvid_bridge.py"),
+                "--request",
+                "{request}",
+                "--response",
+                "{response}",
+            ),
+        ),
+        bridge_timeout_seconds=0.1,
+    )
+
+    with pytest.raises(BridgeTimeoutError, match="0.1 seconds"):
+        KorvidProcessRunner(campaign).run(_candidate(), case, tmp_path / "run")
+
+
 def _aks_runner(
     case: EvalCase,
     *,

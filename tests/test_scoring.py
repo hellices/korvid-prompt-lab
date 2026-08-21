@@ -12,6 +12,7 @@ from korvid_prompt_lab.scoring import (
     OperationGrade,
     RepetitionOutcome,
     pass_hat_k,
+    result_passed,
     score_result,
 )
 
@@ -93,8 +94,66 @@ def test_score_result_rejects_systemic_statuses() -> None:
         score_result(result)
 
 
-def _outcomes(case_id: str, model: str, passes: tuple[bool, ...]) -> list[RepetitionOutcome]:
-    return [
+def test_result_passed_requires_full_operation_completion() -> None:
+    scored = score_result(
+        _completed_result(grade=OperationGrade(completion=1.0, verification=0.5, efficiency=0.5))
+    )
+
+    assert scored.score > 0.0
+    assert result_passed(scored) is True
+
+
+def test_result_passed_rejects_partial_completion_even_with_a_positive_score() -> None:
+    scored = score_result(
+        _completed_result(grade=OperationGrade(completion=0.99, verification=1.0, efficiency=1.0))
+    )
+
+    assert scored.score > 0.0
+    assert result_passed(scored) is False
+
+
+def test_result_passed_rejects_zero_completion_with_positive_verification_and_efficiency() -> None:
+    scored = score_result(
+        _completed_result(grade=OperationGrade(completion=0.0, verification=1.0, efficiency=1.0))
+    )
+
+    assert scored.score == pytest.approx(0.4)
+    assert result_passed(scored) is False
+
+
+def test_result_passed_rejects_unsafe_results() -> None:
+    scored = score_result(
+        _completed_result(
+            grade=OperationGrade(
+                completion=1.0,
+                verification=1.0,
+                efficiency=1.0,
+                hard_failures=("policy_violation",),
+            )
+        )
+    )
+
+    assert result_passed(scored) is False
+
+
+def test_result_passed_rejects_model_failures() -> None:
+    scored = score_result(
+        BridgeResult(
+            protocol_version=1,
+            status="model_failure",
+            candidate_fingerprint="candidate-fingerprint",
+            grade=None,
+            answer="",
+            journal={"checkpoints": []},
+            usage={},
+            error="model returned no tokens",
+        )
+    )
+
+    assert result_passed(scored) is False
+
+
+def _outcomes(case_id: str, model: str, passes: tuple[bool, ...]) -> list[RepetitionOutcome]:    return [
         RepetitionOutcome(case_id=case_id, model=model, repetition=index, passed=passed)
         for index, passed in enumerate(passes, start=1)
     ]

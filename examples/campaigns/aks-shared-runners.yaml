@@ -1,6 +1,7 @@
 schema_version: 1
 campaign_id: aks-shared-runners
 repetitions: 5
+bridge_timeout_seconds: 300
 models:
   - env:KORVID_AKS_MODEL
 cases:

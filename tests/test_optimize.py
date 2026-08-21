@@ -219,6 +219,155 @@ def test_optimize_campaign_runs_real_gepa_and_persists_a_candidate_that_beats_th
     assert persisted.components == artifacts.best_candidate.components
 
 
+def test_optimize_campaign_never_resumes_a_stale_run_when_the_seed_changes(tmp_path: Path) -> None:
+    train_cases = [_case("train-1"), _case("train-2"), _case("train-3")]
+    validation_cases = [_case("val-1"), _case("val-2")]
+    runner = _runner(train_cases + validation_cases)
+    seed_candidate = _seed_candidate()
+    artifact_root = tmp_path / "artifacts"
+    first_proposals: list[list[str]] = []
+    second_proposals: list[list[str]] = []
+
+    first = optimize_campaign(
+        runner=runner,
+        seed_candidate=seed_candidate,
+        train_cases=train_cases,
+        validation_cases=validation_cases,
+        artifact_root=artifact_root,
+        max_metric_calls=16,
+        seed=1,
+        candidate_proposer=_recording_proposer(first_proposals),
+    )
+    first_summary = json.loads(first.summary_path.read_text(encoding="utf-8"))
+
+    second = optimize_campaign(
+        runner=runner,
+        seed_candidate=seed_candidate,
+        train_cases=train_cases,
+        validation_cases=validation_cases,
+        artifact_root=artifact_root,
+        max_metric_calls=16,
+        seed=2,
+        candidate_proposer=_recording_proposer(second_proposals),
+    )
+    second_summary = json.loads(second.summary_path.read_text(encoding="utf-8"))
+
+    assert first_proposals, "the first run must actually search"
+    assert second_proposals, "a changed seed must start a fresh search instead of resuming stale state"
+
+    assert first_summary["seed"] == 1
+    assert second_summary["seed"] == 2
+    assert first_summary["run_id"] != second_summary["run_id"]
+    assert first_summary["run_dir"] != second_summary["run_dir"]
+    assert second_summary["total_metric_calls"] == first_summary["total_metric_calls"]
+    assert second_summary["num_candidates"] == first_summary["num_candidates"]
+
+    assert first.summary_path != second.summary_path
+    assert first.best_candidate_path != second.best_candidate_path
+    assert json.loads(first.summary_path.read_text(encoding="utf-8")) == first_summary
+    assert load_candidate(first.best_candidate_path).components == first.best_candidate.components
+    assert not (artifact_root / "gepa" / "gepa_state.bin").exists()
+
+
+def test_optimize_campaign_refuses_to_reuse_an_existing_invocation_directory(tmp_path: Path) -> None:
+    train_cases = [_case("train-1"), _case("train-2")]
+    validation_cases = [_case("val-1")]
+    runner = _runner(train_cases + validation_cases)
+    seed_candidate = _seed_candidate()
+    artifact_root = tmp_path / "artifacts"
+
+    def run() -> OptimizationArtifacts:
+        return optimize_campaign(
+            runner=runner,
+            seed_candidate=seed_candidate,
+            train_cases=train_cases,
+            validation_cases=validation_cases,
+            artifact_root=artifact_root,
+            max_metric_calls=8,
+            seed=3,
+            candidate_proposer=_recording_proposer([]),
+        )
+
+    first = run()
+
+    with pytest.raises(ValueError, match="already exists"):
+        run()
+
+    assert json.loads(first.summary_path.read_text(encoding="utf-8"))["run_id"] == first.run_id
+
+
+def test_optimize_campaign_records_the_run_identity_next_to_the_artifacts(tmp_path: Path) -> None:
+    train_cases = [_case("train-1"), _case("train-2")]
+    validation_cases = [_case("val-1")]
+    runner = _runner(train_cases + validation_cases)
+    seed_candidate = _seed_candidate()
+
+    artifacts = optimize_campaign(
+        runner=runner,
+        seed_candidate=seed_candidate,
+        train_cases=train_cases,
+        validation_cases=validation_cases,
+        artifact_root=tmp_path / "artifacts",
+        max_metric_calls=8,
+        seed=7,
+        candidate_proposer=_recording_proposer([]),
+    )
+
+    identity = json.loads((artifacts.invocation_dir / "run-identity.json").read_text(encoding="utf-8"))
+    assert identity["seed"] == 7
+    assert identity["seed_candidate_fingerprint"] == seed_candidate.fingerprint
+    assert identity["train_case_ids"] == ["train-1", "train-2"]
+    assert identity["validation_case_ids"] == ["val-1"]
+    assert identity["max_metric_calls"] == 8
+    assert identity["proposal_source"] == "candidate_proposer"
+    assert identity["campaign_id"] == "campaign-1"
+    assert artifacts.summary_path.parent == artifacts.invocation_dir
+    assert artifacts.best_candidate_path.parent == artifacts.invocation_dir
+
+
+def test_optimize_campaign_passes_the_seed_to_gepa(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    train_case = _case("train-1")
+    validation_case = _case("val-1")
+    runner = _runner([train_case, validation_case])
+    captured: dict[str, Any] = {}
+
+    def fake_optimize(**kwargs: object) -> GEPAResult:
+        captured.update(kwargs)
+        return _fake_gepa_result(cast(str, kwargs["run_dir"]))
+
+    monkeypatch.setattr("korvid_prompt_lab.optimize.gepa.optimize", fake_optimize)
+
+    optimize_campaign(
+        runner=runner,
+        seed_candidate=_seed_candidate(),
+        train_cases=[train_case],
+        validation_cases=[validation_case],
+        artifact_root=tmp_path / "artifacts",
+        max_metric_calls=5,
+        seed=11,
+    )
+
+    assert captured["seed"] == 11
+
+
+@pytest.mark.parametrize("seed", [-1, True, 1.5, "1"])
+def test_optimize_campaign_rejects_invalid_seeds(tmp_path: Path, seed: object) -> None:
+    train_case = _case("train-1")
+    validation_case = _case("val-1")
+    runner = _runner([train_case, validation_case])
+
+    with pytest.raises(ValueError, match="seed must be a non-negative integer"):
+        optimize_campaign(
+            runner=runner,
+            seed_candidate=_seed_candidate(),
+            train_cases=[train_case],
+            validation_cases=[validation_case],
+            artifact_root=tmp_path / "artifacts",
+            max_metric_calls=4,
+            seed=cast(int, seed),
+        )
+
+
 def test_optimize_campaign_rejects_combining_reflection_lm_and_candidate_proposer(tmp_path: Path) -> None:
     train_case = _case("train-1")
     validation_case = _case("val-1")

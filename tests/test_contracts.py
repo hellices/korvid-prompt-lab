@@ -10,7 +10,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from korvid_prompt_lab.config import load_campaign, load_candidate
-from korvid_prompt_lab.contracts import AKSPortForwardServing, Candidate, ProcessServing
+from korvid_prompt_lab.contracts import (
+    DEFAULT_BRIDGE_TIMEOUT_SECONDS,
+    AKSPortForwardServing,
+    Candidate,
+    ProcessServing,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -129,6 +134,7 @@ def test_load_campaign_from_example_yaml(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert local.campaign_id == "local-smoke"
     assert local.repetitions == 5
+    assert local.bridge_timeout_seconds == pytest.approx(60.0)
     assert local.models == ("mock-small",)
     assert [case.case_id for case in local.cases] == ["smoke-happy", "smoke-guardrail"]
     assert local.cases[0].models == ("mock-small",)
@@ -145,6 +151,7 @@ def test_load_campaign_from_example_yaml(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert aks.campaign_id == "aks-shared-runners"
     assert aks.repetitions == 5
+    assert aks.bridge_timeout_seconds == pytest.approx(300.0)
     assert aks.models == ("qwen3-4b",)
     assert [case.case_id for case in aks.cases] == ["aks-happy", "aks-guardrail"]
     assert isinstance(aks.serving, AKSPortForwardServing)
@@ -282,6 +289,58 @@ def test_load_campaign_rejects_invalid_campaigns(
     path.write_text(yaml_text.strip() + "\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match=message):
+        load_campaign(path)
+
+
+def _timeout_campaign_yaml(timeout_line: str) -> str:
+    return (
+        """
+schema_version: 1
+campaign_id: timeout-campaign
+repetitions: 1
+"""
+        + timeout_line
+        + """models: [mock-small]
+cases:
+  - case_id: case-a
+    template_id: template-a
+    prompt: one
+    models: [mock-small]
+serving:
+  backend: process
+  command: [python3, bridge.py, --request, "{request}", --response, "{response}"]
+"""
+    ).strip() + "\n"
+
+
+def test_load_campaign_defaults_the_bridge_timeout_to_the_reviewed_value(tmp_path: Path) -> None:
+    path = tmp_path / "campaign.yaml"
+    path.write_text(_timeout_campaign_yaml(""), encoding="utf-8")
+
+    campaign = load_campaign(path)
+
+    assert DEFAULT_BRIDGE_TIMEOUT_SECONDS == 300.0
+    assert campaign.bridge_timeout_seconds == DEFAULT_BRIDGE_TIMEOUT_SECONDS
+
+
+def test_load_campaign_parses_an_explicit_bridge_timeout(tmp_path: Path) -> None:
+    path = tmp_path / "campaign.yaml"
+    path.write_text(_timeout_campaign_yaml("bridge_timeout_seconds: 45.5\n"), encoding="utf-8")
+
+    campaign = load_campaign(path)
+
+    assert campaign.bridge_timeout_seconds == pytest.approx(45.5)
+
+
+@pytest.mark.parametrize(
+    "timeout_value",
+    ["0", "-1", "-0.5", '"30"', "true", "null", "[30]", ".nan", ".inf"],
+)
+def test_load_campaign_rejects_non_positive_bridge_timeouts(tmp_path: Path, timeout_value: str) -> None:
+    path = tmp_path / "campaign.yaml"
+    path.write_text(_timeout_campaign_yaml(f"bridge_timeout_seconds: {timeout_value}\n"), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="bridge_timeout_seconds must be a positive number"):
         load_campaign(path)
 
 

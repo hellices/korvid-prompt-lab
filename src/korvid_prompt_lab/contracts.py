@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+
+DEFAULT_BRIDGE_TIMEOUT_SECONDS = 300.0
 
 
 def _require_mapping(value: Any, context: str) -> Mapping[str, Any]:
@@ -151,3 +154,16 @@ class Campaign:
     models: tuple[str, ...]
     cases: tuple[EvalCase, ...]
     serving: ProcessServing | AKSPortForwardServing
+    bridge_timeout_seconds: float = DEFAULT_BRIDGE_TIMEOUT_SECONDS
+
+    def __post_init__(self) -> None:
+        _require_bridge_timeout(self.bridge_timeout_seconds, "campaign bridge_timeout_seconds")
+
+
+def _require_bridge_timeout(value: Any, context: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{context} must be a positive number")  # noqa: TRY004 - preserve validation API
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout <= 0.0:
+        raise ValueError(f"{context} must be a positive number")
+    return timeout

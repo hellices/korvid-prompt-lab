@@ -16,6 +16,7 @@ from .contracts import (
     EvalCase,
     ProcessServing,
     _ensure_keys,
+    _require_bridge_timeout,
     _require_mapping,
     _require_string,
 )
@@ -82,15 +83,17 @@ class BridgeStatusError(BridgeSystemError):
 @dataclass(frozen=True, slots=True)
 class KorvidProcessRunner:
     campaign: Campaign
-    timeout_seconds: float = 30.0
+    timeout_seconds: float | None = None
     model_endpoint: str | None = None
 
     def __post_init__(self) -> None:
         serving = self.campaign.serving
         if not isinstance(serving, (ProcessServing, AKSPortForwardServing)):
             raise ValueError("KorvidProcessRunner requires process or aks_port_forward serving")  # noqa: TRY004 - preserve validation API
-        if self.timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
+        if self.timeout_seconds is None:
+            # Runtime policy belongs to the campaign, never to a candidate or the optimizer.
+            object.__setattr__(self, "timeout_seconds", self.campaign.bridge_timeout_seconds)
+        _require_bridge_timeout(self.timeout_seconds, "timeout_seconds")
         if isinstance(serving, AKSPortForwardServing):
             if self.model_endpoint is None:
                 raise ValueError("aks_port_forward serving requires a model_endpoint")
