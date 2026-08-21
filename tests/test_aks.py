@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from korvid_prompt_lab.contracts import AKSPortForwardServing
-from korvid_prompt_lab.aks import AKSPortForward, AKSPortForwardError
+from korvid_prompt_lab.aks import AKSPortForward, AKSPortForwardError, AKSPortForwardTimeoutError
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,21 +37,31 @@ class FakeProcess:
     def __init__(
         self,
         *,
+        chunks: tuple[str, ...] = (),
         lines: tuple[str, ...] = (),
         poll_values: tuple[int | None, ...] = (),
         wait_returncode: int = 0,
+        wait_effects: tuple[object, ...] = (),
     ) -> None:
+        self._chunks = list(chunks)
         self._lines = list(lines)
         self._poll_values = list(poll_values)
         self._wait_returncode = wait_returncode
+        self._wait_effects = list(wait_effects)
         self._current_returncode: int | None = None
         self.terminate_calls = 0
+        self.kill_calls = 0
         self.wait_calls: list[float | None] = []
 
     def read_line(self) -> str:
         if self._lines:
             return self._lines.pop(0)
         return ""
+
+    def read_output(self) -> str:
+        if self._chunks:
+            return self._chunks.pop(0)
+        return self.read_line()
 
     def poll(self) -> int | None:
         if self._poll_values:
@@ -61,9 +72,36 @@ class FakeProcess:
     def terminate(self) -> None:
         self.terminate_calls += 1
 
+    def kill(self) -> None:
+        self.kill_calls += 1
+
     def wait(self, timeout: float | None = None) -> int:
         self.wait_calls.append(timeout)
+        if self._wait_effects:
+            effect = self._wait_effects.pop(0)
+            if isinstance(effect, BaseException):
+                raise effect
+            if effect is not None:
+                self._current_returncode = effect
+                return effect
         return self._wait_returncode
+
+
+class FakeClock:
+    def __init__(self, values: tuple[float, ...]) -> None:
+        self._values = list(values)
+        self.calls = 0
+
+    def monotonic(self) -> float:
+        self.calls += 1
+        if self._values:
+            return self._values.pop(0)
+        raise AssertionError("unexpected monotonic clock read")
+
+
+class PartialOutputProcess(FakeProcess):
+    def read_line(self) -> str:
+        raise AssertionError("read_line should not be used for partial port-forward output")
 
 
 class FakeProcessLauncher:
@@ -212,11 +250,63 @@ def test_aks_port_forward_rejects_port_forward_early_exit(tmp_path: Path) -> Non
     assert process.wait_calls == [None]
 
 
+def test_aks_port_forward_stalled_live_process_times_out_and_cleans_up(tmp_path: Path) -> None:
+    commands = FakeCommandRunner(_successful_results())
+    process = FakeProcess(poll_values=(None, None, None))
+    launcher = FakeProcessLauncher([process])
+    clock = FakeClock((100.0, 100.2, 100.5, 101.2))
+    cleanup_timeout = 0.5
+
+    with pytest.raises(AKSPortForwardTimeoutError, match="timed out waiting for port-forward readiness"):
+        with AKSPortForward(
+            _serving(),
+            workspace_dir=tmp_path,
+            command_runner=commands,
+            process_launcher=launcher,
+            monotonic_clock=clock.monotonic,
+            port_forward_ready_timeout_seconds=1.0,
+            cleanup_wait_timeout_seconds=cleanup_timeout,
+        ):
+            pytest.fail("context should not open")
+
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 0
+    assert process.wait_calls == [cleanup_timeout, None]
+
+
+def test_aks_port_forward_partial_output_still_honors_timeout(tmp_path: Path) -> None:
+    commands = FakeCommandRunner(_successful_results())
+    process = PartialOutputProcess(
+        chunks=("Forwarding from 127.0.0.1:", "", ""),
+        poll_values=(None, None, None),
+    )
+    launcher = FakeProcessLauncher([process])
+    clock = FakeClock((200.0, 200.3, 200.7, 201.2))
+    cleanup_timeout = 0.5
+
+    with pytest.raises(AKSPortForwardTimeoutError, match="timed out waiting for port-forward readiness"):
+        with AKSPortForward(
+            _serving(),
+            workspace_dir=tmp_path,
+            command_runner=commands,
+            process_launcher=launcher,
+            monotonic_clock=clock.monotonic,
+            port_forward_ready_timeout_seconds=1.0,
+            cleanup_wait_timeout_seconds=cleanup_timeout,
+        ):
+            pytest.fail("context should not open")
+
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 0
+    assert process.wait_calls == [cleanup_timeout, None]
+
+
 def test_aks_port_forward_rejects_model_probe_mismatch(tmp_path: Path) -> None:
     commands = FakeCommandRunner(_successful_results())
     process = FakeProcess(lines=("Forwarding from 127.0.0.1:41001 -> 8080\n",))
     launcher = FakeProcessLauncher([process])
     http_get = FakeHttpGet([{"data": [{"id": "qwen3-14b"}]}])
+    cleanup_timeout = 0.5
 
     with pytest.raises(AKSPortForwardError, match="did not advertise model qwen3-4b"):
         with AKSPortForward(
@@ -225,12 +315,14 @@ def test_aks_port_forward_rejects_model_probe_mismatch(tmp_path: Path) -> None:
             command_runner=commands,
             process_launcher=launcher,
             http_get_json=http_get,
+            cleanup_wait_timeout_seconds=cleanup_timeout,
         ):
             pytest.fail("context should not open")
 
     assert http_get.urls == ["http://127.0.0.1:41001/v1/models"]
     assert process.terminate_calls == 1
-    assert process.wait_calls == [None]
+    assert process.kill_calls == 0
+    assert process.wait_calls == [cleanup_timeout, None]
 
 
 def test_aks_port_forward_binds_loopback_uses_unique_kubeconfigs_and_cleans_only_owned_processes(
@@ -240,6 +332,7 @@ def test_aks_port_forward_binds_loopback_uses_unique_kubeconfigs_and_cleans_only
     first_process = FakeProcess(lines=("Forwarding from 127.0.0.1:41001 -> 8080\n",))
     second_process = FakeProcess(lines=("Forwarding from 127.0.0.1:41002 -> 8080\n",))
     launcher = FakeProcessLauncher([first_process, second_process])
+    cleanup_timeout = 0.5
     http_get = FakeHttpGet(
         [
             {"data": [{"id": "qwen3-4b"}]},
@@ -253,6 +346,7 @@ def test_aks_port_forward_binds_loopback_uses_unique_kubeconfigs_and_cleans_only
         command_runner=commands,
         process_launcher=launcher,
         http_get_json=http_get,
+        cleanup_wait_timeout_seconds=cleanup_timeout,
     ) as first_forward:
         assert first_forward.base_url == "http://127.0.0.1:41001"
         assert first_process.terminate_calls == 0
@@ -261,7 +355,8 @@ def test_aks_port_forward_binds_loopback_uses_unique_kubeconfigs_and_cleans_only
     first_kubeconfig = Path(commands.calls[1][commands.calls[1].index("--file") + 1])
     assert not first_kubeconfig.exists()
     assert first_process.terminate_calls == 1
-    assert len(first_process.wait_calls) == 1
+    assert first_process.kill_calls == 0
+    assert first_process.wait_calls == [cleanup_timeout, None]
     assert second_process.terminate_calls == 0
 
     with AKSPortForward(
@@ -270,6 +365,7 @@ def test_aks_port_forward_binds_loopback_uses_unique_kubeconfigs_and_cleans_only
         command_runner=commands,
         process_launcher=launcher,
         http_get_json=http_get,
+        cleanup_wait_timeout_seconds=cleanup_timeout,
     ) as second_forward:
         assert second_forward.base_url == "http://127.0.0.1:41002"
 
@@ -277,7 +373,8 @@ def test_aks_port_forward_binds_loopback_uses_unique_kubeconfigs_and_cleans_only
     assert first_kubeconfig != second_kubeconfig
     assert not second_kubeconfig.exists()
     assert second_process.terminate_calls == 1
-    assert len(second_process.wait_calls) == 1
+    assert second_process.kill_calls == 0
+    assert second_process.wait_calls == [cleanup_timeout, None]
     assert launcher.calls[0][-4:] == ("--address", "127.0.0.1", "service/korvid-api", ":8080")
     assert launcher.calls[1][-4:] == ("--address", "127.0.0.1", "service/korvid-api", ":8080")
 
@@ -286,6 +383,7 @@ def test_aks_port_forward_cleans_up_on_base_exception_during_startup(tmp_path: P
     commands = FakeCommandRunner(_successful_results())
     process = FakeProcess(lines=("Forwarding from 127.0.0.1:41001 -> 8080\n",))
     launcher = FakeProcessLauncher([process])
+    cleanup_timeout = 0.5
 
     def raising_probe(_url: str) -> dict[str, object]:
         raise KeyboardInterrupt()
@@ -297,10 +395,39 @@ def test_aks_port_forward_cleans_up_on_base_exception_during_startup(tmp_path: P
             command_runner=commands,
             process_launcher=launcher,
             http_get_json=raising_probe,
+            cleanup_wait_timeout_seconds=cleanup_timeout,
         ):
             pytest.fail("context should not open")
 
     kubeconfig = Path(commands.calls[1][commands.calls[1].index("--file") + 1])
     assert process.terminate_calls == 1
-    assert process.wait_calls == [None]
+    assert process.kill_calls == 0
+    assert process.wait_calls == [cleanup_timeout, None]
     assert not kubeconfig.exists()
+
+
+def test_aks_port_forward_cleanup_kills_ignores_terminate_process(tmp_path: Path) -> None:
+    commands = FakeCommandRunner(_successful_results())
+    process = FakeProcess(
+        lines=("Forwarding from 127.0.0.1:41001 -> 8080\n",),
+        wait_effects=(
+            subprocess.TimeoutExpired(cmd=("kubectl", "port-forward"), timeout=0.25),
+            137,
+        ),
+    )
+    launcher = FakeProcessLauncher([process])
+    http_get = FakeHttpGet([{"data": [{"id": "qwen3-4b"}]}])
+
+    with AKSPortForward(
+        _serving(),
+        workspace_dir=tmp_path,
+        command_runner=commands,
+        process_launcher=launcher,
+        http_get_json=http_get,
+        cleanup_wait_timeout_seconds=0.25,
+    ):
+        pass
+
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 1
+    assert process.wait_calls == [0.25, 0.25, None]

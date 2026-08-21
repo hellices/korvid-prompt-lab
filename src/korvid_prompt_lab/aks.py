@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import select
 import subprocess
+import time
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from .contracts import AKSPortForwardServing, _require_mapping
 
 
 class AKSPortForwardError(RuntimeError):
     """Raised when AKS discovery or port-forward preparation fails."""
+
+
+class AKSPortForwardTimeoutError(AKSPortForwardError):
+    """Raised when the AKS port-forward does not become ready before a deadline."""
 
 
 class _CommandResult(Protocol):
@@ -28,11 +34,13 @@ class _CommandRunner(Protocol):
 
 
 class _PortForwardProcess(Protocol):
-    def read_line(self) -> str: ...
+    def read_output(self) -> str: ...
 
     def poll(self) -> int | None: ...
 
     def terminate(self) -> None: ...
+
+    def kill(self) -> None: ...
 
     def wait(self, timeout: float | None = None) -> int: ...
 
@@ -47,21 +55,27 @@ class _HttpGetJson(Protocol):
 
 @dataclass(slots=True)
 class _SubprocessPortForward:
-    process: subprocess.Popen[str]
+    process: subprocess.Popen[bytes]
 
-    def read_line(self) -> str:
+    def read_output(self) -> str:
         if self.process.stdout is None:
             return ""
         ready, _, _ = select.select([self.process.stdout], [], [], 0.1)
         if not ready:
             return ""
-        return self.process.stdout.readline()
+        chunk = os.read(self.process.stdout.fileno(), 4096)
+        if not chunk:
+            return ""
+        return chunk.decode("utf-8", errors="replace")
 
     def poll(self) -> int | None:
         return self.process.poll()
 
     def terminate(self) -> None:
         self.process.terminate()
+
+    def kill(self) -> None:
+        self.process.kill()
 
     def wait(self, timeout: float | None = None) -> int:
         if timeout is None:
@@ -83,8 +97,7 @@ def _launch_process(args: tuple[str, ...]) -> _SubprocessPortForward:
         args,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
+        bufsize=0,
     )
     return _SubprocessPortForward(process)
 
@@ -101,9 +114,18 @@ class AKSPortForward:
     command_runner: _CommandRunner = _run_command
     process_launcher: _ProcessLauncher = _launch_process
     http_get_json: _HttpGetJson = _http_get_json
+    monotonic_clock: Callable[[], float] = time.monotonic
+    port_forward_ready_timeout_seconds: float = 10.0
+    cleanup_wait_timeout_seconds: float = 5.0
     _process: _PortForwardProcess | None = field(init=False, default=None)
     _kubeconfig_path: Path | None = field(init=False, default=None)
     _base_url: str | None = field(init=False, default=None)
+
+    def __post_init__(self) -> None:
+        if self.port_forward_ready_timeout_seconds <= 0:
+            raise ValueError("port_forward_ready_timeout_seconds must be positive")
+        if self.cleanup_wait_timeout_seconds <= 0:
+            raise ValueError("cleanup_wait_timeout_seconds must be positive")
 
     @property
     def base_url(self) -> str:
@@ -257,14 +279,20 @@ class AKSPortForward:
 
     def _wait_for_port_forward(self) -> int:
         assert self._process is not None
+        deadline = self.monotonic_clock() + self.port_forward_ready_timeout_seconds
+        output = ""
         while True:
-            line = self._process.read_line()
-            match = re.search(r"Forwarding from 127\.0\.0\.1:(\d+) -> \d+", line)
+            output += self._process.read_output()
+            match = re.search(r"Forwarding from 127\.0\.0\.1:(\d+) -> \d+", output)
             if match is not None:
                 return int(match.group(1))
             returncode = self._process.poll()
             if returncode is not None:
                 raise AKSPortForwardError("port-forward exited before it became ready")
+            if self.monotonic_clock() >= deadline:
+                raise AKSPortForwardTimeoutError("timed out waiting for port-forward readiness")
+            if len(output) > 4096:
+                output = output[-4096:]
 
     def _probe_models(self) -> None:
         try:
@@ -294,11 +322,40 @@ class AKSPortForward:
 
     def _cleanup(self) -> None:
         if self._process is not None:
-            if self._process.poll() is None:
-                self._process.terminate()
-            self._process.wait()
+            self._cleanup_process(self._process)
             self._process = None
         self._base_url = None
         if self._kubeconfig_path is not None:
             self._kubeconfig_path.unlink(missing_ok=True)
             self._kubeconfig_path = None
+
+    def _cleanup_process(self, process: _PortForwardProcess) -> None:
+        if process.poll() is not None:
+            self._reap_process(process)
+            return
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        if self._wait_for_process_exit(process, self.cleanup_wait_timeout_seconds):
+            self._reap_process(process)
+            return
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        if self._wait_for_process_exit(process, self.cleanup_wait_timeout_seconds):
+            self._reap_process(process)
+            return
+        if process.poll() is not None:
+            self._reap_process(process)
+
+    def _wait_for_process_exit(self, process: _PortForwardProcess, timeout: float) -> bool:
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return False
+        return True
+
+    def _reap_process(self, process: _PortForwardProcess) -> None:
+        process.wait()

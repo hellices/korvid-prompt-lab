@@ -33,4 +33,35 @@ DONE
 - `feat: add AKS model endpoint backend` with the required Co-authored-by trailer.
 
 ## Concerns
-- The runtime cleanup currently waits indefinitely for the owned `kubectl port-forward` process after `terminate()`. That keeps behavior simple and exact, but a hung child process would block shutdown until the OS reaps it.
+- Addressed by the blocking quality follow-up below.
+
+## Task 4 blocking quality follow-up
+
+### Status
+- DONE
+
+### Files
+- `src/korvid_prompt_lab/aks.py`
+- `tests/test_aks.py`
+
+### Fix summary
+- Added `AKSPortForwardTimeoutError`, injected `monotonic_clock`, and enforced a bounded readiness deadline for a live but stalled port-forward process.
+- Switched the subprocess adapter from blocking `readline()` semantics to nonblocking output chunk reads so partial port-forward output cannot bypass the readiness deadline.
+- Hardened cleanup to terminate, bounded-wait, kill if needed, bounded-wait again, and only do the final unconditional reap once exit is observable.
+
+### Additional commands and results
+- `uv run --python 3.12 pytest tests/test_aks.py -q -k 'stalled_live_process or ignores_terminate'`
+  - RED/GREEN: `2 passed, 7 deselected in 0.11s`
+- `uv run --python 3.12 pytest tests/test_aks.py -q -k 'partial_output_still_honors_timeout'`
+  - RED: failed with `AssertionError: read_line should not be used for partial port-forward output`
+- `uv run --python 3.12 pytest tests/test_aks.py -q`
+  - PASS: `10 passed in 0.16s`
+- `uv run --python 3.12 pytest -q`
+  - PASS: `76 passed in 3.87s`
+
+### Review follow-up
+- Read-only review after the first fix pass found one remaining important issue: readiness still depended on blocking `readline()` behavior and could hang on partial output.
+- Fixed by accumulating nonblocking output chunks during readiness parsing and re-verified the focused regression plus the full suite.
+
+### Current concerns
+- None.
