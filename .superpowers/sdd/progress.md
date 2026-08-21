@@ -1,0 +1,8 @@
+Task 1: complete (commits 5848467..1c83a10, review clean; noted env reference whitespace UX issue)
+Task 2: complete (commits 1c83a10..639ac83, review clean)
+Task 3: complete (commits 639ac83..47cd67f, review clean)
+Task 4: complete (commits 47cd67f..1c86689, review clean)
+Task 5: complete (commits 1c86689..895240a, review clean)
+Task 6: complete (commits 895240a..149a7d6, review clean)
+Task 6: complete (commits 895240a..149a7d6, review clean)
+Final review fix wave: complete (commit 9541177, five findings closed; see final-fix-report.md)
