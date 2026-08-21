@@ -242,7 +242,9 @@ class KorvidProcessRunner:
         try:
             grade_mapping = _require_mapping(grade_payload, "grade")
             _ensure_keys(grade_mapping, {"completion", "verification", "efficiency", "hard_failures"}, "grade")
-            hard_failures = grade_mapping.get("hard_failures", [])
+            if "hard_failures" not in grade_mapping:
+                raise ValueError("grade missing hard_failures")
+            hard_failures = grade_mapping["hard_failures"]
             if not isinstance(hard_failures, list):
                 raise ValueError("hard_failures must be a list")
             return OperationGrade(

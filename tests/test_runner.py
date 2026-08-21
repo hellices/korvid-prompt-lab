@@ -141,6 +141,54 @@ def test_runner_accepts_model_failure_status(tmp_path: Path) -> None:
     assert "model" in result.error
 
 
+def test_runner_rejects_completed_grade_without_hard_failures(tmp_path: Path) -> None:
+    case = _case("case[missing-hard-failures]")
+    bridge_path = tmp_path / "bridge.py"
+    bridge_path.write_text(
+        """
+import json
+import sys
+from pathlib import Path
+
+request = json.loads(Path(sys.argv[sys.argv.index("--request") + 1]).read_text(encoding="utf-8"))
+response_path = Path(sys.argv[sys.argv.index("--response") + 1])
+request_identity = {
+    "case_id": request["case"]["case_id"],
+    "template_id": request["case"]["template_id"],
+    "model": request["case"]["model"],
+    "repetition": request["case"]["repetition"],
+    "seed": request["case"]["seed"],
+}
+response_path.write_text(
+    json.dumps(
+        {
+            "protocol_version": 1,
+            "status": "completed",
+            "candidate_fingerprint": request["candidate_fingerprint"],
+            "request_identity": request_identity,
+            "grade": {
+                "completion": 0.9,
+                "verification": 0.8,
+                "efficiency": 0.7,
+            },
+            "answer": "verified",
+            "journal": {"checkpoints": ["dispatch", "verify"]},
+            "usage": {"completion_tokens": 12},
+            "error": None,
+        }
+    ),
+    encoding="utf-8",
+)
+""".strip(),
+        encoding="utf-8",
+    )
+    bridge_path.chmod(0o755)
+    command = (sys.executable, str(bridge_path), "--request", "{request}", "--response", "{response}")
+
+    with pytest.raises(BridgeMalformedOutputError):
+        _runner_with_command(case, command).run(_candidate(), case, tmp_path / "run")
+
+
 def test_runner_does_not_reuse_stale_response_artifacts(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     candidate = _candidate()
