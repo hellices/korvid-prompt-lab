@@ -267,7 +267,7 @@ def _normalize_evaluation_summary(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("milestone_passed must be a boolean")
 
     case_sets = _normalize_case_sets(summary.get("case_sets"))
-    artifact_refs = _normalize_string_list(summary.get("artifact_refs"), "artifact_refs")
+    artifact_refs = _normalize_unordered_string_list(summary.get("artifact_refs"), "artifact_refs")
     reproduction_command = _normalize_string_list(summary.get("reproduction_command"), "reproduction_command")
 
     return {
@@ -288,7 +288,9 @@ def _normalize_case_sets(value: Any) -> dict[str, list[str]]:
     mapping = _require_mapping(value, "case_sets")
     normalized: dict[str, list[str]] = {}
     for key, entries in sorted(mapping.items()):
-        normalized[_require_string(key, "case_sets key")] = _normalize_string_list(entries, f"case_sets[{key}]")
+        normalized[_require_string(key, "case_sets key")] = _normalize_unordered_string_list(
+            entries, f"case_sets[{key}]"
+        )
     return normalized
 
 
@@ -296,6 +298,10 @@ def _normalize_string_list(value: Any, context: str) -> list[str]:
     if not isinstance(value, list) or not value:
         raise ValueError(f"{context} must be a non-empty list of strings")
     return [_require_string(item, context) for item in value]
+
+
+def _normalize_unordered_string_list(value: Any, context: str) -> list[str]:
+    return sorted(_normalize_string_list(value, context))
 
 
 def _require_float(value: Any, context: str) -> float:
@@ -387,7 +393,7 @@ def _scoreboard_record(bundle: PromptBundle | Mapping[str, Any]) -> Mapping[str,
             "model_digest": bundle.model_digest,
             "bundle_kind": bundle.bundle_kind,
             "candidate_id": bundle.candidate_id,
-            "aggregate_score": bundle.effective_score,
+            "aggregate_score": bundle.aggregate_score,
             "pass_at_3": bundle.pass_at_3,
             "pass_at_5": bundle.pass_at_5,
             "version": bundle.version,

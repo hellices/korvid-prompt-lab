@@ -125,7 +125,17 @@ def test_publish_bundle_writes_deterministic_common_bundle_and_registry_files(tm
         candidate=_candidate(),
         campaign=_campaign(),
         model_metadata=_model_metadata(),
-        evaluation_summary=_evaluation_summary(),
+        evaluation_summary=_evaluation_summary(
+            artifact_refs=[
+                "artifacts/evaluation-summary.json",
+                "artifacts/request.json",
+            ],
+            case_sets={
+                "train": ["train-2", "train-1"],
+                "validation": ["val-2", "val-1"],
+                "milestone": ["milestone-2", "milestone-1"],
+            },
+        ),
         registry_root=registry_root,
     )
     second = publish_bundle(
@@ -140,6 +150,10 @@ def test_publish_bundle_writes_deterministic_common_bundle_and_registry_files(tm
             "model_family": "mock-small",
         },
         evaluation_summary=_evaluation_summary(
+            artifact_refs=[
+                "artifacts/request.json",
+                "artifacts/evaluation-summary.json",
+            ],
             reproduction_command=[
                 "uv",
                 "run",
@@ -150,11 +164,10 @@ def test_publish_bundle_writes_deterministic_common_bundle_and_registry_files(tm
                 "--campaign",
                 "campaign.yaml",
             ],
-            artifact_refs=["artifacts/evaluation-summary.json"],
             case_sets={
-                "milestone": ["milestone-1"],
-                "validation": ["val-1"],
-                "train": ["train-1"],
+                "milestone": ["milestone-1", "milestone-2"],
+                "validation": ["val-1", "val-2"],
+                "train": ["train-1", "train-2"],
             },
         ),
         registry_root=registry_root,
@@ -176,6 +189,37 @@ def test_publish_bundle_writes_deterministic_common_bundle_and_registry_files(tm
     assert [entry["version"] for entry in index_payload["bundles"]] == [first.bundle.version]
     assert ".tmp" not in "\n".join(path.name for path in registry_root.rglob("*"))
 
+
+def test_publish_bundle_treats_reproduction_command_as_ordered_for_versioning(tmp_path: Path) -> None:
+    first = publish_bundle(
+        candidate=_candidate(),
+        campaign=_campaign(),
+        model_metadata=_model_metadata(),
+        evaluation_summary=_evaluation_summary(),
+        registry_root=tmp_path / "registry-first",
+    )
+    second = publish_bundle(
+        candidate=_candidate_reordered(),
+        campaign=_campaign(),
+        model_metadata=_model_metadata(),
+        evaluation_summary=_evaluation_summary(
+            reproduction_command=[
+                "uv",
+                "run",
+                "--python",
+                "3.12",
+                "korvid-prompt-lab",
+                "--campaign",
+                "campaign.yaml",
+                "evaluate",
+            ]
+        ),
+        registry_root=tmp_path / "registry-second",
+    )
+
+    assert first.bundle is not None
+    assert second.bundle is not None
+    assert first.bundle.version != second.bundle.version
 
 
 def test_publish_bundle_requires_exact_model_digest() -> None:
@@ -330,3 +374,26 @@ def test_render_scoreboard_generates_markdown_table(tmp_path: Path) -> None:
     assert "| Model family | Model digest | Bundle kind | Candidate | Aggregate | pass^3 | pass^5 |" in scoreboard
     assert "| mock-small | sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef | common | candidate-common | 0.900 | 1.000 | 1.000 |" in scoreboard
     assert "| mock-small | sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef | model-specific | candidate-specific | 0.950 | 1.000 | 1.000 |" in scoreboard
+
+
+def test_render_scoreboard_uses_aggregate_score_for_prompt_bundle_rows(tmp_path: Path) -> None:
+    bundle = PromptBundle(
+        schema_version=1,
+        bundle_kind="common",
+        version="pb-unsafe000000000",
+        model_family="mock-small",
+        model_digest="sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        candidate_id="candidate-unsafe",
+        aggregate_score=0.973,
+        effective_score=0.0,
+        pass_at_3=1.0,
+        pass_at_5=1.0,
+        hard_safety_failures=1,
+        bundle_dir=tmp_path / "registry" / "bundles" / "mock-small" / "pb-unsafe000000000",
+        prompt_bundle_path=tmp_path / "registry" / "bundles" / "mock-small" / "pb-unsafe000000000" / "prompt-bundle.yaml",
+        evaluation_summary_path=tmp_path / "registry" / "bundles" / "mock-small" / "pb-unsafe000000000" / "evaluation-summary.json",
+    )
+
+    scoreboard = render_scoreboard([bundle])
+
+    assert "| mock-small | sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef | common | candidate-unsafe | 0.973 | 1.000 | 1.000 |" in scoreboard
