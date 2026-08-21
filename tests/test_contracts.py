@@ -46,6 +46,16 @@ def test_load_candidate_from_example_yaml() -> None:
     )
 
 
+def test_frozen_dataclasses_use_slots() -> None:
+    candidate = load_candidate(ROOT / "examples/candidates/shipped-small.yaml")
+    local = load_campaign(ROOT / "examples/campaigns/local-smoke.yaml")
+
+    assert not hasattr(candidate, "__dict__")
+    assert not hasattr(local.cases[0], "__dict__")
+    assert not hasattr(local.serving, "__dict__")
+    assert not hasattr(local, "__dict__")
+
+
 def test_candidate_fingerprint_is_stable_for_mapping_order() -> None:
     shuffled = {
         "candidate_id": "tiny",

@@ -53,7 +53,7 @@ def _resolve_env_string(value: Any, context: str) -> str:
     return text
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Candidate:
     schema_version: int
     candidate_id: str
@@ -117,7 +117,7 @@ class Candidate:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class EvalCase:
     case_id: str
     template_id: str
@@ -125,13 +125,13 @@ class EvalCase:
     models: tuple[str, ...]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ProcessServing:
     backend: str
     command: tuple[str, ...]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AKSPortForwardServing:
     backend: str
     resource_group: str
@@ -141,7 +141,7 @@ class AKSPortForwardServing:
     model: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Campaign:
     schema_version: int
     campaign_id: str
