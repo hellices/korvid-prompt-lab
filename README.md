@@ -144,6 +144,11 @@ run, pass the resulting `http://127.0.0.1:<port>` base URL to every bridge
 request as `runtime.model_endpoint`, and terminate only that forward (and its
 temporary kubeconfig) when the run ends, including on failure.
 
+The forward's merged stdout/stderr is drained by a daemon reader for the whole
+run, so `kubectl`'s per-connection log lines can never fill the OS pipe and stall
+a long campaign. Only the most recent 64 KiB is retained (for readiness parsing);
+older output is discarded, never written to disk, and never logged.
+
 An `aks_port_forward` campaign must therefore declare the reviewed local Korvid
 bridge command explicitly:
 

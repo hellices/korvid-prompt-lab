@@ -609,3 +609,184 @@ tests/test_scoring.py                              |  63 ++++-
 7. **AKS wiring is still proven only against a fake port-forward and a fake bridge.** The live
    `rg-pension-guard` / `aks-shared-runners` path still needs one supervised run; nothing in this
    wave touched the cluster.
+
+---
+
+# Final review fix wave 3
+
+**Date:** 2026-08-22
+**Worktree:** `.worktrees/feat-prompt-lab-mvp`
+**Baseline commit:** `e18badc` (`docs: append second final review fix report`)
+**Python:** 3.12.13 (`.venv`)
+**Skills used:** `superpowers:systematic-debugging`, then `superpowers:test-driven-development`
+(RED → observed failure → minimal GREEN → focused re-run → full gate).
+
+## Pre-existing baseline
+
+`.venv/bin/python -m pytest -q` on `e18badc`: **201 passed**. `ruff check .` clean,
+`mypy --python-version 3.12 src tests` clean. No pre-existing failures.
+
+## Sole blocking finding (Critical) — port-forward output is never consumed after readiness
+
+### Root cause
+
+`_launch_process` starts `kubectl port-forward` with `stdout=PIPE, stderr=STDOUT, bufsize=0`.
+`_wait_for_port_forward` is the **only** consumer of that pipe, and it stops reading the moment
+the `Forwarding from 127.0.0.1:<port> -> <port>` line matches. `kubectl port-forward` then keeps
+writing `Handling connection for <port>` — one line per proxied connection — into a pipe nobody
+drains. Once the OS pipe buffer (64 KiB here) fills, the child blocks in `write(2)` **inside the
+connection handler**, so it stops forwarding traffic. A campaign that issues a few thousand bridge
+requests therefore stalls indefinitely: the forward looks alive (`poll()` is `None`), the base URL
+still resolves, and every subsequent model call hangs. The longer the campaign, the more certain
+the stall.
+
+### RED evidence (root-cause reproduction, before any test was written)
+
+A throwaway script drove the real `_launch_process` wrapper against a child that prints the
+readiness line and then ~600 KB of connection-log lines (script deleted afterwards):
+
+```text
+readiness observed: 'Forwarding from 127.0.0.1:41001 -> 8080\nHandling connection for 41001\n...'
+CHILD STILL ALIVE after 8s -> blocked writing into a full pipe
+```
+
+### RED evidence (tests)
+
+`.venv/bin/python -m pytest -q tests/test_aks.py` with the new tests, against the unmodified
+draining behaviour (only the names/`close()` API surface scaffolded so the module imports):
+
+```text
+E           AssertionError: port-forward child must not block writing into an unread pipe after readiness
+E           assert None == 0
+tests/test_aks.py:563: AssertionError
+
+E       AssertionError: cleanup must release the port-forward output pipe
+E       assert False
+E        +  where False = <_io.FileIO name=13 mode='rb' closefd=True>.closed
+tests/test_aks.py:603: AssertionError
+
+E       ValueError: file descriptor cannot be a negative integer (-1)
+src/korvid_prompt_lab/aks.py:70: ValueError   (reader failure escaped as a raw ValueError)
+
+3 failed, 11 passed in 21.66s
+```
+
+The 21.66 s wall time is itself the bug: the noisy child never exited, so the drain test burned
+its full 20 s deadline.
+
+### Tests added (`tests/test_aks.py`, all pipe-backed, no port-forward mock)
+
+`RealChildLauncher` injects the **production** `_launch_process` / `_SubprocessPortForward` pair
+(running a real Python child over a real OS pipe) into the real `AKSPortForward` lifecycle, with
+only `az`/`kubectl` discovery and the `/v1/models` probe faked. Four tests:
+
+1. `test_aks_port_forward_drains_child_output_for_the_whole_forward_lifetime` — child prints
+   readiness then ~600 KB (≈9× the pipe buffer) and a completion marker. Asserts the child exits
+   `0` **while the forward is still open**, that the marker is still observable, that each
+   `read_output()` result is bounded by `_MAX_BUFFERED_OUTPUT_BYTES`, and that total retained
+   output is far below what the child wrote (bounded retention, not accumulation).
+2. `test_aks_port_forward_cleanup_stops_the_reader_and_releases_the_pipe` — endlessly chatty
+   child. After the context exits: cleanup returned well inside its bound, the exact child is
+   reaped, the output pipe is closed (no fd leak) and no reader thread survives.
+3. `test_aks_port_forward_real_child_partial_output_still_times_out` — real child emits the
+   partial prefix `Forwarding from 127.0.0.1:` and sleeps; `AKSPortForwardTimeoutError` still
+   fires inside the readiness deadline, the child is still killed, no reader leaks. (Regression
+   guard: green before and after — it protects the readiness timeout and partial-output parsing
+   from the new reader.)
+4. `test_subprocess_port_forward_surfaces_reader_failures_instead_of_empty_output` — a stdout
+   whose `fileno()` is invalid must surface `AKSPortForwardError("port-forward output reader
+   failed")`, never an empty string. Proves a broken reader is not silently converted into
+   "no output yet" (which would have been reported as a readiness timeout, or worse, silence).
+
+The eight existing fake-process tests were extended with `close_calls` assertions so the new
+`close()` step of cleanup is covered on every cleanup path (early exit, readiness timeout, probe
+mismatch, `BaseException` during startup, terminate-then-kill, and the two-forward isolation test
+which also asserts the *second* process is never closed by the first forward).
+
+### GREEN implementation (`src/korvid_prompt_lab/aks.py`)
+
+`_SubprocessPortForward` now owns a bounded daemon reader:
+
+- `__post_init__` starts one daemon thread (`korvid-aks-port-forward-reader`) that loops on
+  `os.read(fd, 4096)` until EOF, so the pipe is drained for the entire forward lifetime, not just
+  until readiness.
+- Output is appended to a `bytearray` under a lock and trimmed to the **last 64 KiB**
+  (`_MAX_BUFFERED_OUTPUT_BYTES`); everything older is discarded. Memory is bounded regardless of
+  campaign length, and nothing is written to disk or logged.
+- `read_output()` waits on a `threading.Event` for at most 0.1 s (the same tick the old
+  `select()` provided), then takes and clears the buffer under the lock. The event is set inside
+  the lock and cleared only while holding it with the buffer empty, so no wakeup can be lost.
+- Reader failures are recorded (`OSError`/`ValueError`) and re-raised from `read_output()` as
+  `AKSPortForwardError` **after** any buffered bytes have been handed over, so an error can never
+  masquerade as success; they are suppressed only once `close()` has been called (expected
+  shutdown).
+- `close()` (new `_PortForwardProcess` protocol member) joins the reader with a 5 s bound. The
+  reader closes the pipe itself on exit, so the fd is released. If the join ever times out the
+  call still returns — the thread is a daemon with a fixed-size buffer, so it can neither hang
+  cleanup nor grow.
+- `AKSPortForward._cleanup_process` now wraps the existing terminate → wait → kill → wait → reap
+  sequence (moved verbatim to `_stop_process`) in `try/finally: process.close()`, so the reader is
+  always released, including when stopping raises.
+
+### GREEN evidence
+
+```text
+.venv/bin/python -m pytest -q tests/test_aks.py
+14 passed in 1.59s          (was 3 failed, 11 passed in 21.66s)
+```
+
+Repeated 5× for race/flake detection: `14 passed` in 1.48–1.94 s every time.
+
+## Preserved guarantees (re-verified by the suite)
+
+- **Readiness timeout** — fake-clock and real-child timeout tests both still raise
+  `AKSPortForwardTimeoutError` inside the deadline.
+- **Partial-output parsing** — `PartialOutputProcess` and the real partial-prefix child still
+  accumulate across reads without matching a truncated line.
+- **Exact-child cleanup** — the two-forward test still proves forward #1 terminates, waits, and
+  closes only its own process and kubeconfig (`second_process.close_calls == 0`).
+- **No secret output** — the reader discards bytes; nothing is printed, logged or persisted.
+- **Loopback only** — `--address 127.0.0.1` and the `http://127.0.0.1:<port>` base URL assertions
+  are unchanged.
+- **DI testability** — `command_runner`, `process_launcher`, `http_get_json` and
+  `monotonic_clock` injection is unchanged; `_SubprocessPortForward` additionally exposes
+  `max_buffered_bytes`, `output_poll_interval_seconds` and `reader_join_timeout_seconds`.
+
+## Commands and results
+
+```text
+.venv/bin/python -m pytest -q tests/test_aks.py     -> 14 passed
+.venv/bin/python -m pytest -q                       -> 205 passed
+.venv/bin/python -m ruff check .                    -> All checks passed!
+.venv/bin/python -m mypy --python-version 3.12 src tests
+                                                    -> Success: no issues found in 22 source files
+```
+
+## Files changed
+
+```text
+README.md                    |   5 +
+src/korvid_prompt_lab/aks.py | 109 ++++++++++++++++++--
+tests/test_aks.py            | 212 +++++++++++++++++++++++++++++++++++++++++
+3 files changed, 316 insertions(+), 10 deletions(-)
+```
+
+## Concerns and follow-ups
+
+1. **Retention is 64 KiB of the most recent output.** If a forward ever emitted more than 64 KiB
+   between two readiness polls (~2 200 connection lines in 100 ms) the readiness line could be
+   evicted before it is matched, and the wait would end in the normal readiness timeout rather
+   than a match. That cannot happen in practice — `kubectl` prints readiness before any
+   connection can be proxied — but the bound is the trade-off that makes memory constant.
+2. **Reader failures after readiness are not observed.** Nothing calls `read_output()` once the
+   forward is up, so a mid-run reader error is recorded but never raised. It is not swallowed
+   into a success path: a broken pipe means the child is gone, which surfaces immediately as a
+   failing bridge request. Surfacing it eagerly would need a supervisor callback.
+3. **A wedged reader thread is bounded, not killable.** If the port-forward's stdout were
+   inherited by a grandchild that outlives it, EOF never arrives, `close()` returns after its 5 s
+   join and one daemon thread plus one fd stay until interpreter exit. Forcibly closing the fd
+   under a blocked `read(2)` was rejected as unsafe (fd-reuse race), and `kubectl port-forward`
+   does not spawn children.
+4. **Still proven only against real pipes, not a real cluster.** The reader is exercised by real
+   OS pipes and real child processes, but concern 7 of wave 2 stands: the live
+   `rg-pension-guard` / `aks-shared-runners` path still needs one supervised run.

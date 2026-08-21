@@ -3,17 +3,24 @@ from __future__ import annotations
 import json
 import os
 import re
-import select
 import subprocess
+import threading
 import time
 import urllib.request
 import uuid
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, Self
+from typing import IO, Any, Protocol, Self
 
 from .contracts import AKSPortForwardServing, _require_mapping
+
+_MAX_BUFFERED_OUTPUT_BYTES = 65536
+_READER_THREAD_NAME = "korvid-aks-port-forward-reader"
+_OUTPUT_POLL_INTERVAL_SECONDS = 0.1
+_READER_JOIN_TIMEOUT_SECONDS = 5.0
+_READ_CHUNK_BYTES = 4096
 
 
 class AKSPortForwardError(RuntimeError):
@@ -45,6 +52,8 @@ class _PortForwardProcess(Protocol):
 
     def wait(self, timeout: float | None = None) -> int: ...
 
+    def close(self) -> None: ...
+
 
 class _ProcessLauncher(Protocol):
     def __call__(self, args: tuple[str, ...]) -> _PortForwardProcess: ...
@@ -56,17 +65,53 @@ class _HttpGetJson(Protocol):
 
 @dataclass(slots=True)
 class _SubprocessPortForward:
+    """Owns one port-forward child and keeps its merged output pipe drained.
+
+    ``kubectl port-forward`` logs a line per proxied connection, so an unread pipe
+    fills within a few thousand requests and blocks the child mid-campaign. A daemon
+    reader keeps the pipe empty for the whole forward lifetime and retains only the
+    most recent bytes, which is all readiness parsing needs.
+    """
+
     process: subprocess.Popen[bytes]
+    max_buffered_bytes: int = _MAX_BUFFERED_OUTPUT_BYTES
+    output_poll_interval_seconds: float = _OUTPUT_POLL_INTERVAL_SECONDS
+    reader_join_timeout_seconds: float = _READER_JOIN_TIMEOUT_SECONDS
+    _lock: threading.Lock = field(init=False, repr=False, compare=False, default_factory=threading.Lock)
+    _buffer: bytearray = field(init=False, repr=False, compare=False, default_factory=bytearray)
+    _output_ready: threading.Event = field(
+        init=False, repr=False, compare=False, default_factory=threading.Event
+    )
+    _closing: threading.Event = field(
+        init=False, repr=False, compare=False, default_factory=threading.Event
+    )
+    _failure: BaseException | None = field(init=False, repr=False, compare=False, default=None)
+    _reader: threading.Thread | None = field(init=False, repr=False, compare=False, default=None)
+
+    def __post_init__(self) -> None:
+        stream = self.process.stdout
+        if stream is None:
+            return
+        reader = threading.Thread(
+            target=self._drain_output,
+            args=(stream,),
+            name=_READER_THREAD_NAME,
+            daemon=True,
+        )
+        self._reader = reader
+        reader.start()
 
     def read_output(self) -> str:
-        if self.process.stdout is None:
-            return ""
-        ready, _, _ = select.select([self.process.stdout], [], [], 0.1)
-        if not ready:
-            return ""
-        chunk = os.read(self.process.stdout.fileno(), 4096)
-        if not chunk:
-            return ""
+        self._output_ready.wait(self.output_poll_interval_seconds)
+        with self._lock:
+            chunk = bytes(self._buffer)
+            self._buffer.clear()
+            self._output_ready.clear()
+            failure = None if chunk else self._failure
+            if failure is not None:
+                self._failure = None
+        if failure is not None and not self._closing.is_set():
+            raise AKSPortForwardError("port-forward output reader failed") from failure
         return chunk.decode("utf-8", errors="replace")
 
     def poll(self) -> int | None:
@@ -82,6 +127,44 @@ class _SubprocessPortForward:
         if timeout is None:
             return self.process.wait()
         return self.process.wait(timeout=timeout)
+
+    def close(self) -> None:
+        self._closing.set()
+        reader = self._reader
+        if reader is None or reader is threading.current_thread():
+            return
+        reader.join(timeout=self.reader_join_timeout_seconds)
+        if not reader.is_alive():
+            self._reader = None
+
+    def _drain_output(self, stream: IO[bytes]) -> None:
+        try:
+            fileno = stream.fileno()
+            while True:
+                chunk = os.read(fileno, _READ_CHUNK_BYTES)
+                if not chunk:
+                    return
+                self._store_output(chunk)
+        except (OSError, ValueError) as exc:
+            self._record_failure(exc)
+        finally:
+            with self._lock:
+                self._output_ready.set()
+            with suppress(OSError, ValueError):
+                stream.close()
+
+    def _store_output(self, chunk: bytes) -> None:
+        with self._lock:
+            self._buffer.extend(chunk)
+            overflow = len(self._buffer) - self.max_buffered_bytes
+            if overflow > 0:
+                del self._buffer[:overflow]
+            self._output_ready.set()
+
+    def _record_failure(self, exc: BaseException) -> None:
+        with self._lock:
+            if self._failure is None:
+                self._failure = exc
 
 
 def _run_command(args: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
@@ -330,6 +413,12 @@ class AKSPortForward:
             self._kubeconfig_path = None
 
     def _cleanup_process(self, process: _PortForwardProcess) -> None:
+        try:
+            self._stop_process(process)
+        finally:
+            process.close()
+
+    def _stop_process(self, process: _PortForwardProcess) -> None:
         if process.poll() is not None:
             self._reap_process(process)
             return
