@@ -178,6 +178,70 @@ response_path.write_text(
     assert "kubectl" not in rendered
 
 
+def test_adapter_zeroes_all_scores_when_any_case_is_unsafe(tmp_path: Path) -> None:
+    safe_bridge_path = tmp_path / "mixed_bridge.py"
+    safe_bridge_path.write_text(
+        """
+import json
+import sys
+from pathlib import Path
+
+request = json.loads(Path(sys.argv[sys.argv.index("--request") + 1]).read_text(encoding="utf-8"))
+response_path = Path(sys.argv[sys.argv.index("--response") + 1])
+case_id = request["case"]["case_id"]
+unsafe = case_id.endswith("unsafe")
+response_path.write_text(
+    json.dumps(
+        {
+            "protocol_version": 1,
+            "status": "completed",
+            "candidate_fingerprint": request["candidate_fingerprint"],
+            "request_identity": {
+                "case_id": request["case"]["case_id"],
+                "template_id": request["case"]["template_id"],
+                "model": request["case"]["model"],
+                "repetition": request["case"]["repetition"],
+                "seed": request["case"]["seed"],
+            },
+            "grade": {
+                "completion": 0.9 if not unsafe else 0.2,
+                "verification": 0.9 if not unsafe else 0.1,
+                "efficiency": 0.9 if not unsafe else 0.3,
+                "hard_failures": ["approval_bypass"] if unsafe else [],
+            },
+            "answer": "unsafe answer" if unsafe else "safe answer",
+            "journal": {
+                "checkpoints": ["dispatch", "verify"] if not unsafe else ["dispatch"],
+                "tool_calls": [],
+            },
+            "usage": {"completion_tokens": 12},
+            "error": None,
+        }
+    ),
+    encoding="utf-8",
+)
+""".strip(),
+        encoding="utf-8",
+    )
+    safe_bridge_path.chmod(0o755)
+    safe_case = _case("case-safe")
+    unsafe_case = _case("case-unsafe")
+    adapter = _adapter(
+        tmp_path,
+        [safe_case, unsafe_case],
+        (sys.executable, str(safe_bridge_path), "--request", "{request}", "--response", "{response}"),
+    )
+
+    eval_batch = adapter.evaluate([safe_case, unsafe_case], _seed_candidate().components, capture_traces=True)
+
+    assert eval_batch.scores == [0.0, 0.0]
+    assert eval_batch.trajectories is not None
+    assert len(eval_batch.outputs) == 2
+    assert len(eval_batch.trajectories) == 2
+    assert [trace.case_id for trace in eval_batch.trajectories] == ["case-safe", "case-unsafe"]
+    assert [trace.outcome for trace in eval_batch.trajectories] == ["completed", "unsafe"]
+
+
 def test_adapter_propagates_systemic_runner_failures(tmp_path: Path) -> None:
     case = _case("case[systemic-status]")
     adapter = _adapter(tmp_path, [case])

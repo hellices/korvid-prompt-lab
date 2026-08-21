@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -51,6 +51,7 @@ class KorvidGEPAAdapter:
         outputs: list[BridgeResult] = []
         scores: list[float] = []
         traces: list[SafeExecutionTrace] = []
+        any_unsafe = False
 
         for case in batch:
             run_dir = self._next_run_dir(resolved_candidate.fingerprint, case)
@@ -58,8 +59,14 @@ class KorvidGEPAAdapter:
             scored = score_result(result)
             outputs.append(result)
             scores.append(scored.score)
+            any_unsafe = any_unsafe or scored.unsafe
             if capture_traces:
                 traces.append(self._build_trace(case, result, score=scored.score, unsafe=scored.unsafe))
+
+        if any_unsafe:
+            scores = [0.0 for _ in scores]
+            if capture_traces:
+                traces = [replace(trace, score=0.0) for trace in traces]
 
         return EvaluationBatch(
             outputs=outputs,
