@@ -30,3 +30,10 @@ DONE
 
 ## Concerns
 - None.
+
+## Task 2 update
+- Commit: `1470db6` — `fix: require hard_failures in bridge grades`
+- Focused verification: `uv run --python 3.12 pytest tests/test_runner.py::test_runner_rejects_completed_grade_without_hard_failures -q`
+  - `1 passed in 0.09s`
+- Task verification: `uv run --python 3.12 pytest tests/test_runner.py -q`
+  - `42 passed in 1.45s`
