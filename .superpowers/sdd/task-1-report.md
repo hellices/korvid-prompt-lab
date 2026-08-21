@@ -42,3 +42,8 @@ DONE
 
 ## Fixed commit
 - `da034c4` — `fix: add dataclass slots`
+
+## Whitespace env fix
+- Commit: `5e708d6568c122156e12aec9654cbca5d65a049d`
+- Test: `uv run --python /Users/hwang-inhwan/.local/bin/python3.12 python -m pytest tests/test_contracts.py -q`
+  - Result: `11 passed in 0.07s`
