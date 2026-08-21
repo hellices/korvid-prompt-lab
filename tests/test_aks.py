@@ -3,30 +3,40 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from korvid_prompt_lab.aks import (
+    AKSPortForward,
+    AKSPortForwardError,
+    AKSPortForwardTimeoutError,
+    _CommandResult,
+    _CommandRunner,
+    _HttpGetJson,
+    _ProcessLauncher,
+)
 from korvid_prompt_lab.contracts import AKSPortForwardServing
-from korvid_prompt_lab.aks import AKSPortForward, AKSPortForwardError, AKSPortForwardTimeoutError
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class FakeCompletedCommand:
     returncode: int = 0
     stdout: str = ""
     stderr: str = ""
 
 
-class FakeCommandRunner:
+class FakeCommandRunner(_CommandRunner):
     def __init__(self, results: list[FakeCompletedCommand]) -> None:
         self._results = list(results)
         self.calls: list[tuple[str, ...]] = []
 
-    def __call__(self, args: tuple[str, ...]) -> FakeCompletedCommand:
+    def __call__(self, args: tuple[str, ...]) -> _CommandResult:
         self.calls.append(tuple(args))
         if not self._results:
             raise AssertionError(f"unexpected command: {args}")
@@ -41,7 +51,7 @@ class FakeProcess:
         lines: tuple[str, ...] = (),
         poll_values: tuple[int | None, ...] = (),
         wait_returncode: int = 0,
-        wait_effects: tuple[object, ...] = (),
+        wait_effects: tuple[int | BaseException | None, ...] = (),
     ) -> None:
         self._chunks = list(chunks)
         self._lines = list(lines)
@@ -104,7 +114,7 @@ class PartialOutputProcess(FakeProcess):
         raise AssertionError("read_line should not be used for partial port-forward output")
 
 
-class FakeProcessLauncher:
+class FakeProcessLauncher(_ProcessLauncher):
     def __init__(self, processes: list[FakeProcess]) -> None:
         self._processes = list(processes)
         self.calls: list[tuple[str, ...]] = []
@@ -116,12 +126,12 @@ class FakeProcessLauncher:
         return self._processes.pop(0)
 
 
-class FakeHttpGet:
+class FakeHttpGet(_HttpGetJson):
     def __init__(self, payloads: list[dict[str, object]]) -> None:
         self._payloads = list(payloads)
         self.urls: list[str] = []
 
-    def __call__(self, url: str) -> dict[str, object]:
+    def __call__(self, url: str) -> Mapping[str, Any]:
         self.urls.append(url)
         if not self._payloads:
             raise AssertionError(f"unexpected probe: {url}")
@@ -183,13 +193,12 @@ def test_aks_port_forward_rejects_missing_resource_group(tmp_path: Path) -> None
         [FakeCompletedCommand(returncode=3, stderr="ResourceGroupNotFound")]
     )
 
-    with pytest.raises(AKSPortForwardError, match="AKS cluster lookup failed"):
-        with AKSPortForward(
-            _serving(),
-            workspace_dir=tmp_path,
-            command_runner=commands,
-        ):
-            pytest.fail("context should not open")
+    with pytest.raises(AKSPortForwardError, match="AKS cluster lookup failed"), AKSPortForward(
+        _serving(),
+        workspace_dir=tmp_path,
+        command_runner=commands,
+    ):
+        pytest.fail("context should not open")
 
     assert len(commands.calls) == 1
     assert commands.calls[0] == (
@@ -209,13 +218,12 @@ def test_aks_port_forward_rejects_missing_resource_group(tmp_path: Path) -> None
 def test_aks_port_forward_rejects_wrong_cluster_response(tmp_path: Path) -> None:
     commands = FakeCommandRunner(_successful_results(cluster_name="cluster-two"))
 
-    with pytest.raises(AKSPortForwardError, match="AKS cluster validation failed"):
-        with AKSPortForward(
-            _serving(),
-            workspace_dir=tmp_path,
-            command_runner=commands,
-        ):
-            pytest.fail("context should not open")
+    with pytest.raises(AKSPortForwardError, match="AKS cluster validation failed"), AKSPortForward(
+        _serving(),
+        workspace_dir=tmp_path,
+        command_runner=commands,
+    ):
+        pytest.fail("context should not open")
 
 
 def test_aks_port_forward_rejects_non_ready_endpoints(tmp_path: Path) -> None:
@@ -223,13 +231,12 @@ def test_aks_port_forward_rejects_non_ready_endpoints(tmp_path: Path) -> None:
         _successful_results(not_ready_addresses=("10.0.0.99",), ready_addresses=())
     )
 
-    with pytest.raises(AKSPortForwardError, match="Ready endpoints"):
-        with AKSPortForward(
-            _serving(),
-            workspace_dir=tmp_path,
-            command_runner=commands,
-        ):
-            pytest.fail("context should not open")
+    with pytest.raises(AKSPortForwardError, match="Ready endpoints"), AKSPortForward(
+        _serving(),
+        workspace_dir=tmp_path,
+        command_runner=commands,
+    ):
+        pytest.fail("context should not open")
 
 
 def test_aks_port_forward_rejects_port_forward_early_exit(tmp_path: Path) -> None:
@@ -237,14 +244,13 @@ def test_aks_port_forward_rejects_port_forward_early_exit(tmp_path: Path) -> Non
     process = FakeProcess(poll_values=(9,))
     launcher = FakeProcessLauncher([process])
 
-    with pytest.raises(AKSPortForwardError, match="port-forward exited before it became ready"):
-        with AKSPortForward(
-            _serving(),
-            workspace_dir=tmp_path,
-            command_runner=commands,
-            process_launcher=launcher,
-        ):
-            pytest.fail("context should not open")
+    with pytest.raises(AKSPortForwardError, match="port-forward exited before it became ready"), AKSPortForward(
+        _serving(),
+        workspace_dir=tmp_path,
+        command_runner=commands,
+        process_launcher=launcher,
+    ):
+        pytest.fail("context should not open")
 
     assert process.terminate_calls == 0
     assert process.wait_calls == [None]
@@ -257,17 +263,18 @@ def test_aks_port_forward_stalled_live_process_times_out_and_cleans_up(tmp_path:
     clock = FakeClock((100.0, 100.2, 100.5, 101.2))
     cleanup_timeout = 0.5
 
-    with pytest.raises(AKSPortForwardTimeoutError, match="timed out waiting for port-forward readiness"):
-        with AKSPortForward(
-            _serving(),
-            workspace_dir=tmp_path,
-            command_runner=commands,
-            process_launcher=launcher,
-            monotonic_clock=clock.monotonic,
-            port_forward_ready_timeout_seconds=1.0,
-            cleanup_wait_timeout_seconds=cleanup_timeout,
-        ):
-            pytest.fail("context should not open")
+    with pytest.raises(
+        AKSPortForwardTimeoutError, match="timed out waiting for port-forward readiness"
+    ), AKSPortForward(
+        _serving(),
+        workspace_dir=tmp_path,
+        command_runner=commands,
+        process_launcher=launcher,
+        monotonic_clock=clock.monotonic,
+        port_forward_ready_timeout_seconds=1.0,
+        cleanup_wait_timeout_seconds=cleanup_timeout,
+    ):
+        pytest.fail("context should not open")
 
     assert process.terminate_calls == 1
     assert process.kill_calls == 0
@@ -284,17 +291,18 @@ def test_aks_port_forward_partial_output_still_honors_timeout(tmp_path: Path) ->
     clock = FakeClock((200.0, 200.3, 200.7, 201.2))
     cleanup_timeout = 0.5
 
-    with pytest.raises(AKSPortForwardTimeoutError, match="timed out waiting for port-forward readiness"):
-        with AKSPortForward(
-            _serving(),
-            workspace_dir=tmp_path,
-            command_runner=commands,
-            process_launcher=launcher,
-            monotonic_clock=clock.monotonic,
-            port_forward_ready_timeout_seconds=1.0,
-            cleanup_wait_timeout_seconds=cleanup_timeout,
-        ):
-            pytest.fail("context should not open")
+    with pytest.raises(
+        AKSPortForwardTimeoutError, match="timed out waiting for port-forward readiness"
+    ), AKSPortForward(
+        _serving(),
+        workspace_dir=tmp_path,
+        command_runner=commands,
+        process_launcher=launcher,
+        monotonic_clock=clock.monotonic,
+        port_forward_ready_timeout_seconds=1.0,
+        cleanup_wait_timeout_seconds=cleanup_timeout,
+    ):
+        pytest.fail("context should not open")
 
     assert process.terminate_calls == 1
     assert process.kill_calls == 0
@@ -308,16 +316,15 @@ def test_aks_port_forward_rejects_model_probe_mismatch(tmp_path: Path) -> None:
     http_get = FakeHttpGet([{"data": [{"id": "qwen3-14b"}]}])
     cleanup_timeout = 0.5
 
-    with pytest.raises(AKSPortForwardError, match="did not advertise model qwen3-4b"):
-        with AKSPortForward(
-            _serving(),
-            workspace_dir=tmp_path,
-            command_runner=commands,
-            process_launcher=launcher,
-            http_get_json=http_get,
-            cleanup_wait_timeout_seconds=cleanup_timeout,
-        ):
-            pytest.fail("context should not open")
+    with pytest.raises(AKSPortForwardError, match="did not advertise model qwen3-4b"), AKSPortForward(
+        _serving(),
+        workspace_dir=tmp_path,
+        command_runner=commands,
+        process_launcher=launcher,
+        http_get_json=http_get,
+        cleanup_wait_timeout_seconds=cleanup_timeout,
+    ):
+        pytest.fail("context should not open")
 
     assert http_get.urls == ["http://127.0.0.1:41001/v1/models"]
     assert process.terminate_calls == 1
@@ -385,19 +392,18 @@ def test_aks_port_forward_cleans_up_on_base_exception_during_startup(tmp_path: P
     launcher = FakeProcessLauncher([process])
     cleanup_timeout = 0.5
 
-    def raising_probe(_url: str) -> dict[str, object]:
+    def raising_probe(_url: str) -> Mapping[str, Any]:
         raise KeyboardInterrupt()
 
-    with pytest.raises(KeyboardInterrupt):
-        with AKSPortForward(
-            _serving(),
-            workspace_dir=tmp_path,
-            command_runner=commands,
-            process_launcher=launcher,
-            http_get_json=raising_probe,
-            cleanup_wait_timeout_seconds=cleanup_timeout,
-        ):
-            pytest.fail("context should not open")
+    with pytest.raises(KeyboardInterrupt), AKSPortForward(
+        _serving(),
+        workspace_dir=tmp_path,
+        command_runner=commands,
+        process_launcher=launcher,
+        http_get_json=cast(_HttpGetJson, raising_probe),
+        cleanup_wait_timeout_seconds=cleanup_timeout,
+    ):
+        pytest.fail("context should not open")
 
     kubeconfig = Path(commands.calls[1][commands.calls[1].index("--file") + 1])
     assert process.terminate_calls == 1

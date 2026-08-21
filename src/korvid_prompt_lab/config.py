@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 
 from .contracts import (
     AKSPortForwardServing,
-    Candidate,
     Campaign,
+    Candidate,
     EvalCase,
     ProcessServing,
     _ensure_keys,
@@ -97,6 +98,7 @@ def load_campaign(path: Path | str) -> Campaign:
 
     serving_mapping = _require_mapping(data.get("serving"), "serving")
     backend = _require_string(serving_mapping.get("backend"), "serving.backend")
+    serving: ProcessServing | AKSPortForwardServing
     if backend == "process":
         serving = _parse_process_serving(serving_mapping)
     elif backend == "aks_port_forward":

@@ -8,9 +8,10 @@ import subprocess
 import time
 import urllib.request
 import uuid
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Protocol, Self
 
 from .contracts import AKSPortForwardServing, _require_mapping
 
@@ -133,7 +134,7 @@ class AKSPortForward:
             raise AKSPortForwardError("port-forward is not active")
         return self._base_url
 
-    def __enter__(self) -> AKSPortForward:
+    def __enter__(self) -> Self:
         self._kubeconfig_path = self._create_kubeconfig_path()
         try:
             self._validate_cluster()
@@ -149,7 +150,6 @@ class AKSPortForward:
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         self._cleanup()
-        return None
 
     def _create_kubeconfig_path(self) -> Path:
         workspace_dir = Path(self.workspace_dir)

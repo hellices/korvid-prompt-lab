@@ -1,21 +1,22 @@
 from __future__ import annotations
 
-import os
 import json
+import os
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from korvid_prompt_lab.artifacts import write_json_artifact
-from korvid_prompt_lab.contracts import Candidate, Campaign, EvalCase, ProcessServing
+from korvid_prompt_lab.contracts import Campaign, Candidate, EvalCase, ProcessServing
 from korvid_prompt_lab.runner import (
     BridgeArtifactError,
     BridgeFingerprintMismatchError,
-    BridgeInvocationError,
     BridgeIdentityMismatchError,
+    BridgeInvocationError,
     BridgeMalformedOutputError,
     BridgeMissingOutputError,
     BridgeProcessExitError,
@@ -24,7 +25,6 @@ from korvid_prompt_lab.runner import (
     BridgeTimeoutError,
     KorvidProcessRunner,
 )
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -138,6 +138,7 @@ def test_runner_accepts_model_failure_status(tmp_path: Path) -> None:
 
     assert result.status == "model_failure"
     assert result.grade is None
+    assert result.error is not None
     assert "model" in result.error
 
 
@@ -210,7 +211,9 @@ def test_runner_rejects_non_integer_repetition_values(tmp_path: Path) -> None:
     case = _case("case[completed]")
 
     with pytest.raises(ValueError, match="repetition"):
-        _runner(case, campaign_repetitions=2).run(_candidate(), case, tmp_path / "run", repetition=1.5)
+        _runner(case, campaign_repetitions=2).run(
+            _candidate(), case, tmp_path / "run", repetition=cast(Any, 1.5)
+        )
 
 
 @pytest.mark.parametrize("seed", [-1, True])

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, cast
 
 import gepa
-import yaml
+import yaml  # type: ignore[import-untyped]
 from gepa import GEPAResult
 
 from .adapter import KorvidGEPAAdapter
@@ -47,21 +48,22 @@ def optimize_campaign(
     custom_candidate_proposer = DSPyInstructionProposer(reflection_lm) if reflection_lm is not None else None
     run_dir = artifact_root_path / "gepa"
 
-    result = gepa.optimize(
+    result: GEPAResult[Any, Any] = gepa.optimize(  # type: ignore[assignment]
         seed_candidate=seed_candidate.components,
         trainset=list(train_cases),
         valset=list(validation_cases),
-        adapter=adapter,
+        adapter=cast(Any, adapter),
         custom_candidate_proposer=custom_candidate_proposer,
         max_metric_calls=max_metric_calls,
         run_dir=str(run_dir),
     )
+    best_candidate_components = cast(dict[str, str], result.best_candidate)
 
     best_candidate = Candidate.from_mapping(
         {
             "schema_version": 1,
             "candidate_id": seed_candidate.candidate_id,
-            "components": dict(result.best_candidate),
+            "components": dict(best_candidate_components),
             "metadata": seed_candidate.metadata,
         }
     )

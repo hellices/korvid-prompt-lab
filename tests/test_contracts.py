@@ -9,9 +9,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from korvid_prompt_lab.config import load_candidate, load_campaign
-from korvid_prompt_lab.contracts import Candidate
-
+from korvid_prompt_lab.config import load_campaign, load_candidate
+from korvid_prompt_lab.contracts import AKSPortForwardServing, Candidate, ProcessServing
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -133,6 +132,7 @@ def test_load_campaign_from_example_yaml(monkeypatch: pytest.MonkeyPatch) -> Non
     assert local.models == ("mock-small",)
     assert local.cases[0].case_id == "smoke-happy"
     assert local.cases[0].models == ("mock-small",)
+    assert isinstance(local.serving, ProcessServing)
     assert local.serving.backend == "process"
     assert local.serving.command == (
         "python",
@@ -146,6 +146,7 @@ def test_load_campaign_from_example_yaml(monkeypatch: pytest.MonkeyPatch) -> Non
     assert aks.campaign_id == "aks-shared-runners"
     assert aks.repetitions == 2
     assert aks.models == ("qwen3-4b",)
+    assert isinstance(aks.serving, AKSPortForwardServing)
     assert aks.serving.backend == "aks_port_forward"
     assert aks.serving.resource_group == "rg-pension-guard"
     assert aks.serving.cluster_name == "aks-shared-runners"

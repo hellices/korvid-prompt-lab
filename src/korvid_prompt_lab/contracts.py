@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 
 def _require_mapping(value: Any, context: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
-        raise ValueError(f"{context} must be a mapping")
+        raise ValueError(f"{context} must be a mapping")  # noqa: TRY004 - preserve validation API
     return value
 
 
@@ -20,7 +21,7 @@ def _require_string(value: Any, context: str) -> str:
 
 def _require_unique_string_items(value: Any, context: str) -> tuple[str, ...]:
     if not isinstance(value, list):
-        raise ValueError(f"{context} must be a list of strings")
+        raise ValueError(f"{context} must be a list of strings")  # noqa: TRY004 - preserve validation API
     items: list[str] = []
     seen: set[str] = set()
     for index, item in enumerate(value):
@@ -81,7 +82,7 @@ class Candidate:
         return hashlib.sha256(encoded).hexdigest()
 
     @classmethod
-    def from_mapping(cls, mapping: Mapping[str, Any]) -> "Candidate":
+    def from_mapping(cls, mapping: Mapping[str, Any]) -> Candidate:
         data = _require_mapping(mapping, "candidate")
         _ensure_keys(data, {"schema_version", "candidate_id", "components", "metadata"}, "candidate")
 

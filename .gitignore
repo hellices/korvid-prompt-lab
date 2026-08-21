@@ -1,6 +1,8 @@
 .worktrees/
 .venv/
 __pycache__/
+*.py[cod]
+.DS_Store
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -8,4 +10,6 @@ dist/
 build/
 *.egg-info/
 artifacts/
+registry/
 *.kubeconfig
+.kubeconfig-*.yaml

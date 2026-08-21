@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from .artifacts import write_json_artifact
-from .contracts import Candidate, Campaign, EvalCase, ProcessServing, _ensure_keys, _require_mapping, _require_string
+from .contracts import (
+    Campaign,
+    Candidate,
+    EvalCase,
+    ProcessServing,
+    _ensure_keys,
+    _require_mapping,
+    _require_string,
+)
 from .scoring import BridgeResult, OperationGrade
 
 
@@ -62,7 +71,7 @@ class KorvidProcessRunner:
 
     def __post_init__(self) -> None:
         if not isinstance(self.campaign.serving, ProcessServing):
-            raise ValueError("KorvidProcessRunner requires process serving")
+            raise ValueError("KorvidProcessRunner requires process serving")  # noqa: TRY004 - preserve validation API
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
 
@@ -187,7 +196,10 @@ class KorvidProcessRunner:
 
     def _expand_command(self, request_path: Path, response_path: Path) -> tuple[str, ...]:
         expanded: list[str] = []
-        for token in self.campaign.serving.command:
+        serving = self.campaign.serving
+        if not isinstance(serving, ProcessServing):
+            raise ValueError("KorvidProcessRunner requires process serving")  # noqa: TRY004 - preserve validation API
+        for token in serving.command:
             if token == "{request}":
                 expanded.append(str(request_path))
             elif token == "{response}":
@@ -246,7 +258,7 @@ class KorvidProcessRunner:
                 raise ValueError("grade missing hard_failures")
             hard_failures = grade_mapping["hard_failures"]
             if not isinstance(hard_failures, list):
-                raise ValueError("hard_failures must be a list")
+                raise ValueError("hard_failures must be a list")  # noqa: TRY004 - preserve validation API
             return OperationGrade(
                 completion=_coerce_metric(grade_mapping["completion"], "completion"),
                 verification=_coerce_metric(grade_mapping["verification"], "verification"),
@@ -289,7 +301,7 @@ class KorvidProcessRunner:
 
 def _coerce_metric(value: Any, field_name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{field_name} must be numeric")
+        raise ValueError(f"{field_name} must be numeric")  # noqa: TRY004 - preserve validation API
     return float(value)
 
 

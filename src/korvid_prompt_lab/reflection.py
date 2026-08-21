@@ -4,7 +4,7 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-import dspy
+import dspy  # type: ignore[import-untyped]
 
 
 class ReflectionProposalSignature(dspy.Signature):

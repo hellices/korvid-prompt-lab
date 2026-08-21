@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from gepa import GEPAResult
@@ -10,10 +11,9 @@ from gepa import GEPAResult
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from korvid_prompt_lab.config import load_candidate
-from korvid_prompt_lab.contracts import Candidate, Campaign, EvalCase, ProcessServing
+from korvid_prompt_lab.contracts import Campaign, Candidate, EvalCase, ProcessServing
 from korvid_prompt_lab.optimize import OptimizationArtifacts, optimize_campaign
 from korvid_prompt_lab.runner import KorvidProcessRunner
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -92,11 +92,11 @@ def test_optimize_campaign_calls_gepa_and_persists_best_candidate_and_summary(
     validation_case = _case("val-1")
     runner = _runner([train_case, validation_case])
     seed_candidate = _seed_candidate()
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     def fake_optimize(**kwargs: object) -> GEPAResult:
         captured.update(kwargs)
-        return _fake_gepa_result(kwargs["run_dir"])  # type: ignore[index]
+        return _fake_gepa_result(cast(str, kwargs["run_dir"]))
 
     monkeypatch.setattr("korvid_prompt_lab.optimize.gepa.optimize", fake_optimize)
 
@@ -145,7 +145,7 @@ def test_optimize_campaign_uses_optional_dspy_proposer_only_when_reflection_lm_i
 
     def fake_optimize(**kwargs: object) -> GEPAResult:
         captured_proposers.append(kwargs["custom_candidate_proposer"])
-        return _fake_gepa_result(kwargs["run_dir"])  # type: ignore[index]
+        return _fake_gepa_result(cast(str, kwargs["run_dir"]))
 
     monkeypatch.setattr("korvid_prompt_lab.optimize.DSPyInstructionProposer", fake_proposer_factory)
     monkeypatch.setattr("korvid_prompt_lab.optimize.gepa.optimize", fake_optimize)

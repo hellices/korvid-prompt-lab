@@ -8,9 +8,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from korvid_prompt_lab.contracts import Candidate, Campaign, EvalCase, ProcessServing
-from korvid_prompt_lab.publish import PromptBundle, PromotionDecision, publish_bundle, render_scoreboard
-
+from korvid_prompt_lab.contracts import Campaign, Candidate, EvalCase, ProcessServing
+from korvid_prompt_lab.publish import (
+    PromotionDecision,
+    PromptBundle,
+    publish_bundle,
+    render_scoreboard,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -46,6 +50,10 @@ def _candidate_reordered(*, candidate_id: str = "candidate-common") -> Candidate
 
 
 def _campaign() -> Campaign:
+    return _campaign_with_id("campaign-1")
+
+
+def _campaign_with_id(campaign_id: str) -> Campaign:
     case = EvalCase(
         case_id="case-1",
         template_id="template-1",
@@ -54,7 +62,7 @@ def _campaign() -> Campaign:
     )
     return Campaign(
         schema_version=1,
-        campaign_id="campaign-1",
+        campaign_id=campaign_id,
         repetitions=3,
         models=("mock-small",),
         cases=(case,),
@@ -114,6 +122,7 @@ def _evaluation_summary(**overrides: object) -> dict[str, object]:
         ],
     }
     summary.update(overrides)
+    summary.setdefault("model_scores", {"mock-small": summary["aggregate_score"]})
     return summary
 
 
@@ -176,6 +185,7 @@ def test_publish_bundle_writes_deterministic_common_bundle_and_registry_files(tm
     assert isinstance(first, PromotionDecision)
     assert isinstance(first.bundle, PromptBundle)
     assert first.bundle is not None
+    assert second.bundle is not None
     assert first.bundle.version == second.bundle.version
     assert first.published is True
     assert second.published is True
@@ -220,6 +230,36 @@ def test_publish_bundle_treats_reproduction_command_as_ordered_for_versioning(tm
     assert first.bundle is not None
     assert second.bundle is not None
     assert first.bundle.version != second.bundle.version
+
+
+def test_publish_bundle_preserves_evaluation_provenance_fields(tmp_path: Path) -> None:
+    decision = publish_bundle(
+        candidate=_candidate(),
+        campaign=_campaign(),
+        model_metadata=_model_metadata(),
+        evaluation_summary=_evaluation_summary(
+            candidate_id="candidate-common",
+            candidate_fingerprint=_candidate().fingerprint,
+            campaign_id="campaign-1",
+            campaign_case_ids=["case-1"],
+            evaluated_case_ids=["case-1"],
+            evaluated_models=["mock-small"],
+            campaign_case_model_pairs=["case-1::mock-small"],
+            evaluated_case_model_pairs=["case-1::mock-small"],
+        ),
+        registry_root=tmp_path / "registry",
+    )
+
+    assert decision.bundle is not None
+    persisted_summary = json.loads(decision.bundle.evaluation_summary_path.read_text(encoding="utf-8"))
+    assert persisted_summary["candidate_id"] == "candidate-common"
+    assert persisted_summary["candidate_fingerprint"] == _candidate().fingerprint
+    assert persisted_summary["campaign_id"] == "campaign-1"
+    assert persisted_summary["campaign_case_ids"] == ["case-1"]
+    assert persisted_summary["evaluated_case_ids"] == ["case-1"]
+    assert persisted_summary["evaluated_models"] == ["mock-small"]
+    assert persisted_summary["campaign_case_model_pairs"] == ["case-1::mock-small"]
+    assert persisted_summary["evaluated_case_model_pairs"] == ["case-1::mock-small"]
 
 
 def test_publish_bundle_requires_exact_model_digest() -> None:
@@ -276,6 +316,101 @@ def test_publish_bundle_requires_common_baseline_for_model_specific_promotion(tm
     assert decision.published is False
     assert decision.bundle is None
     assert "common baseline" in decision.reason
+
+
+def test_publish_bundle_uses_strongest_common_baseline_for_model_specific_comparison(tmp_path: Path) -> None:
+    registry_root = tmp_path / "registry"
+    low_common = publish_bundle(
+        candidate=_candidate(candidate_id="a-common"),
+        campaign=_campaign(),
+        model_metadata=_model_metadata(),
+        evaluation_summary=_evaluation_summary(bundle_kind="common", aggregate_score=0.80),
+        registry_root=registry_root,
+    )
+    high_common = publish_bundle(
+        candidate=_candidate(candidate_id="z-common"),
+        campaign=_campaign(),
+        model_metadata=_model_metadata(),
+        evaluation_summary=_evaluation_summary(bundle_kind="common", aggregate_score=0.90),
+        registry_root=registry_root,
+    )
+    candidate_specific = publish_bundle(
+        candidate=_candidate(candidate_id="candidate-model"),
+        campaign=_campaign(),
+        model_metadata=_model_metadata(),
+        evaluation_summary=_evaluation_summary(bundle_kind="model-specific", aggregate_score=0.84),
+        registry_root=registry_root,
+        minimum_model_improvement=0.03,
+    )
+
+    assert low_common.published is True
+    assert high_common.published is True
+    assert candidate_specific.published is False
+    assert candidate_specific.bundle is None
+    assert "improvement" in candidate_specific.reason
+
+
+def test_publish_bundle_scopes_common_baseline_to_matching_campaign(tmp_path: Path) -> None:
+    registry_root = tmp_path / "registry"
+    same_campaign_common = publish_bundle(
+        candidate=_candidate(candidate_id="campaign-a-common"),
+        campaign=_campaign_with_id("campaign-a"),
+        model_metadata=_model_metadata(),
+        evaluation_summary=_evaluation_summary(bundle_kind="common", aggregate_score=0.80),
+        registry_root=registry_root,
+    )
+    different_campaign_common = publish_bundle(
+        candidate=_candidate(candidate_id="campaign-b-common"),
+        campaign=_campaign_with_id("campaign-b"),
+        model_metadata=_model_metadata(),
+        evaluation_summary=_evaluation_summary(bundle_kind="common", aggregate_score=0.95),
+        registry_root=registry_root,
+    )
+    same_campaign_model_specific = publish_bundle(
+        candidate=_candidate(candidate_id="campaign-a-model"),
+        campaign=_campaign_with_id("campaign-a"),
+        model_metadata=_model_metadata(),
+        evaluation_summary=_evaluation_summary(bundle_kind="model-specific", aggregate_score=0.84),
+        registry_root=registry_root,
+        minimum_model_improvement=0.03,
+    )
+
+    assert same_campaign_common.published is True
+    assert different_campaign_common.published is True
+    assert same_campaign_model_specific.published is True
+    assert same_campaign_model_specific.bundle is not None
+
+
+def test_publish_bundle_compares_model_specific_scores_against_target_model_common_score(tmp_path: Path) -> None:
+    registry_root = tmp_path / "registry"
+    common = publish_bundle(
+        candidate=_candidate(candidate_id="candidate-common"),
+        campaign=_campaign(),
+        model_metadata=_model_metadata(),
+        evaluation_summary=_evaluation_summary(
+            bundle_kind="common",
+            aggregate_score=0.95,
+            model_scores={"mock-small": 0.70, "mock-large": 0.99},
+        ),
+        registry_root=registry_root,
+    )
+    model_specific = publish_bundle(
+        candidate=_candidate(candidate_id="candidate-model"),
+        campaign=_campaign(),
+        model_metadata=_model_metadata(),
+        evaluation_summary=_evaluation_summary(
+            bundle_kind="model-specific",
+            aggregate_score=0.75,
+            model_scores={"mock-small": 0.75},
+        ),
+        registry_root=registry_root,
+        minimum_model_improvement=0.02,
+    )
+
+    assert common.published is True
+    assert model_specific.published is True
+    assert model_specific.bundle is not None
+    assert model_specific.effective_score == pytest.approx(0.75)
 
 
 def test_publish_bundle_requires_milestone_pass_for_model_specific_promotion(tmp_path: Path) -> None:

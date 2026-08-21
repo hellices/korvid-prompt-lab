@@ -4,14 +4,15 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 
 from .artifacts import write_json_artifact
-from .contracts import Candidate, Campaign, _require_mapping, _require_string
+from .contracts import Campaign, Candidate, _require_mapping, _require_string
 
 _DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -52,17 +53,19 @@ def publish_bundle(
     minimum_model_improvement: float = 0.0,
 ) -> PromotionDecision:
     if isinstance(minimum_model_improvement, bool) or not isinstance(minimum_model_improvement, (int, float)):
-        raise ValueError("minimum_model_improvement must be numeric")
+        raise ValueError("minimum_model_improvement must be numeric")  # noqa: TRY004 - preserve validation API
     if float(minimum_model_improvement) < 0.0:
         raise ValueError("minimum_model_improvement must be non-negative")
 
     model = _normalize_model_metadata(model_metadata)
     summary = _normalize_evaluation_summary(evaluation_summary)
+    provenance = _extract_evaluation_provenance(evaluation_summary)
+    target_model_score = _resolve_target_model_score(evaluation_summary, model["model_family"], summary["aggregate_score"])
 
     if summary["systemic_failures"]:
         raise RuntimeError("systemic bridge failures must abort publication")
 
-    effective_score = 0.0 if summary["hard_safety_failures"] else summary["aggregate_score"]
+    effective_score = 0.0 if summary["hard_safety_failures"] else target_model_score
     if summary["hard_safety_failures"]:
         return PromotionDecision(
             published=False,
@@ -75,7 +78,12 @@ def publish_bundle(
     existing_entries = _load_index_entries(registry_path)
     baseline_entry: Mapping[str, Any] | None = None
     if summary["bundle_kind"] == "model-specific":
-        baseline_entry = _find_common_baseline(existing_entries, model_family=model["model_family"], model_digest=model["model_digest"])
+        baseline_entry = _find_common_baseline(
+            existing_entries,
+            campaign_id=campaign.campaign_id,
+            model_family=model["model_family"],
+            model_digest=model["model_digest"],
+        )
         if baseline_entry is None:
             return PromotionDecision(
                 published=False,
@@ -108,6 +116,8 @@ def publish_bundle(
         summary=summary,
         effective_score=effective_score,
         baseline_entry=baseline_entry,
+        provenance=provenance,
+        target_model_score=target_model_score,
     )
     version = _compute_bundle_version(bundle_payload)
     bundle_dir = registry_path / "bundles" / model["model_family"] / version
@@ -174,9 +184,13 @@ def _build_bundle_payload(
     summary: Mapping[str, Any],
     effective_score: float,
     baseline_entry: Mapping[str, Any] | None,
+    provenance: Mapping[str, Any],
+    target_model_score: float,
 ) -> dict[str, Any]:
     evaluation_payload = dict(summary)
     evaluation_payload["effective_score"] = effective_score
+    evaluation_payload["target_model_score"] = target_model_score
+    evaluation_payload.update(provenance)
     if baseline_entry is not None:
         evaluation_payload["common_baseline"] = {
             "version": baseline_entry["version"],
@@ -205,6 +219,44 @@ def _build_bundle_payload(
         "model": dict(model),
         "evaluation": evaluation_payload,
     }
+
+
+def _extract_evaluation_provenance(value: Mapping[str, Any]) -> dict[str, Any]:
+    summary = _require_mapping(value, "evaluation_summary")
+    provenance: dict[str, Any] = {}
+
+    string_fields = ("candidate_id", "candidate_fingerprint", "campaign_id")
+    for field_name in string_fields:
+        field_value = summary.get(field_name)
+        if field_value is not None:
+            provenance[field_name] = _require_string(field_value, field_name)
+
+    for field_name in (
+        "campaign_case_ids",
+        "evaluated_case_ids",
+        "evaluated_models",
+        "campaign_case_model_pairs",
+        "evaluated_case_model_pairs",
+    ):
+        field_value = summary.get(field_name)
+        if field_value is not None:
+            provenance[field_name] = _normalize_unordered_string_list(field_value, field_name)
+
+    model_scores = summary.get("model_scores")
+    if model_scores is not None:
+        provenance["model_scores"] = _normalize_model_scores(model_scores)
+
+    return provenance
+
+
+def _resolve_target_model_score(summary: Mapping[str, Any], target_model: str, aggregate_score: float) -> float:
+    raw_model_scores = summary.get("model_scores")
+    if raw_model_scores is None:
+        return aggregate_score
+    model_scores = _normalize_model_scores(raw_model_scores)
+    if target_model not in model_scores:
+        raise ValueError("model_scores must include the target model family")
+    return model_scores[target_model]
 
 
 def _sorted_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
@@ -264,7 +316,7 @@ def _normalize_evaluation_summary(value: Mapping[str, Any]) -> dict[str, Any]:
     systemic_failures = _require_non_negative_int(summary.get("systemic_failures"), "systemic_failures")
     milestone_passed = summary.get("milestone_passed")
     if not isinstance(milestone_passed, bool):
-        raise ValueError("milestone_passed must be a boolean")
+        raise ValueError("milestone_passed must be a boolean")  # noqa: TRY004 - preserve validation API
 
     case_sets = _normalize_case_sets(summary.get("case_sets"))
     artifact_refs = _normalize_unordered_string_list(summary.get("artifact_refs"), "artifact_refs")
@@ -304,9 +356,19 @@ def _normalize_unordered_string_list(value: Any, context: str) -> list[str]:
     return sorted(_normalize_string_list(value, context))
 
 
+def _normalize_model_scores(value: Any) -> dict[str, float]:
+    mapping = _require_mapping(value, "model_scores")
+    normalized: dict[str, float] = {}
+    for model_name, score in sorted(mapping.items()):
+        normalized[_require_string(model_name, "model_scores key")] = _require_float(score, "model_scores value")
+    if not normalized:
+        raise ValueError("model_scores must not be empty")
+    return normalized
+
+
 def _require_float(value: Any, context: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{context} must be numeric")
+        raise ValueError(f"{context} must be numeric")  # noqa: TRY004 - preserve validation API
     return float(value)
 
 
@@ -324,19 +386,26 @@ def _load_index_entries(registry_root: Path) -> list[dict[str, Any]]:
     index = _require_mapping(payload, "registry index")
     bundles = index.get("bundles")
     if not isinstance(bundles, list):
-        raise ValueError("registry index bundles must be a list")
-    return [_require_mapping(entry, "registry bundle entry") for entry in bundles]  # type: ignore[list-item]
+        raise ValueError("registry index bundles must be a list")  # noqa: TRY004 - preserve validation API
+    return [dict(_require_mapping(entry, "registry bundle entry")) for entry in bundles]
 
 
-def _find_common_baseline(entries: Sequence[Mapping[str, Any]], *, model_family: str, model_digest: str) -> Mapping[str, Any] | None:
-    for entry in entries:
+def _find_common_baseline(
+    entries: Sequence[Mapping[str, Any]], *, campaign_id: str, model_family: str, model_digest: str
+) -> Mapping[str, Any] | None:
+    matches = [
+        entry
+        for entry in entries
         if (
             entry.get("bundle_kind") == "common"
+            and entry.get("campaign_id") == campaign_id
             and entry.get("model_family") == model_family
             and entry.get("model_digest") == model_digest
-        ):
-            return entry
-    return None
+        )
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda entry: (float(entry["effective_score"]), str(entry["version"])))
 
 
 def _bundle_index_entry(

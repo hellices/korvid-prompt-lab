@@ -4,6 +4,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -37,7 +38,7 @@ def test_dspy_instruction_proposer_is_lazy_and_serializes_reflection_records(
         "system": "Stay safe.",
         "append": "Verify before reporting completion.",
     }
-    reflective_dataset = {
+    reflective_dataset: dict[str, list[dict[str, Any]]] = {
         "system": [{"Feedback": "No changes"}],
         "append": [
             {

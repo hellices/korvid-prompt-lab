@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from gepa.core.adapter import EvaluationBatch
 

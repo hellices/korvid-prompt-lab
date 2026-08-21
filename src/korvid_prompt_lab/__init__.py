@@ -1,18 +1,18 @@
-from .config import load_candidate, load_campaign
+from .config import load_campaign, load_candidate
 from .contracts import (
     AKSPortForwardServing,
-    Candidate,
     Campaign,
+    Candidate,
     EvalCase,
     ProcessServing,
 )
 
 __all__ = [
     "AKSPortForwardServing",
-    "Candidate",
     "Campaign",
+    "Candidate",
     "EvalCase",
     "ProcessServing",
-    "load_candidate",
     "load_campaign",
+    "load_candidate",
 ]

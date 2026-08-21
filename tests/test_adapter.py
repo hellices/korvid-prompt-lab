@@ -8,11 +8,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from korvid_prompt_lab.contracts import Candidate, Campaign, EvalCase, ProcessServing
-from korvid_prompt_lab.runner import BridgeStatusError, KorvidProcessRunner
-
 from korvid_prompt_lab.adapter import KorvidGEPAAdapter
-
+from korvid_prompt_lab.contracts import Campaign, Candidate, EvalCase, ProcessServing
+from korvid_prompt_lab.runner import BridgeStatusError, KorvidProcessRunner
 
 ROOT = Path(__file__).resolve().parents[1]
 
