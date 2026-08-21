@@ -1,0 +1,20 @@
+schema_version: 1
+campaign_id: local-smoke
+repetitions: 1
+models:
+  - mock-small
+cases:
+  - case_id: smoke-happy
+    template_id: smoke-template
+    prompt: Confirm the control loop stays bounded.
+    models:
+      - mock-small
+serving:
+  backend: process
+  command:
+    - python
+    - tests/fixtures/fake_korvid_bridge.py
+    - --request
+    - "{request}"
+    - --response
+    - "{response}"

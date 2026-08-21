@@ -1,0 +1,18 @@
+schema_version: 1
+campaign_id: aks-shared-runners
+repetitions: 2
+models:
+  - env:KORVID_AKS_MODEL
+cases:
+  - case_id: aks-happy
+    template_id: aks-template
+    prompt: Confirm the shared runner service is reachable.
+    models:
+      - env:KORVID_AKS_MODEL
+serving:
+  backend: aks_port_forward
+  resource_group: rg-pension-guard
+  cluster_name: aks-shared-runners
+  namespace: env:KORVID_AKS_NAMESPACE
+  service: env:KORVID_AKS_SERVICE
+  model: env:KORVID_AKS_MODEL

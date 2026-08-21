@@ -1,0 +1,8 @@
+schema_version: 1
+candidate_id: shipped-small
+components:
+  system: You are korvid's bounded Kubernetes operator.
+  append: Verify the postcondition before reporting completion.
+  tool.scale_resource: Request an approval-gated replica-count change.
+metadata:
+  source: shipped
