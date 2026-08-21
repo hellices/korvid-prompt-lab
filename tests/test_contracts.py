@@ -154,6 +154,39 @@ def test_load_campaign_from_example_yaml(monkeypatch: pytest.MonkeyPatch) -> Non
     assert aks.serving.model == "qwen3-4b"
 
 
+def test_load_campaign_rejects_whitespace_only_env_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("KORVID_AKS_NAMESPACE", "   ")
+    monkeypatch.setenv("KORVID_AKS_SERVICE", "korvid-api")
+    monkeypatch.setenv("KORVID_AKS_MODEL", "qwen3-4b")
+
+    path = tmp_path / "campaign.yaml"
+    path.write_text(
+        """
+schema_version: 1
+campaign_id: aks-shared-runners
+repetitions: 1
+models: [qwen3-4b]
+cases:
+  - case_id: case-a
+    template_id: template-a
+    prompt: one
+    models: [qwen3-4b]
+serving:
+  backend: aks_port_forward
+  resource_group: rg-pension-guard
+  cluster_name: aks-shared-runners
+  namespace: env:KORVID_AKS_NAMESPACE
+  service: env:KORVID_AKS_SERVICE
+  model: env:KORVID_AKS_MODEL
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="serving.namespace"):
+        load_campaign(path)
+
+
 @pytest.mark.parametrize(
     ("yaml_text", "message"),
     [

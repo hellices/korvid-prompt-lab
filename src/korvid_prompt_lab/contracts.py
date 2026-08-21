@@ -13,7 +13,7 @@ def _require_mapping(value: Any, context: str) -> Mapping[str, Any]:
 
 
 def _require_string(value: Any, context: str) -> str:
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{context} must be a non-empty string")
     return value
 
@@ -47,7 +47,7 @@ def _resolve_env_string(value: Any, context: str) -> str:
         from os import getenv
 
         resolved = getenv(env_name)
-        if resolved is None or resolved == "":
+        if resolved is None or not resolved.strip():
             raise ValueError(f"{context} references missing environment variable {env_name}")
         return resolved
     return text
