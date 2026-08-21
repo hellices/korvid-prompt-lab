@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any, cast
 
+import gepa
 import pytest
+from gepa import GEPAResult
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -13,6 +17,9 @@ from korvid_prompt_lab.contracts import Campaign, Candidate, EvalCase, ProcessSe
 from korvid_prompt_lab.runner import BridgeStatusError, KorvidProcessRunner
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tests" / "fixtures"))
+
+from fake_korvid_bridge import TUNED_MARKER
 
 
 def _seed_candidate() -> Candidate:
@@ -246,3 +253,35 @@ def test_adapter_propagates_systemic_runner_failures(tmp_path: Path) -> None:
 
     with pytest.raises(BridgeStatusError):
         adapter.evaluate([case], _seed_candidate().components, capture_traces=False)
+
+
+def test_real_gepa_invokes_the_adapter_proposal_contract_and_can_beat_the_seed(tmp_path: Path) -> None:
+    train_cases = [_case("train-1"), _case("train-2"), _case("train-3")]
+    validation_cases = [_case("val-1"), _case("val-2")]
+    adapter = _adapter(tmp_path, train_cases + validation_cases)
+    seed_components = _seed_candidate().components
+    proposals: list[list[str]] = []
+
+    def recording_proposer(
+        candidate: dict[str, str],
+        reflective_dataset: Mapping[str, Sequence[Mapping[str, Any]]],
+        components_to_update: list[str],
+    ) -> dict[str, str]:
+        proposals.append(list(components_to_update))
+        return {name: f"{candidate[name]} {TUNED_MARKER}" for name in components_to_update}
+
+    result: GEPAResult[Any, Any] = gepa.optimize(
+        seed_candidate=dict(seed_components),
+        trainset=train_cases,
+        valset=validation_cases,
+        adapter=cast(Any, adapter),
+        custom_candidate_proposer=recording_proposer,
+        max_metric_calls=16,
+        run_dir=str(tmp_path / "gepa"),
+    )
+    best_candidate = cast(dict[str, str], result.best_candidate)
+
+    assert proposals, "real GEPA reflective mutation must invoke the proposal contract"
+    assert best_candidate != seed_components
+    assert TUNED_MARKER in "".join(best_candidate.values())
+    assert result.val_aggregate_scores[result.best_idx] > result.val_aggregate_scores[0]

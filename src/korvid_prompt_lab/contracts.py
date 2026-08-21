@@ -140,6 +140,7 @@ class AKSPortForwardServing:
     namespace: str
     service: str
     model: str
+    command: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)

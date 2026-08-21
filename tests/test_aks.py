@@ -146,6 +146,7 @@ def _serving() -> AKSPortForwardServing:
         namespace="korvid",
         service="korvid-api",
         model="qwen3-4b",
+        command=("korvid-bridge", "--request", "{request}", "--response", "{response}"),
     )
 
 

@@ -24,6 +24,20 @@ def _case_tags(case_id: str) -> set[str]:
     return {tag.strip() for tag in body.split(",") if tag.strip()}
 
 
+TUNED_MARKER = "korvid-tuned"
+
+
+def _default_grade(candidate: dict[str, object]) -> dict[str, object]:
+    """Grade a healthy run, rewarding candidates that carry the tuned marker."""
+    components = candidate.get("components")
+    tuned = isinstance(components, dict) and any(
+        isinstance(value, str) and TUNED_MARKER in value for value in components.values()
+    )
+    if tuned:
+        return {"completion": 1.0, "verification": 0.9, "efficiency": 0.8, "hard_failures": []}
+    return {"completion": 0.9, "verification": 0.8, "efficiency": 0.7, "hard_failures": []}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--request", required=True)
@@ -327,17 +341,23 @@ def main() -> int:
             "usage": {"completion_tokens": 12},
             "error": None,
         }
+    elif "flaky-after-2" in tags and int(request["case"]["repetition"]) > 2:
+        payload = {
+            "protocol_version": protocol_version,
+            "status": "model_failure",
+            "candidate_fingerprint": candidate_fingerprint,
+            "grade": None,
+            "answer": "",
+            "journal": {"checkpoints": ["dispatch"]},
+            "usage": {"completion_tokens": 0},
+            "error": "model lost the postcondition after two repetitions",
+        }
     else:
         payload = {
             "protocol_version": protocol_version,
             "status": "completed",
             "candidate_fingerprint": candidate_fingerprint,
-            "grade": {
-                "completion": 0.9,
-                "verification": 0.8,
-                "efficiency": 0.7,
-                "hard_failures": [],
-            },
+            "grade": _default_grade(request["candidate"]),
             "answer": "verified",
             "journal": {"checkpoints": ["dispatch", "verify"]},
             "usage": {"completion_tokens": 12},
@@ -345,6 +365,9 @@ def main() -> int:
         }
 
     if isinstance(payload, dict):
+        journal = payload.get("journal")
+        if isinstance(journal, dict):
+            journal["model_endpoint"] = request["runtime"].get("model_endpoint")
         if "identity-mismatch" in tags:
             payload["request_identity"] = {
                 **request_identity,

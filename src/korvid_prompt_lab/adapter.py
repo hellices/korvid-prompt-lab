@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from gepa.core.adapter import EvaluationBatch
+from gepa.core.adapter import EvaluationBatch, ProposalFn
 
 from .contracts import Candidate, EvalCase
 from .runner import KorvidProcessRunner
@@ -28,6 +28,11 @@ class SafeExecutionTrace:
 
 
 class KorvidGEPAAdapter:
+    # GEPA reads this attribute on every reflective mutation. Keeping it declared and
+    # None keeps proposal responsibility outside the adapter (DSPy reflection or an
+    # explicitly injected proposer) instead of silently aborting the mutation step.
+    propose_new_texts: ProposalFn | None = None
+
     def __init__(
         self,
         runner: KorvidProcessRunner,

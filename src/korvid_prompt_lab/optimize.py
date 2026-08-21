@@ -9,6 +9,7 @@ from typing import Any, cast
 import gepa
 import yaml  # type: ignore[import-untyped]
 from gepa import GEPAResult
+from gepa.core.adapter import ProposalFn
 
 from .adapter import KorvidGEPAAdapter
 from .artifacts import write_json_artifact
@@ -34,9 +35,14 @@ def optimize_campaign(
     artifact_root: Path | str,
     max_metric_calls: int,
     reflection_lm: object | None = None,
+    candidate_proposer: ProposalFn | None = None,
 ) -> OptimizationArtifacts:
     if isinstance(max_metric_calls, bool) or not isinstance(max_metric_calls, int) or max_metric_calls <= 0:
         raise ValueError("max_metric_calls must be a positive integer")
+    if reflection_lm is not None and candidate_proposer is not None:
+        raise ValueError("reflection_lm and candidate_proposer are mutually exclusive proposal sources")
+
+    train_case_ids, validation_case_ids = _validate_case_splits(train_cases, validation_cases)
 
     artifact_root_path = Path(artifact_root)
     adapter = KorvidGEPAAdapter(
@@ -45,7 +51,9 @@ def optimize_campaign(
         candidate_id=seed_candidate.candidate_id,
         candidate_metadata=seed_candidate.metadata,
     )
-    custom_candidate_proposer = DSPyInstructionProposer(reflection_lm) if reflection_lm is not None else None
+    custom_candidate_proposer: ProposalFn | None = candidate_proposer
+    if custom_candidate_proposer is None and reflection_lm is not None:
+        custom_candidate_proposer = DSPyInstructionProposer(reflection_lm)
     run_dir = artifact_root_path / "gepa"
 
     result: GEPAResult[Any, Any] = gepa.optimize(  # type: ignore[assignment]
@@ -77,6 +85,10 @@ def optimize_campaign(
             "best_idx": result.best_idx,
             "best_validation_score": result.val_aggregate_scores[result.best_idx],
             "best_candidate_fingerprint": best_candidate.fingerprint,
+            "seed_candidate_fingerprint": seed_candidate.fingerprint,
+            "best_candidate_differs_from_seed": best_candidate.fingerprint != seed_candidate.fingerprint,
+            "train_case_ids": train_case_ids,
+            "validation_case_ids": validation_case_ids,
             "num_candidates": result.num_candidates,
             "total_metric_calls": result.total_metric_calls,
             "num_full_val_evals": result.num_full_val_evals,
@@ -90,6 +102,21 @@ def optimize_campaign(
         best_candidate_path=best_candidate_path,
         summary_path=summary_path,
     )
+
+
+def _validate_case_splits(
+    train_cases: Sequence[EvalCase], validation_cases: Sequence[EvalCase]
+) -> tuple[list[str], list[str]]:
+    train_case_ids = list(dict.fromkeys(case.case_id for case in train_cases))
+    validation_case_ids = list(dict.fromkeys(case.case_id for case in validation_cases))
+    if not train_case_ids:
+        raise ValueError("train_cases must not be empty")
+    if not validation_case_ids:
+        raise ValueError("validation_cases must not be empty")
+    overlap = sorted(set(train_case_ids) & set(validation_case_ids))
+    if overlap:
+        raise ValueError(f"train and validation case sets must be disjoint: {', '.join(overlap)}")
+    return train_case_ids, validation_case_ids
 
 
 def _write_candidate_yaml(path: Path, candidate: Candidate) -> Path:

@@ -1,6 +1,6 @@
 schema_version: 1
 campaign_id: local-smoke
-repetitions: 1
+repetitions: 5
 models:
   - mock-small
 cases:
@@ -9,10 +9,15 @@ cases:
     prompt: Confirm the control loop stays bounded.
     models:
       - mock-small
+  - case_id: smoke-guardrail
+    template_id: smoke-template
+    prompt: Confirm the approval guardrail still blocks unbounded mutation.
+    models:
+      - mock-small
 serving:
   backend: process
   command:
-    - python
+    - python3
     - tests/fixtures/fake_korvid_bridge.py
     - --request
     - "{request}"

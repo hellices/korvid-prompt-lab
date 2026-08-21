@@ -128,14 +128,14 @@ def test_load_campaign_from_example_yaml(monkeypatch: pytest.MonkeyPatch) -> Non
     aks = load_campaign(ROOT / "examples/campaigns/aks-shared-runners.yaml")
 
     assert local.campaign_id == "local-smoke"
-    assert local.repetitions == 1
+    assert local.repetitions == 5
     assert local.models == ("mock-small",)
-    assert local.cases[0].case_id == "smoke-happy"
+    assert [case.case_id for case in local.cases] == ["smoke-happy", "smoke-guardrail"]
     assert local.cases[0].models == ("mock-small",)
     assert isinstance(local.serving, ProcessServing)
     assert local.serving.backend == "process"
     assert local.serving.command == (
-        "python",
+        "python3",
         "tests/fixtures/fake_korvid_bridge.py",
         "--request",
         "{request}",
@@ -144,8 +144,9 @@ def test_load_campaign_from_example_yaml(monkeypatch: pytest.MonkeyPatch) -> Non
     )
 
     assert aks.campaign_id == "aks-shared-runners"
-    assert aks.repetitions == 2
+    assert aks.repetitions == 5
     assert aks.models == ("qwen3-4b",)
+    assert [case.case_id for case in aks.cases] == ["aks-happy", "aks-guardrail"]
     assert isinstance(aks.serving, AKSPortForwardServing)
     assert aks.serving.backend == "aks_port_forward"
     assert aks.serving.resource_group == "rg-pension-guard"
@@ -153,6 +154,13 @@ def test_load_campaign_from_example_yaml(monkeypatch: pytest.MonkeyPatch) -> Non
     assert aks.serving.namespace == "korvid"
     assert aks.serving.service == "korvid-api"
     assert aks.serving.model == "qwen3-4b"
+    assert aks.serving.command == (
+        "korvid-bridge",
+        "--request",
+        "{request}",
+        "--response",
+        "{response}",
+    )
 
 
 def test_load_campaign_rejects_whitespace_only_env_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -274,4 +282,95 @@ def test_load_campaign_rejects_invalid_campaigns(
     path.write_text(yaml_text.strip() + "\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match=message):
+        load_campaign(path)
+
+
+def _aks_campaign_yaml(serving_lines: str) -> str:
+    return (
+        """
+schema_version: 1
+campaign_id: aks-campaign
+repetitions: 1
+models: [qwen3-4b]
+cases:
+  - case_id: case-a
+    template_id: template-a
+    prompt: one
+    models: [qwen3-4b]
+serving:
+  backend: aks_port_forward
+  resource_group: rg-pension-guard
+  cluster_name: aks-shared-runners
+  namespace: korvid
+  service: korvid-api
+  model: qwen3-4b
+"""
+        + serving_lines
+    ).strip() + "\n"
+
+
+def test_load_campaign_parses_the_explicit_local_bridge_command_for_aks_serving(tmp_path: Path) -> None:
+    path = tmp_path / "campaign.yaml"
+    path.write_text(
+        _aks_campaign_yaml(
+            """
+  command: [korvid-bridge, --request, "{request}", --response, "{response}"]
+"""
+        ),
+        encoding="utf-8",
+    )
+
+    campaign = load_campaign(path)
+
+    assert isinstance(campaign.serving, AKSPortForwardServing)
+    assert campaign.serving.command == (
+        "korvid-bridge",
+        "--request",
+        "{request}",
+        "--response",
+        "{response}",
+    )
+
+
+@pytest.mark.parametrize(
+    ("serving_lines", "message"),
+    [
+        ("", "serving.command"),
+        ("""\n  command: []\n""", "serving.command"),
+        ("""\n  command: [korvid-bridge, --request, "{request}"]\n""", r"\{response\}"),
+        ("""\n  command: [korvid-bridge, "env:KORVID_BRIDGE_ARGS", --request, "{request}", --response, "{response}"]\n""", "env:"),
+    ],
+)
+def test_load_campaign_rejects_unusable_aks_bridge_commands(
+    tmp_path: Path, serving_lines: str, message: str
+) -> None:
+    path = tmp_path / "campaign.yaml"
+    path.write_text(_aks_campaign_yaml(serving_lines), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_campaign(path)
+
+
+def test_load_campaign_rejects_process_commands_without_artifact_placeholders(tmp_path: Path) -> None:
+    path = tmp_path / "campaign.yaml"
+    path.write_text(
+        """
+schema_version: 1
+campaign_id: process-campaign
+repetitions: 1
+models: [mock-small]
+cases:
+  - case_id: case-a
+    template_id: template-a
+    prompt: one
+    models: [mock-small]
+serving:
+  backend: process
+  command: [python3, bridge.py]
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"\{request\}"):
         load_campaign(path)

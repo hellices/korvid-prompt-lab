@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -13,9 +14,9 @@ from .artifacts import write_json_artifact
 from .config import load_campaign, load_candidate
 from .contracts import AKSPortForwardServing, Campaign, Candidate, EvalCase
 from .optimize import OptimizationArtifacts, optimize_campaign
-from .publish import publish_bundle
+from .publish import DEFAULT_MINIMUM_MODEL_IMPROVEMENT, publish_bundle
 from .runner import BridgeSystemError, KorvidProcessRunner
-from .scoring import score_result
+from .scoring import RepetitionOutcome, pass_hat_k, score_result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,6 +41,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Limit evaluation to one or more case_id values.",
+    )
+    evaluate_parser.add_argument(
+        "--train-case-id",
+        dest="train_case_ids",
+        action="append",
+        default=[],
+        help="Case ids that form the train split recorded in the evaluation summary.",
+    )
+    evaluate_parser.add_argument(
+        "--validation-case-id",
+        dest="validation_case_ids",
+        action="append",
+        default=[],
+        help="Case ids that form the validation split recorded in the evaluation summary.",
+    )
+    evaluate_parser.add_argument(
+        "--milestone-case-id",
+        dest="milestone_case_ids",
+        action="append",
+        default=[],
+        help="Case ids that form the milestone pack recorded in the evaluation summary.",
     )
     evaluate_parser.add_argument(
         "--bundle-kind",
@@ -73,14 +95,14 @@ def build_parser() -> argparse.ArgumentParser:
         dest="train_case_ids",
         action="append",
         default=[],
-        help="Limit the train split to one or more case_id values.",
+        help="Case ids used for the train split; required and disjoint from the validation split.",
     )
     optimize_parser.add_argument(
         "--validation-case-id",
         dest="validation_case_ids",
         action="append",
         default=[],
-        help="Limit the validation split to one or more case_id values.",
+        help="Case ids used for the validation split; required and disjoint from the train split.",
     )
     optimize_parser.set_defaults(func=command_optimize)
 
@@ -112,8 +134,11 @@ def build_parser() -> argparse.ArgumentParser:
     publish_parser.add_argument(
         "--minimum-model-improvement",
         type=float,
-        default=0.0,
-        help="Minimum effective-score improvement for model-specific publication.",
+        default=DEFAULT_MINIMUM_MODEL_IMPROVEMENT,
+        help=(
+            "Minimum effective-score improvement a model-specific bundle must strictly exceed "
+            f"over its common baseline (default {DEFAULT_MINIMUM_MODEL_IMPROVEMENT})."
+        ),
     )
     publish_parser.set_defaults(func=command_publish)
 
@@ -157,25 +182,31 @@ def command_evaluate(args: argparse.Namespace) -> int:
     try:
         candidate, campaign = _load_candidate_campaign(args.candidate, args.campaign)
         selected_cases = _select_cases(campaign.cases, args.case_ids)
+        case_sets = _resolve_case_sets(args, [case.case_id for case in selected_cases])
     except (OSError, ValueError) as exc:
         print(f"evaluation failed: {exc}", file=_stderr())
         return 2
 
     artifact_root = Path(args.artifact_root)
     try:
-        runner = KorvidProcessRunner(campaign=campaign)
-        summary = _evaluate_campaign(
-            candidate=candidate,
-            campaign=campaign,
-            selected_cases=selected_cases,
-            runner=runner,
-            artifact_root=artifact_root,
-            bundle_kind=args.bundle_kind,
-            reproduction_command=_evaluate_reproduction_command(args),
-        )
+        with _serving_session(campaign, artifact_root) as model_endpoint:
+            runner = KorvidProcessRunner(campaign=campaign, model_endpoint=model_endpoint)
+            summary = _evaluate_campaign(
+                candidate=candidate,
+                campaign=campaign,
+                selected_cases=selected_cases,
+                runner=runner,
+                artifact_root=artifact_root,
+                bundle_kind=args.bundle_kind,
+                case_sets=case_sets,
+                reproduction_command=_evaluate_reproduction_command(args),
+            )
     except ValueError as exc:
         print(f"evaluation failed: {exc}", file=_stderr())
         return 2
+    except AKSPortForwardError as exc:
+        print(f"evaluation failed: AKS serving error: {exc}", file=_stderr())
+        return 1
     except BridgeSystemError as exc:
         print(f"evaluation failed: systemic bridge error: {exc}", file=_stderr())
         return 1
@@ -194,12 +225,12 @@ def command_evaluate(args: argparse.Namespace) -> int:
         print(json.dumps(summary, sort_keys=True, ensure_ascii=False, indent=2))
     elif exit_code == 0:
         print(
-            "evaluated candidate={candidate_id} campaign={campaign_id} aggregate={aggregate:.3f} pass^3={pass3:.3f} pass^5={pass5:.3f} summary={summary_path}".format(
+            "evaluated candidate={candidate_id} campaign={campaign_id} aggregate={aggregate:.3f} pass^3={pass3} pass^5={pass5} summary={summary_path}".format(
                 candidate_id=candidate.candidate_id,
                 campaign_id=campaign.campaign_id,
                 aggregate=summary["aggregate_score"],
-                pass3=summary["pass_at_3"],
-                pass5=summary["pass_at_5"],
+                pass3=_format_pass_hat_k(summary["pass_at_3"]),
+                pass5=_format_pass_hat_k(summary["pass_at_5"]),
                 summary_path=summary_path,
             )
         )
@@ -216,6 +247,9 @@ def command_optimize(args: argparse.Namespace) -> int:
 
     try:
         candidate, campaign = _load_candidate_campaign(args.candidate, args.campaign)
+        _require_case_selection("--train-case-id", args.train_case_ids)
+        _require_case_selection("--validation-case-id", args.validation_case_ids)
+        _require_disjoint_case_selections(args.train_case_ids, args.validation_case_ids)
         train_cases = _expand_cases(_select_cases(campaign.cases, args.train_case_ids))
         validation_cases = _expand_cases(_select_cases(campaign.cases, args.validation_case_ids))
     except (OSError, ValueError) as exc:
@@ -223,15 +257,16 @@ def command_optimize(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        artifacts = optimize_campaign(
-            runner=KorvidProcessRunner(campaign=campaign),
-            seed_candidate=candidate,
-            train_cases=train_cases,
-            validation_cases=validation_cases,
-            artifact_root=args.artifact_root,
-            max_metric_calls=args.max_metric_calls,
-            reflection_lm=_build_reflection_lm(args.reflection_model),
-        )
+        with _serving_session(campaign, Path(args.artifact_root)) as model_endpoint:
+            artifacts = optimize_campaign(
+                runner=KorvidProcessRunner(campaign=campaign, model_endpoint=model_endpoint),
+                seed_candidate=candidate,
+                train_cases=train_cases,
+                validation_cases=validation_cases,
+                artifact_root=args.artifact_root,
+                max_metric_calls=args.max_metric_calls,
+                reflection_lm=_build_reflection_lm(args.reflection_model),
+            )
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"optimization failed: {exc}", file=_stderr())
         return 1
@@ -304,6 +339,17 @@ def _stderr() -> Any:
     return sys.stderr
 
 
+@contextmanager
+def _serving_session(campaign: Campaign, workspace_dir: Path) -> Iterator[str | None]:
+    """Hold the exact serving resources a campaign needs for a whole run."""
+    serving = campaign.serving
+    if not isinstance(serving, AKSPortForwardServing):
+        yield None
+        return
+    with AKSPortForward(serving, workspace_dir=workspace_dir) as forward:
+        yield forward.base_url
+
+
 def _load_candidate_campaign(candidate_path: Path, campaign_path: Path) -> tuple[Candidate, Campaign]:
     return load_candidate(candidate_path), load_campaign(campaign_path)
 
@@ -341,6 +387,42 @@ def _expand_cases(cases: Sequence[EvalCase]) -> tuple[EvalCase, ...]:
     return tuple(expanded)
 
 
+def _require_case_selection(flag: str, case_ids: Sequence[str]) -> list[str]:
+    selection = list(dict.fromkeys(case_ids))
+    if not selection:
+        raise ValueError(f"{flag} is required and must name at least one case")
+    return selection
+
+
+def _require_disjoint_case_selections(train_case_ids: Sequence[str], validation_case_ids: Sequence[str]) -> None:
+    overlap = sorted(set(train_case_ids) & set(validation_case_ids))
+    if overlap:
+        raise ValueError(f"train and validation case sets must be disjoint: {', '.join(overlap)}")
+
+
+def _resolve_case_sets(args: argparse.Namespace, evaluated_case_ids: Sequence[str]) -> dict[str, list[str]]:
+    train_case_ids = _require_case_selection("--train-case-id", args.train_case_ids)
+    validation_case_ids = _require_case_selection("--validation-case-id", args.validation_case_ids)
+    _require_disjoint_case_selections(train_case_ids, validation_case_ids)
+    milestone_case_ids = list(dict.fromkeys(args.milestone_case_ids))
+
+    evaluated = set(evaluated_case_ids)
+    for label, case_ids in (
+        ("train", train_case_ids),
+        ("validation", validation_case_ids),
+        ("milestone", milestone_case_ids),
+    ):
+        missing = [case_id for case_id in case_ids if case_id not in evaluated]
+        if missing:
+            raise ValueError(f"{label} case set must be drawn from the evaluated cases: {', '.join(missing)}")
+
+    return {
+        "train": train_case_ids,
+        "validation": validation_case_ids,
+        "milestone": milestone_case_ids,
+    }
+
+
 def _evaluate_campaign(
     *,
     candidate: Candidate,
@@ -349,11 +431,13 @@ def _evaluate_campaign(
     runner: KorvidProcessRunner,
     artifact_root: Path,
     bundle_kind: str,
+    case_sets: Mapping[str, Sequence[str]],
     reproduction_command: Sequence[str],
 ) -> dict[str, Any]:
     artifact_root.mkdir(parents=True, exist_ok=True)
     executed_cases = _expand_cases(selected_cases)
     run_records: list[dict[str, Any]] = []
+    repetition_outcomes: list[RepetitionOutcome] = []
     scores: list[float] = []
     hard_safety_failures = 0
 
@@ -375,6 +459,14 @@ def _evaluate_campaign(
                     "hard_failures": list(result.grade.hard_failures) if result.grade is not None else [],
                 }
             )
+            repetition_outcomes.append(
+                RepetitionOutcome(
+                    case_id=case.case_id,
+                    model=case.models[0],
+                    repetition=repetition,
+                    passed=scored.score > 0.0 and not scored.unsafe,
+                )
+            )
             scores.append(scored.score)
             hard_safety_failures += len(result.grade.hard_failures) if result.grade is not None else 0
 
@@ -383,7 +475,7 @@ def _evaluate_campaign(
     evaluated_models = sorted({case.models[0] for case in executed_cases})
     campaign_case_model_pairs = _case_model_pairs(campaign.cases)
     evaluated_case_model_pairs = _case_model_pairs(executed_cases)
-    milestone_case_ids: list[str] = []
+    required_milestone_case_ids: list[str] = []
     full_milestone_pack_executed = False
     if bundle_kind == "model-specific" and len(evaluated_models) == 1:
         target_model = evaluated_models[0]
@@ -393,18 +485,29 @@ def _evaluate_campaign(
             for model in case.models
             if model == target_model
         ]
-        milestone_case_ids = list(dict.fromkeys(case_id for case_id, _ in (_decode_case_model_pair(pair, "campaign_case_model_pairs") for pair in expected_target_pairs)))
-        full_milestone_pack_executed = (
-            evaluated_case_ids == milestone_case_ids and set(evaluated_case_model_pairs) == set(expected_target_pairs)
+        required_milestone_case_ids = list(
+            dict.fromkeys(
+                case_id
+                for case_id, _ in (
+                    _decode_case_model_pair(pair, "campaign_case_model_pairs") for pair in expected_target_pairs
+                )
+            )
         )
-        if not full_milestone_pack_executed:
-            milestone_case_ids = []
-    elif bundle_kind == "model-specific":
-        full_milestone_pack_executed = False
-        milestone_case_ids = []
-    else:
+        full_milestone_pack_executed = (
+            evaluated_case_ids == required_milestone_case_ids
+            and set(evaluated_case_model_pairs) == set(expected_target_pairs)
+        )
+    elif bundle_kind == "common":
+        required_milestone_case_ids = list(campaign_case_ids)
         full_milestone_pack_executed = evaluated_case_ids == campaign_case_ids
-        milestone_case_ids = list(campaign_case_ids) if full_milestone_pack_executed else []
+
+    requested_milestone_case_ids = list(dict.fromkeys(case_sets.get("milestone", ())))
+    if requested_milestone_case_ids:
+        milestone_case_ids = requested_milestone_case_ids
+        milestone_covers_required_pack = set(milestone_case_ids) == set(required_milestone_case_ids)
+    else:
+        milestone_case_ids = list(required_milestone_case_ids) if full_milestone_pack_executed else []
+        milestone_covers_required_pack = full_milestone_pack_executed
     summary: dict[str, Any] = {
         "bundle_kind": bundle_kind,
         "candidate_id": candidate.candidate_id,
@@ -417,14 +520,17 @@ def _evaluate_campaign(
         "evaluated_case_model_pairs": evaluated_case_model_pairs,
         "aggregate_score": sum(scores) / len(scores) if scores else 0.0,
         "model_scores": _model_scores(run_records),
-        "pass_at_3": _pass_at_k(run_records, 3),
-        "pass_at_5": _pass_at_k(run_records, 5),
+        "repetitions_per_case": campaign.repetitions,
+        "pass_at_3": pass_hat_k(repetition_outcomes, 3),
+        "pass_at_5": pass_hat_k(repetition_outcomes, 5),
         "hard_safety_failures": hard_safety_failures,
         "systemic_failures": 0,
-        "milestone_passed": hard_safety_failures == 0 and full_milestone_pack_executed,
+        "milestone_passed": (
+            hard_safety_failures == 0 and full_milestone_pack_executed and milestone_covers_required_pack
+        ),
         "case_sets": {
-            "train": evaluated_case_ids,
-            "validation": evaluated_case_ids,
+            "train": list(case_sets["train"]),
+            "validation": list(case_sets["validation"]),
             "milestone": milestone_case_ids,
         },
         "artifact_refs": [],
@@ -439,21 +545,10 @@ def _case_run_slug(case: EvalCase, repetition: int) -> str:
     return f"{normalized_case_id or 'case'}-{normalized_model or 'model'}-r{repetition:02d}"
 
 
-def _pass_at_k(run_records: Sequence[dict[str, Any]], k: int) -> float:
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    for record in run_records:
-        key = (str(record["case_id"]), str(record["model"]))
-        grouped.setdefault(key, []).append(record)
-
-    if not grouped:
-        return 0.0
-
-    passed = 0
-    for records in grouped.values():
-        limited = sorted(records, key=lambda item: int(item["repetition"]))[:k]
-        if any(float(record["score"]) > 0.0 and not bool(record["unsafe"]) for record in limited):
-            passed += 1
-    return passed / len(grouped)
+def _format_pass_hat_k(value: float | None) -> str:
+    if value is None:
+        return "insufficient-evidence"
+    return f"{value:.3f}"
 
 
 def _model_scores(run_records: Sequence[dict[str, Any]]) -> dict[str, float]:
@@ -502,6 +597,12 @@ def _evaluate_reproduction_command(args: argparse.Namespace) -> list[str]:
     ]
     for case_id in args.case_ids:
         command.extend(["--case-id", str(case_id)])
+    for case_id in args.train_case_ids:
+        command.extend(["--train-case-id", str(case_id)])
+    for case_id in args.validation_case_ids:
+        command.extend(["--validation-case-id", str(case_id)])
+    for case_id in args.milestone_case_ids:
+        command.extend(["--milestone-case-id", str(case_id)])
     return command
 
 

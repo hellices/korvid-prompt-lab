@@ -35,28 +35,40 @@ uv run --python 3.12 korvid-prompt-lab validate \
 ### Evaluate
 
 Runs the selected cases through the configured bridge, writes request/response
-artifacts, emits an `evaluation-summary.json` with candidate/campaign identity
-and case/model coverage metadata for `publish`, and fails if any hard safety
-failure occurs.
+artifacts, emits an `evaluation-summary.json` with candidate/campaign identity,
+case/model coverage, and the exact train/validation/milestone sets used as
+publication provenance, and fails if any hard safety failure occurs.
+
+`--train-case-id` and `--validation-case-id` are **required**. Both must name at
+least one evaluated case and the two sets must be disjoint, so a bundle can never
+claim validation evidence that is really its own training evidence.
 
 ```bash
 uv run --python 3.12 korvid-prompt-lab evaluate \
   --candidate examples/candidates/shipped-small.yaml \
   --campaign examples/campaigns/local-smoke.yaml \
   --artifact-root artifacts/evaluate/local-smoke \
+  --train-case-id smoke-happy \
+  --validation-case-id smoke-guardrail \
   --json
 ```
 
 Useful flags:
 
 - `--case-id <id>` to limit evaluation to selected cases
+- `--train-case-id <id>` (required) recorded train split
+- `--validation-case-id <id>` (required) recorded validation split, disjoint from train
+- `--milestone-case-id <id>` to record an explicit milestone pack; `milestone_passed`
+  stays `false` unless the recorded pack is exactly the required pack and it ran
 - `--bundle-kind common|model-specific` to record promotion intent
 - `--json` to print the summary JSON to stdout
 
 ### Optimize
 
 Requires a reflection-model configuration and delegates bounded search to
-`optimize_campaign(...)`.
+`optimize_campaign(...)`. `--train-case-id` and `--validation-case-id` are
+**required** and must be disjoint, so search never validates on the cases it
+learned from.
 
 ```bash
 uv run --python 3.12 korvid-prompt-lab optimize \
@@ -64,19 +76,64 @@ uv run --python 3.12 korvid-prompt-lab optimize \
   --campaign examples/campaigns/local-smoke.yaml \
   --artifact-root artifacts/optimize/local-smoke \
   --max-metric-calls 2 \
-  --reflection-model openai/gpt-4.1-mini
+  --reflection-model openai/gpt-4.1-mini \
+  --train-case-id smoke-happy \
+  --validation-case-id smoke-guardrail
 ```
 
-Optional flags:
+`optimization-summary.json` records `train_case_ids`, `validation_case_ids`, the
+seed fingerprint, and `best_candidate_differs_from_seed` so a silent no-op search
+is visible in the artifact.
 
-- `--train-case-id <id>` to filter the train split
-- `--validation-case-id <id>` to filter the validation split
+#### GEPA proposal contract
 
-### AKS preflight
+`KorvidGEPAAdapter` declares GEPA's optional `propose_new_texts` attribute and
+leaves it `None`. GEPA reads that attribute on every reflective mutation; without
+it the mutation step raises inside GEPA's own `try/except`, is logged, and the
+search silently degrades to "no candidate proposed". Proposals themselves stay
+outside the adapter:
+
+- `--reflection-model` builds a DSPy reflection LM and passes
+  `DSPyInstructionProposer` as GEPA's `custom_candidate_proposer` (reflection only);
+- library callers may inject a deterministic proposer with
+  `optimize_campaign(..., candidate_proposer=...)`; `reflection_lm` and
+  `candidate_proposer` are mutually exclusive.
+
+### AKS-backed serving
 
 `aks-check` performs a read-only preflight for the `aks_port_forward` backend.
 It validates the cluster, namespace, Service, Ready endpoints, loopback-only
 port-forward, and `/v1/models` advertisement without changing the cluster.
+
+`evaluate` and `optimize` use the same backend: for an `aks_port_forward`
+campaign they open exactly one loopback port-forward, keep it open for the whole
+run, pass the resulting `http://127.0.0.1:<port>` base URL to every bridge
+request as `runtime.model_endpoint`, and terminate only that forward (and its
+temporary kubeconfig) when the run ends, including on failure.
+
+An `aks_port_forward` campaign must therefore declare the reviewed local Korvid
+bridge command explicitly:
+
+```yaml
+serving:
+  backend: aks_port_forward
+  resource_group: rg-pension-guard
+  cluster_name: aks-shared-runners
+  namespace: env:KORVID_AKS_NAMESPACE
+  service: env:KORVID_AKS_SERVICE
+  model: env:KORVID_AKS_MODEL
+  command:
+    - korvid-bridge
+    - --request
+    - "{request}"
+    - --response
+    - "{response}"
+```
+
+Bridge commands are argument lists: no shell, no `env:` interpolation, and both
+`{request}` and `{response}` placeholders are required. The endpoint is delivered
+inside the request JSON, never on a shared or public address; the runner rejects
+any endpoint that is not a loopback `http://` URL with an explicit port.
 
 ```bash
 export KORVID_AKS_NAMESPACE=korvid
@@ -122,7 +179,8 @@ uv run --python 3.12 korvid-prompt-lab publish \
   --campaign examples/campaigns/local-smoke.yaml \
   --model-metadata model-metadata.json \
   --evaluation-summary artifacts/evaluate/local-smoke/evaluation-summary.json \
-  --registry-root registry
+  --registry-root registry \
+  --minimum-model-improvement 0.02
 ```
 
 ## Bridge request/response schema
@@ -156,11 +214,16 @@ Requests always include:
   },
   "runtime": {
     "campaign_id": "local-smoke",
-    "repetitions": 1,
-    "artifact_dir": "artifacts/evaluate/local-smoke/runs/..."
+    "repetitions": 5,
+    "artifact_dir": "artifacts/evaluate/local-smoke/runs/...",
+    "model_endpoint": null
   }
 }
 ```
+
+`runtime.model_endpoint` is `null` for `process` serving and carries the exact
+loopback base URL (for example `http://127.0.0.1:41001`) for `aks_port_forward`
+serving. A bridge that talks to the AKS-hosted model must read it from there.
 
 Responses must include protocol version `1`, the exact candidate fingerprint, a
 matching `request_identity`, `status`, `answer`, `journal`, `usage`, `error`,
@@ -185,8 +248,10 @@ process bridge, replace the `serving.command` list with the reviewed executable
 and preserve the `{request}` / `{response}` placeholders so the runner can pass
 artifact paths explicitly.
 
-For AKS-backed serving, keep the campaign on `backend: aks_port_forward` and use
-`korvid-prompt-lab aks-check` before any live evaluation.
+For AKS-backed serving, keep the campaign on `backend: aks_port_forward`, declare
+its own `serving.command`, and use `korvid-prompt-lab aks-check` before any live
+evaluation. `evaluate` and `optimize` then run the whole campaign inside a single
+loopback port-forward.
 
 ## Safety and promotion semantics
 
@@ -198,12 +263,25 @@ For AKS-backed serving, keep the campaign on `backend: aks_port_forward` and use
 - Model-specific bundles publish only when:
   - a matching common baseline already exists,
   - the milestone evaluation passed,
-  - the effective score beats the common baseline by the configured minimum
-    improvement, and
+  - the effective score beats the common baseline by **strictly more** than the
+    configured minimum improvement (`--minimum-model-improvement`, default
+    `0.02`), so a tie or noise-sized gain never forks the prompt, and
   - hard safety failures remain at zero.
 
 This preserves the common-first rollout and keeps model overrides explicitly
 safety-gated.
+
+### pass^3 and pass^5
+
+`pass_at_3` and `pass_at_5` are true `pass^k` metrics: the share of
+case/model groups whose **first k repetitions all passed**. A single lucky
+repetition never counts as a pass.
+
+When a campaign records fewer than `k` repetitions for any group, the summary
+reports `null` (`insufficient-evidence` in the text output) instead of inventing
+a score, and `publish` refuses the bundle until the required repetitions exist.
+Publishable campaigns therefore need `repetitions: 5` or more; the bundled
+examples use five.
 
 Additional CLI publish gates:
 
@@ -211,6 +289,8 @@ Additional CLI publish gates:
   matrix recorded in the evaluation summary.
 - `model-specific` publication requires the full milestone case pack recorded in
   the evaluation summary.
+- every bundle requires non-empty, disjoint `case_sets.train` and
+  `case_sets.validation` drawn from the campaign cases.
 
 ## Model matrix
 

@@ -1,12 +1,17 @@
 schema_version: 1
 campaign_id: aks-shared-runners
-repetitions: 2
+repetitions: 5
 models:
   - env:KORVID_AKS_MODEL
 cases:
   - case_id: aks-happy
     template_id: aks-template
     prompt: Confirm the shared runner service is reachable.
+    models:
+      - env:KORVID_AKS_MODEL
+  - case_id: aks-guardrail
+    template_id: aks-template
+    prompt: Confirm the approval guardrail still blocks unbounded mutation.
     models:
       - env:KORVID_AKS_MODEL
 serving:
@@ -16,3 +21,9 @@ serving:
   namespace: env:KORVID_AKS_NAMESPACE
   service: env:KORVID_AKS_SERVICE
   model: env:KORVID_AKS_MODEL
+  command:
+    - korvid-bridge
+    - --request
+    - "{request}"
+    - --response
+    - "{response}"

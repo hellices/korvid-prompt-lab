@@ -11,7 +11,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from korvid_prompt_lab.artifacts import write_json_artifact
-from korvid_prompt_lab.contracts import Campaign, Candidate, EvalCase, ProcessServing
+from korvid_prompt_lab.contracts import (
+    AKSPortForwardServing,
+    Campaign,
+    Candidate,
+    EvalCase,
+    ProcessServing,
+)
 from korvid_prompt_lab.runner import (
     BridgeArtifactError,
     BridgeFingerprintMismatchError,
@@ -322,3 +328,94 @@ def test_runner_raises_typed_errors_for_systemic_failures(
 
     with pytest.raises(error_type):
         _runner(case, timeout_seconds=timeout_seconds).run(_candidate(), case, tmp_path / "run")
+
+
+def _aks_runner(
+    case: EvalCase,
+    *,
+    model_endpoint: str | None,
+    timeout_seconds: float = 1.0,
+) -> KorvidProcessRunner:
+    campaign = Campaign(
+        schema_version=1,
+        campaign_id="campaign-aks",
+        repetitions=1,
+        models=("mock-small",),
+        cases=(case,),
+        serving=AKSPortForwardServing(
+            backend="aks_port_forward",
+            resource_group="rg-pension-guard",
+            cluster_name="aks-shared-runners",
+            namespace="korvid",
+            service="korvid-api",
+            model="mock-small",
+            command=(
+                sys.executable,
+                str(ROOT / "tests" / "fixtures" / "fake_korvid_bridge.py"),
+                "--request",
+                "{request}",
+                "--response",
+                "{response}",
+            ),
+        ),
+    )
+    return KorvidProcessRunner(campaign, timeout_seconds=timeout_seconds, model_endpoint=model_endpoint)
+
+
+def test_runner_supplies_the_loopback_endpoint_to_aks_bridge_requests(tmp_path: Path) -> None:
+    case = _case("case[completed]")
+    runner = _aks_runner(case, model_endpoint="http://127.0.0.1:41001")
+
+    result = runner.run(_candidate(), case, tmp_path / "run")
+
+    request_payload = json.loads((tmp_path / "run" / "request.json").read_text(encoding="utf-8"))
+    assert request_payload["runtime"]["model_endpoint"] == "http://127.0.0.1:41001"
+    assert result.journal["model_endpoint"] == "http://127.0.0.1:41001"
+
+
+def test_process_bridge_requests_record_an_absent_model_endpoint(tmp_path: Path) -> None:
+    case = _case("case[completed]")
+
+    result = _runner(case).run(_candidate(), case, tmp_path / "run")
+
+    request_payload = json.loads((tmp_path / "run" / "request.json").read_text(encoding="utf-8"))
+    assert request_payload["runtime"]["model_endpoint"] is None
+    assert result.journal["model_endpoint"] is None
+
+
+def test_runner_rejects_aks_serving_without_a_model_endpoint() -> None:
+    with pytest.raises(ValueError, match="model_endpoint"):
+        _aks_runner(_case("case[completed]"), model_endpoint=None)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://10.0.0.5:41001",
+        "http://example.com:41001",
+        "http://127.0.0.1",
+        "ftp://127.0.0.1:41001",
+        "127.0.0.1:41001",
+    ],
+)
+def test_runner_rejects_endpoints_that_are_not_loopback_http(endpoint: str) -> None:
+    with pytest.raises(ValueError, match="loopback"):
+        _aks_runner(_case("case[completed]"), model_endpoint=endpoint)
+
+
+def test_runner_rejects_a_model_endpoint_for_process_serving() -> None:
+    case = _case("case[completed]")
+    campaign = Campaign(
+        schema_version=1,
+        campaign_id="campaign-1",
+        repetitions=1,
+        models=("mock-small",),
+        cases=(case,),
+        serving=ProcessServing(
+            backend="process",
+            command=(sys.executable, "bridge.py", "--request", "{request}", "--response", "{response}"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="model_endpoint"):
+        KorvidProcessRunner(campaign, model_endpoint="http://127.0.0.1:41001")

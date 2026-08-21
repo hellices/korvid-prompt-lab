@@ -16,6 +16,10 @@ from .contracts import Campaign, Candidate, _require_mapping, _require_string
 
 _DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
+# A model-specific override must beat the common bundle by a visible margin, not by
+# stochastic noise, so the common-first rollout stays the default.
+DEFAULT_MINIMUM_MODEL_IMPROVEMENT = 0.02
+
 
 @dataclass(frozen=True, slots=True)
 class PromptBundle:
@@ -50,7 +54,7 @@ def publish_bundle(
     model_metadata: Mapping[str, Any],
     evaluation_summary: Mapping[str, Any],
     registry_root: Path | str,
-    minimum_model_improvement: float = 0.0,
+    minimum_model_improvement: float = DEFAULT_MINIMUM_MODEL_IMPROVEMENT,
 ) -> PromotionDecision:
     if isinstance(minimum_model_improvement, bool) or not isinstance(minimum_model_improvement, (int, float)):
         raise ValueError("minimum_model_improvement must be numeric")  # noqa: TRY004 - preserve validation API
@@ -59,6 +63,7 @@ def publish_bundle(
 
     model = _normalize_model_metadata(model_metadata)
     summary = _normalize_evaluation_summary(evaluation_summary)
+    _require_usable_case_sets(summary["case_sets"], campaign)
     provenance = _extract_evaluation_provenance(evaluation_summary)
     target_model_score = _resolve_target_model_score(evaluation_summary, model["model_family"], summary["aggregate_score"])
 
@@ -99,11 +104,12 @@ def publish_bundle(
                 bundle=None,
             )
         improvement = effective_score - float(baseline_entry["effective_score"])
-        if improvement < float(minimum_model_improvement):
+        if improvement <= float(minimum_model_improvement):
             return PromotionDecision(
                 published=False,
                 reason=(
-                    "model-specific promotion requires minimum improvement over the common baseline"
+                    "model-specific promotion requires improvement strictly greater than the configured "
+                    "minimum over the common baseline"
                 ),
                 effective_score=effective_score,
                 bundle=None,
@@ -310,8 +316,8 @@ def _normalize_evaluation_summary(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("bundle_kind must be common or model-specific")
 
     aggregate_score = _require_float(summary.get("aggregate_score"), "aggregate_score")
-    pass_at_3 = _require_float(summary.get("pass_at_3"), "pass_at_3")
-    pass_at_5 = _require_float(summary.get("pass_at_5"), "pass_at_5")
+    pass_at_3 = _require_pass_hat_k(summary.get("pass_at_3"), "pass_at_3", 3)
+    pass_at_5 = _require_pass_hat_k(summary.get("pass_at_5"), "pass_at_5", 5)
     hard_safety_failures = _require_non_negative_int(summary.get("hard_safety_failures"), "hard_safety_failures")
     systemic_failures = _require_non_negative_int(summary.get("systemic_failures"), "systemic_failures")
     milestone_passed = summary.get("milestone_passed")
@@ -334,6 +340,24 @@ def _normalize_evaluation_summary(value: Mapping[str, Any]) -> dict[str, Any]:
         "artifact_refs": artifact_refs,
         "reproduction_command": reproduction_command,
     }
+
+
+def _require_usable_case_sets(case_sets: Mapping[str, Sequence[str]], campaign: Campaign) -> None:
+    """Reject vacuous or overlapping train/validation evidence before publication."""
+    for split in ("train", "validation"):
+        if not case_sets.get(split):
+            raise ValueError(f"case_sets must record {split} cases")
+
+    train_case_ids = list(case_sets["train"])
+    validation_case_ids = list(case_sets["validation"])
+    overlap = sorted(set(train_case_ids) & set(validation_case_ids))
+    if overlap:
+        raise ValueError(f"case_sets train and validation must be disjoint: {', '.join(overlap)}")
+
+    campaign_case_ids = {case.case_id for case in campaign.cases}
+    unknown = sorted(set(train_case_ids + validation_case_ids) - campaign_case_ids)
+    if unknown:
+        raise ValueError(f"case_sets must be drawn from the campaign cases: {', '.join(unknown)}")
 
 
 def _normalize_case_sets(value: Any) -> dict[str, list[str]]:
@@ -370,6 +394,18 @@ def _require_float(value: Any, context: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{context} must be numeric")  # noqa: TRY004 - preserve validation API
     return float(value)
+
+
+def _require_pass_hat_k(value: Any, context: str, k: int) -> float:
+    """Reject publication evidence that never observed k repetitions per case."""
+    if value is None:
+        raise ValueError(
+            f"{context} requires {k} recorded repetitions per case before publication"
+        )
+    score = _require_float(value, context)
+    if not 0.0 <= score <= 1.0:
+        raise ValueError(f"{context} must be between 0.0 and 1.0")
+    return score
 
 
 def _require_non_negative_int(value: Any, context: str) -> int:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -96,3 +96,42 @@ def score_result(result: BridgeResult) -> ScoredResult:
         + 0.10 * result.grade.efficiency
     )
     return ScoredResult(result=result, score=score, unsafe=False, accepted=True)
+
+
+@dataclass(frozen=True, slots=True)
+class RepetitionOutcome:
+    case_id: str
+    model: str
+    repetition: int
+    passed: bool
+
+
+def pass_hat_k(outcomes: Sequence[RepetitionOutcome], k: int) -> float | None:
+    """Return pass^k: the share of case/model groups whose first k repetitions all passed.
+
+    Returns ``None`` when the recorded evidence cannot support the claim, which happens
+    when no repetition was recorded or when any group ran fewer than ``k`` repetitions.
+    """
+    if isinstance(k, bool) or not isinstance(k, int) or k <= 0:
+        raise ValueError("k must be a positive integer")
+
+    grouped: dict[tuple[str, str], dict[int, bool]] = {}
+    for outcome in outcomes:
+        group = grouped.setdefault((outcome.case_id, outcome.model), {})
+        if outcome.repetition in group:
+            raise ValueError(
+                f"duplicate repetition {outcome.repetition} for case {outcome.case_id} on model {outcome.model}"
+            )
+        group[outcome.repetition] = outcome.passed
+
+    if not grouped:
+        return None
+
+    passed_groups = 0
+    for group in grouped.values():
+        repetitions = sorted(group)
+        if len(repetitions) < k:
+            return None
+        if all(group[repetition] for repetition in repetitions[:k]):
+            passed_groups += 1
+    return passed_groups / len(grouped)

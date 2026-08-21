@@ -6,9 +6,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .artifacts import write_json_artifact
 from .contracts import (
+    AKSPortForwardServing,
     Campaign,
     Candidate,
     EvalCase,
@@ -18,6 +20,19 @@ from .contracts import (
     _require_string,
 )
 from .scoring import BridgeResult, OperationGrade
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _require_loopback_endpoint(endpoint: str) -> str:
+    parts = urlsplit(endpoint)
+    if parts.scheme != "http" or parts.hostname not in _LOOPBACK_HOSTS or parts.port is None:
+        raise ValueError(
+            "model_endpoint must be a loopback http URL with an explicit port, for example http://127.0.0.1:41001"
+        )
+    if parts.path not in {"", "/"} or parts.query or parts.fragment:
+        raise ValueError("model_endpoint must be a loopback base URL without path, query, or fragment")
+    return endpoint
 
 
 class BridgeSystemError(RuntimeError):
@@ -68,12 +83,20 @@ class BridgeStatusError(BridgeSystemError):
 class KorvidProcessRunner:
     campaign: Campaign
     timeout_seconds: float = 30.0
+    model_endpoint: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.campaign.serving, ProcessServing):
-            raise ValueError("KorvidProcessRunner requires process serving")  # noqa: TRY004 - preserve validation API
+        serving = self.campaign.serving
+        if not isinstance(serving, (ProcessServing, AKSPortForwardServing)):
+            raise ValueError("KorvidProcessRunner requires process or aks_port_forward serving")  # noqa: TRY004 - preserve validation API
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if isinstance(serving, AKSPortForwardServing):
+            if self.model_endpoint is None:
+                raise ValueError("aks_port_forward serving requires a model_endpoint")
+            _require_loopback_endpoint(self.model_endpoint)
+        elif self.model_endpoint is not None:
+            raise ValueError("process serving must not receive a model_endpoint")
 
     def run(
         self,
@@ -191,14 +214,15 @@ class KorvidProcessRunner:
                 "campaign_id": self.campaign.campaign_id,
                 "repetitions": self.campaign.repetitions,
                 "artifact_dir": str(run_dir),
+                "model_endpoint": self.model_endpoint,
             },
         }
 
     def _expand_command(self, request_path: Path, response_path: Path) -> tuple[str, ...]:
         expanded: list[str] = []
         serving = self.campaign.serving
-        if not isinstance(serving, ProcessServing):
-            raise ValueError("KorvidProcessRunner requires process serving")  # noqa: TRY004 - preserve validation API
+        if not isinstance(serving, (ProcessServing, AKSPortForwardServing)):
+            raise ValueError("KorvidProcessRunner requires process or aks_port_forward serving")  # noqa: TRY004 - preserve validation API
         for token in serving.command:
             if token == "{request}":
                 expanded.append(str(request_path))

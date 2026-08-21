@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from korvid_prompt_lab.contracts import Campaign, Candidate, EvalCase, ProcessServing
 from korvid_prompt_lab.publish import (
+    DEFAULT_MINIMUM_MODEL_IMPROVEMENT,
     PromotionDecision,
     PromptBundle,
     publish_bundle,
@@ -54,18 +55,21 @@ def _campaign() -> Campaign:
 
 
 def _campaign_with_id(campaign_id: str) -> Campaign:
-    case = EvalCase(
-        case_id="case-1",
-        template_id="template-1",
-        prompt="Confirm the postcondition.",
-        models=("mock-small",),
+    cases = tuple(
+        EvalCase(
+            case_id=case_id,
+            template_id="template-1",
+            prompt="Confirm the postcondition.",
+            models=("mock-small",),
+        )
+        for case_id in ("case-train-a", "case-train-b", "case-val-a", "case-val-b")
     )
     return Campaign(
         schema_version=1,
         campaign_id=campaign_id,
-        repetitions=3,
+        repetitions=5,
         models=("mock-small",),
-        cases=(case,),
+        cases=cases,
         serving=ProcessServing(
             backend="process",
             command=(
@@ -105,9 +109,9 @@ def _evaluation_summary(**overrides: object) -> dict[str, object]:
         "systemic_failures": 0,
         "milestone_passed": True,
         "case_sets": {
-            "train": ["train-1"],
-            "validation": ["val-1"],
-            "milestone": ["milestone-1"],
+            "train": ["case-train-a", "case-train-b"],
+            "validation": ["case-val-a", "case-val-b"],
+            "milestone": ["case-train-a", "case-train-b", "case-val-a", "case-val-b"],
         },
         "artifact_refs": ["artifacts/evaluation-summary.json"],
         "reproduction_command": [
@@ -140,9 +144,9 @@ def test_publish_bundle_writes_deterministic_common_bundle_and_registry_files(tm
                 "artifacts/request.json",
             ],
             case_sets={
-                "train": ["train-2", "train-1"],
-                "validation": ["val-2", "val-1"],
-                "milestone": ["milestone-2", "milestone-1"],
+                "train": ["case-train-b", "case-train-a"],
+                "validation": ["case-val-b", "case-val-a"],
+                "milestone": ["case-val-b", "case-val-a", "case-train-b", "case-train-a"],
             },
         ),
         registry_root=registry_root,
@@ -174,9 +178,9 @@ def test_publish_bundle_writes_deterministic_common_bundle_and_registry_files(tm
                 "campaign.yaml",
             ],
             case_sets={
-                "milestone": ["milestone-1", "milestone-2"],
-                "validation": ["val-1", "val-2"],
-                "train": ["train-1", "train-2"],
+                "milestone": ["case-train-a", "case-train-b", "case-val-a", "case-val-b"],
+                "validation": ["case-val-a", "case-val-b"],
+                "train": ["case-train-a", "case-train-b"],
             },
         ),
         registry_root=registry_root,
@@ -532,3 +536,145 @@ def test_render_scoreboard_uses_aggregate_score_for_prompt_bundle_rows(tmp_path:
     scoreboard = render_scoreboard([bundle])
 
     assert "| mock-small | sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef | common | candidate-unsafe | 0.973 | 1.000 | 1.000 |" in scoreboard
+
+
+@pytest.mark.parametrize(("field_name", "repetitions"), [("pass_at_3", 3), ("pass_at_5", 5)])
+def test_publish_bundle_rejects_insufficient_pass_hat_k_evidence(
+    tmp_path: Path, field_name: str, repetitions: int
+) -> None:
+    with pytest.raises(ValueError, match=f"{field_name} requires {repetitions} recorded repetitions"):
+        publish_bundle(
+            candidate=_candidate(),
+            campaign=_campaign(),
+            model_metadata=_model_metadata(),
+            evaluation_summary=_evaluation_summary(**{field_name: None}),
+            registry_root=tmp_path / "registry",
+        )
+
+    assert not (tmp_path / "registry").exists()
+
+
+@pytest.mark.parametrize("value", [-0.1, 1.5])
+def test_publish_bundle_rejects_pass_hat_k_outside_the_unit_interval(tmp_path: Path, value: float) -> None:
+    with pytest.raises(ValueError, match="pass_at_3"):
+        publish_bundle(
+            candidate=_candidate(),
+            campaign=_campaign(),
+            model_metadata=_model_metadata(),
+            evaluation_summary=_evaluation_summary(pass_at_3=value),
+            registry_root=tmp_path / "registry",
+        )
+
+
+def test_publish_bundle_rejects_overlapping_train_and_validation_case_sets(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="case_sets train and validation must be disjoint"):
+        publish_bundle(
+            candidate=_candidate(),
+            campaign=_campaign(),
+            model_metadata=_model_metadata(),
+            evaluation_summary=_evaluation_summary(
+                case_sets={
+                    "train": ["case-train-a", "case-val-a"],
+                    "validation": ["case-val-a", "case-val-b"],
+                    "milestone": ["case-train-a", "case-val-a"],
+                }
+            ),
+            registry_root=tmp_path / "registry",
+        )
+
+    assert not (tmp_path / "registry").exists()
+
+
+@pytest.mark.parametrize("missing_key", ["train", "validation"])
+def test_publish_bundle_requires_recorded_train_and_validation_case_sets(
+    tmp_path: Path, missing_key: str
+) -> None:
+    case_sets = {
+        "train": ["case-train-a"],
+        "validation": ["case-val-a"],
+        "milestone": ["case-train-a", "case-val-a"],
+    }
+    case_sets.pop(missing_key)
+
+    with pytest.raises(ValueError, match=f"case_sets must record {missing_key}"):
+        publish_bundle(
+            candidate=_candidate(),
+            campaign=_campaign(),
+            model_metadata=_model_metadata(),
+            evaluation_summary=_evaluation_summary(case_sets=case_sets),
+            registry_root=tmp_path / "registry",
+        )
+
+
+@pytest.mark.parametrize("split", ["train", "validation"])
+def test_publish_bundle_rejects_case_sets_outside_the_campaign(tmp_path: Path, split: str) -> None:
+    case_sets = {
+        "train": ["case-train-a"],
+        "validation": ["case-val-a"],
+        "milestone": ["case-train-a", "case-val-a"],
+    }
+    case_sets[split] = [*case_sets[split], "case-not-in-campaign"]
+
+    with pytest.raises(ValueError, match="case-not-in-campaign"):
+        publish_bundle(
+            candidate=_candidate(),
+            campaign=_campaign(),
+            model_metadata=_model_metadata(),
+            evaluation_summary=_evaluation_summary(case_sets=case_sets),
+            registry_root=tmp_path / "registry",
+        )
+
+
+def _publish_common(registry_root: Path, score: float) -> PromotionDecision:
+    return publish_bundle(
+        candidate=_candidate(candidate_id="candidate-common"),
+        campaign=_campaign(),
+        model_metadata=_model_metadata(),
+        evaluation_summary=_evaluation_summary(bundle_kind="common", aggregate_score=score),
+        registry_root=registry_root,
+    )
+
+
+def test_publish_bundle_rejects_a_model_specific_improvement_equal_to_the_threshold(tmp_path: Path) -> None:
+    registry_root = tmp_path / "registry"
+    common = _publish_common(registry_root, 0.5)
+
+    tie = publish_bundle(
+        candidate=_candidate(candidate_id="candidate-specific-tie"),
+        campaign=_campaign(),
+        model_metadata=_model_metadata(),
+        evaluation_summary=_evaluation_summary(bundle_kind="model-specific", aggregate_score=0.75),
+        registry_root=registry_root,
+        minimum_model_improvement=0.25,
+    )
+
+    assert common.published is True
+    assert tie.published is False
+    assert tie.bundle is None
+    assert "improvement" in tie.reason
+
+
+def test_publish_bundle_defaults_to_a_non_zero_minimum_model_improvement(tmp_path: Path) -> None:
+    registry_root = tmp_path / "registry"
+    common = _publish_common(registry_root, 0.5)
+
+    marginal = publish_bundle(
+        candidate=_candidate(candidate_id="candidate-specific-marginal"),
+        campaign=_campaign(),
+        model_metadata=_model_metadata(),
+        evaluation_summary=_evaluation_summary(bundle_kind="model-specific", aggregate_score=0.5078125),
+        registry_root=registry_root,
+    )
+    clear_win = publish_bundle(
+        candidate=_candidate(candidate_id="candidate-specific-clear"),
+        campaign=_campaign(),
+        model_metadata=_model_metadata(),
+        evaluation_summary=_evaluation_summary(bundle_kind="model-specific", aggregate_score=0.75),
+        registry_root=registry_root,
+    )
+
+    assert DEFAULT_MINIMUM_MODEL_IMPROVEMENT > 0.0
+    assert common.published is True
+    assert marginal.published is False
+    assert "improvement" in marginal.reason
+    assert clear_win.published is True

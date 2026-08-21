@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -16,6 +17,9 @@ from korvid_prompt_lab.optimize import OptimizationArtifacts, optimize_campaign
 from korvid_prompt_lab.runner import KorvidProcessRunner
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tests" / "fixtures"))
+
+from fake_korvid_bridge import TUNED_MARKER
 
 
 def _seed_candidate() -> Candidate:
@@ -170,3 +174,93 @@ def test_optimize_campaign_uses_optional_dspy_proposer_only_when_reflection_lm_i
 
     assert created_with == ["reflection-lm"]
     assert captured_proposers == [None, proposer]
+
+
+def _recording_proposer(proposals: list[list[str]]) -> Any:
+    def propose(
+        candidate: dict[str, str],
+        reflective_dataset: Mapping[str, Sequence[Mapping[str, Any]]],
+        components_to_update: list[str],
+    ) -> dict[str, str]:
+        proposals.append(list(components_to_update))
+        return {name: f"{candidate[name]} {TUNED_MARKER}" for name in components_to_update}
+
+    return propose
+
+
+def test_optimize_campaign_runs_real_gepa_and_persists_a_candidate_that_beats_the_seed(tmp_path: Path) -> None:
+    train_cases = [_case("train-1"), _case("train-2"), _case("train-3")]
+    validation_cases = [_case("val-1"), _case("val-2")]
+    runner = _runner(train_cases + validation_cases)
+    seed_candidate = _seed_candidate()
+    proposals: list[list[str]] = []
+
+    artifacts = optimize_campaign(
+        runner=runner,
+        seed_candidate=seed_candidate,
+        train_cases=train_cases,
+        validation_cases=validation_cases,
+        artifact_root=tmp_path / "artifacts",
+        max_metric_calls=16,
+        candidate_proposer=_recording_proposer(proposals),
+    )
+
+    assert proposals, "real GEPA must invoke the injected proposal contract"
+    assert artifacts.best_candidate.components != seed_candidate.components
+    assert TUNED_MARKER in "".join(artifacts.best_candidate.components.values())
+
+    summary = json.loads(artifacts.summary_path.read_text(encoding="utf-8"))
+    assert summary["seed_candidate_fingerprint"] == seed_candidate.fingerprint
+    assert summary["best_candidate_differs_from_seed"] is True
+    assert summary["train_case_ids"] == ["train-1", "train-2", "train-3"]
+    assert summary["validation_case_ids"] == ["val-1", "val-2"]
+
+    persisted = load_candidate(artifacts.best_candidate_path)
+    assert persisted.components == artifacts.best_candidate.components
+
+
+def test_optimize_campaign_rejects_combining_reflection_lm_and_candidate_proposer(tmp_path: Path) -> None:
+    train_case = _case("train-1")
+    validation_case = _case("val-1")
+    runner = _runner([train_case, validation_case])
+
+    with pytest.raises(ValueError, match="reflection_lm"):
+        optimize_campaign(
+            runner=runner,
+            seed_candidate=_seed_candidate(),
+            train_cases=[train_case],
+            validation_cases=[validation_case],
+            artifact_root=tmp_path / "artifacts",
+            max_metric_calls=4,
+            reflection_lm="reflection-lm",
+            candidate_proposer=_recording_proposer([]),
+        )
+
+
+@pytest.mark.parametrize(
+    ("train_case_ids", "validation_case_ids", "message"),
+    [
+        ((), ("val-1",), "train_cases must not be empty"),
+        (("train-1",), (), "validation_cases must not be empty"),
+        (("train-1", "val-1"), ("val-1",), "train and validation case sets must be disjoint"),
+        (("val-1",), ("val-1",), "train and validation case sets must be disjoint"),
+    ],
+)
+def test_optimize_campaign_requires_explicit_disjoint_case_splits(
+    tmp_path: Path,
+    train_case_ids: tuple[str, ...],
+    validation_case_ids: tuple[str, ...],
+    message: str,
+) -> None:
+    all_cases = [_case("train-1"), _case("val-1")]
+    runner = _runner(all_cases)
+
+    with pytest.raises(ValueError, match=message):
+        optimize_campaign(
+            runner=runner,
+            seed_candidate=_seed_candidate(),
+            train_cases=[_case(case_id) for case_id in train_case_ids],
+            validation_cases=[_case(case_id) for case_id in validation_case_ids],
+            artifact_root=tmp_path / "artifacts",
+            max_metric_calls=4,
+        )

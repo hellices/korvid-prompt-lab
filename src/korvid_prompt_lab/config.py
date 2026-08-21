@@ -43,21 +43,30 @@ def _parse_case(mapping: Mapping[str, Any]) -> EvalCase:
     )
 
 
+def _parse_bridge_command(value: Any, context: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{context} must be a non-empty list")
+    tokens = tuple(_require_string(item, f"{context} item") for item in value)
+    if any(token.startswith("env:") for token in tokens):
+        raise ValueError(f"{context} must not use env: interpolation")
+    missing = [placeholder for placeholder in ("{request}", "{response}") if placeholder not in tokens]
+    if missing:
+        raise ValueError(f"{context} must include {' and '.join(missing)}")
+    return tokens
+
+
 def _parse_process_serving(mapping: Mapping[str, Any]) -> ProcessServing:
     _ensure_keys(mapping, {"backend", "command"}, "serving.process")
-    command = mapping.get("command")
-    if not isinstance(command, list) or not command:
-        raise ValueError("serving.command must be a non-empty list")
     return ProcessServing(
         backend="process",
-        command=tuple(_require_string(item, "serving.command item") for item in command),
+        command=_parse_bridge_command(mapping.get("command"), "serving.command"),
     )
 
 
 def _parse_aks_serving(mapping: Mapping[str, Any]) -> AKSPortForwardServing:
     _ensure_keys(
         mapping,
-        {"backend", "resource_group", "cluster_name", "namespace", "service", "model"},
+        {"backend", "resource_group", "cluster_name", "namespace", "service", "model", "command"},
         "serving.aks_port_forward",
     )
     return AKSPortForwardServing(
@@ -67,6 +76,7 @@ def _parse_aks_serving(mapping: Mapping[str, Any]) -> AKSPortForwardServing:
         namespace=_resolve_env_string(mapping.get("namespace"), "serving.namespace"),
         service=_resolve_env_string(mapping.get("service"), "serving.service"),
         model=_resolve_env_string(mapping.get("model"), "serving.model"),
+        command=_parse_bridge_command(mapping.get("command"), "serving.command"),
     )
 
 
