@@ -358,3 +358,254 @@ tests/test_scoring.py                      |  69 ++-
    (`milestone_passed` requires the recorded pack to equal the required pack).
 7. **Example bridge command for AKS is a placeholder.** `korvid-bridge` is not installed by this
    repository; operators must point `serving.command` at their reviewed executable.
+
+---
+
+# Final review fix wave 2
+
+**Date:** 2026-08-22
+**Worktree:** `.worktrees/feat-prompt-lab-mvp`
+**Baseline commit:** `e2e5e24` (`docs: append final review fix report`)
+**Fix commit:** `4e13932` (`fix: isolate optimize runs, harden pass^k, add bridge timeout`)
+**Python:** 3.12.13 (`.venv`, `uv run --python 3.12` for CLI smoke)
+**Skills used:** `superpowers:systematic-debugging`, then `superpowers:test-driven-development`
+(each finding: root-cause evidence → RED → observed failure → minimal GREEN → focused re-run).
+
+## Pre-existing baseline
+
+`pytest -q` on `e2e5e24`: **185 passed** (after this wave's test additions: 201 passed).
+No pre-existing failures.
+
+## Finding 1 (Critical) — optimize silently resumed stale GEPA state
+
+### Root cause
+
+`optimize.py` used a stable `run_dir = artifact_root / "gepa"`, and
+`gepa/core/state.py:661` resumes whenever `os.path.exists(run_dir/"gepa_state.bin")`.
+`optimize_campaign` also never passed a `seed` to `gepa.optimize`, and it wrote
+`best-candidate.yaml` / `optimization-summary.json` to fixed paths under the artifact root.
+
+### Root-cause evidence (two real GEPA runs into one artifact root, real fake-bridge subprocess)
+
+```text
+Loading gepa state from run dir
+state file exists: True
+run 1 proposals: 2 run 2 proposals: 0
+run 1 run_dir: .../scratch-artifacts/gepa
+run 2 run_dir: .../scratch-artifacts/gepa
+run 1 summary path: .../scratch-artifacts/optimization-summary.json
+run 2 summary path: .../scratch-artifacts/optimization-summary.json
+run 1 total_metric_calls: 16 num_candidates: 2
+run 2 total_metric_calls: 16 num_candidates: 2
+run 1 artifacts overwritten by run 2: True
+```
+
+The second invocation performed **no search at all** (0 proposals), reported the first run's
+candidate and provenance as its own, and overwrote the first run's artifacts.
+
+### RED evidence
+
+`.venv/bin/python -m pytest -q tests/test_optimize.py -x -k "stale or existing_invocation or run_identity or passes_the_seed or invalid_seeds"`
+
+```text
+E       TypeError: optimize_campaign() got an unexpected keyword argument 'seed'
+tests/test_optimize.py:231: TypeError
+1 failed, 8 deselected
+```
+
+`.venv/bin/python -m pytest -q tests/test_cli.py -k "threads_an_explicit_seed or defaults_to_a_zero_seed or rejects_a_negative_seed"`
+
+```text
+E       SystemExit: 2   # korvid-prompt-lab: error: unrecognized arguments: --seed -1
+E       KeyError: 'seed'
+3 failed, 37 deselected
+```
+
+### GREEN
+
+- `optimize_campaign(..., seed: int = 0)` validates a non-negative int and passes it to
+  `gepa.optimize(seed=...)`.
+- `_run_identity(...)` records the full immutable run identity (schema version, campaign id,
+  candidate id, seed candidate fingerprint, train ids, validation ids, `max_metric_calls`,
+  `seed`, proposal source); `run_id` is the first 16 hex chars of its SHA-256.
+- All artifacts move to `<artifact-root>/invocations/<run_id>/`
+  (`run-identity.json`, `gepa/`, `runs/`, `best-candidate.yaml`, `optimization-summary.json`),
+  so previous invocations stay immutable and the adapter's bridge artifacts are per-invocation.
+- Fail-closed, no resume feature: an existing invocation directory raises
+  `optimization invocation directory already exists: ...`, and a pre-existing `gepa_state.bin`
+  raises `refusing to resume incompatible GEPA state: ...` (defense in depth).
+- `optimization-summary.json` gains `run_id`, `seed`, `run_identity`, `invocation_dir`.
+- CLI: `--seed` (default `0`, rejected below zero with exit `2`) and
+  `optimized candidate=... run_id=... invocation=... best_candidate=... summary=...`.
+
+Regression (unpatched `gepa.optimize` + real fake-bridge subprocess):
+`tests/test_optimize.py::test_optimize_campaign_never_resumes_a_stale_run_when_the_seed_changes`
+proves both runs propose, both report their own `run_id`/`run_dir`/`total_metric_calls`, the
+first run's summary and candidate survive unchanged, and no `artifact_root/gepa/gepa_state.bin`
+is ever created.
+
+## Finding 2 (Important) — pass^k used the weighted score instead of authoritative success
+
+### Root cause
+
+`cli._evaluate_campaign` recorded `passed=scored.score > 0.0 and not scored.unsafe`, so a
+`completed` run with `completion: 0.0, verification: 1.0, efficiency: 1.0` (score `0.40`)
+counted as a pass.
+
+### RED evidence
+
+`.venv/bin/python -m pytest -q tests/test_scoring.py -k result_passed`
+
+```text
+E   ImportError: cannot import name 'result_passed' from 'korvid_prompt_lab.scoring'
+1 error
+```
+
+`.venv/bin/python -m pytest -q tests/test_cli.py -k full_operation_completion`
+
+```text
+>           assert response["grade"]["completion"] == 0.0
+E           assert 0.9 == 0.0
+1 failed, 40 deselected
+```
+
+### GREEN
+
+- `scoring.result_passed(scored) -> bool` is the documented pass criterion: `status == "completed"`,
+  no hard safety failure (`accepted` and not `unsafe`), and `grade.completion == 1.0`.
+- `cli._evaluate_campaign` records `passed=result_passed(scored)`.
+- Fake bridge: healthy runs now grade a *full* completion (`completion: 1.0`), and a new
+  `partial-completion` tag returns `completion: 0.0, verification: 0.9, efficiency: 0.9`.
+- Consequence: the healthy smoke aggregate moved from `0.850` to `0.910`
+  (`0.60*1.0 + 0.30*0.8 + 0.10*0.7`); `tests/test_adapter.py` and `tests/test_cli.py` updated.
+
+## Finding 3 (Important) — no campaign-level bridge timeout
+
+### Root cause
+
+`KorvidProcessRunner.timeout_seconds` defaulted to a hard-coded `30.0` and the CLI never set it,
+so every real bridge call was capped at 30 s regardless of campaign intent.
+
+### RED evidence
+
+```text
+tests/test_contracts.py: ImportError: cannot import name 'DEFAULT_BRIDGE_TIMEOUT_SECONDS'
+tests/test_runner.py:   TypeError: Campaign.__init__() got an unexpected keyword argument 'bridge_timeout_seconds'
+tests/test_cli.py:      AssertionError: assert 'bridge_timeout_seconds must be a positive number' in
+                        'evaluation failed: campaign has unknown field(s): bridge_timeout_seconds\n'
+2 failed / 3 failed
+```
+
+### GREEN
+
+- `contracts.DEFAULT_BRIDGE_TIMEOUT_SECONDS = 300.0`; `Campaign.bridge_timeout_seconds` with a
+  `__post_init__` guard and shared `_require_bridge_timeout` validator (rejects `0`, negatives,
+  strings, booleans, `null`, lists, `.inf`, `.nan`).
+- `load_campaign` accepts and validates the optional field.
+- `KorvidProcessRunner.timeout_seconds` is now `float | None`; `None` resolves to
+  `campaign.bridge_timeout_seconds`, so runtime policy always comes from the campaign and never
+  from a candidate or the optimizer. `evaluate` and `optimize` pass it explicitly.
+- Examples: `local-smoke.yaml` uses `60`, `aks-shared-runners.yaml` uses `300`.
+
+## Commands and results
+
+```text
+.venv/bin/python -m pytest -q                 -> 201 passed
+.venv/bin/ruff check .                        -> All checks passed!
+.venv/bin/mypy src tests                      -> Success: no issues found in 22 source files
+
+uv run --python 3.12 korvid-prompt-lab validate ...
+-> validated candidate=shipped-small fingerprint=05386c2e...335d7 campaign=local-smoke cases=2 models=mock-small  (exit 0)
+
+uv run --python 3.12 korvid-prompt-lab evaluate ... --train-case-id smoke-happy \
+  --validation-case-id smoke-guardrail --milestone-case-id smoke-happy --milestone-case-id smoke-guardrail
+-> evaluated candidate=shipped-small campaign=local-smoke aggregate=0.910 pass^3=1.000 pass^5=1.000 ...  (exit 0)
+   summary: aggregate_score=0.9099999999999999, pass_at_3=1.0, pass_at_5=1.0,
+            repetitions_per_case=5, milestone_passed=True, hard_safety_failures=0
+
+uv run --python 3.12 korvid-prompt-lab publish ... --registry-root registry
+-> published version=pb-31591ae4aa040350 kind=common effective_score=0.910  (exit 0)
+
+# bridge_timeout_seconds: 0
+-> evaluation failed: campaign bridge_timeout_seconds must be a positive number  (exit 2)
+
+# bridge_timeout_seconds: 0.1 with a smoke-slow[timeout] case
+-> evaluation failed: systemic bridge error: bridge timed out after 0.1 seconds  (exit 1)
+
+# smoke-partial[partial-completion] case, repetitions: 3
+-> evaluated ... aggregate=0.635 pass^3=0.500 pass^5=insufficient-evidence  (exit 0)
+   partial grade: {'completion': 0.0, 'verification': 0.9, 'efficiency': 0.9, 'hard_failures': []} status: completed
+
+uv run --python 3.12 korvid-prompt-lab optimize ... --seed -1
+-> optimization failed: seed must be a non-negative integer  (exit 2)
+
+uv run --python 3.12 korvid-prompt-lab optimize ... --seed 0        (real GEPA, real fake bridge)
+-> optimized candidate=shipped-small run_id=32cc1c5ea817698e
+   invocation=artifacts/scratch/optimize/invocations/32cc1c5ea817698e ...  (exit 0)
+
+uv run --python 3.12 korvid-prompt-lab optimize ... --seed 0        (repeated, identical identity)
+-> optimization failed: optimization invocation directory already exists:
+   artifacts/scratch/optimize/invocations/32cc1c5ea817698e; korvid-prompt-lab never resumes a
+   GEPA run, so change the run identity (seed, case splits, budget, or seed candidate) or use a
+   fresh artifact root  (exit 1)
+
+uv run --python 3.12 korvid-prompt-lab optimize ... --seed 1        (same artifact root)
+-> optimized candidate=shipped-small run_id=023fe8f585df1655 ...  (exit 0)
+   023fe8f585df1655 seed=1 total_metric_calls=4 num_candidates=1 differs=False
+   32cc1c5ea817698e seed=0 total_metric_calls=4 num_candidates=1 differs=False
+```
+
+The optimize smoke ran with a deliberately invalid `OPENAI_API_KEY`, so GEPA logged
+`Reflective mutation did not propose a new candidate`; that path only exercises the invocation
+isolation, while the proposal contract itself is covered by the unpatched-GEPA tests.
+Scratch smoke artifacts (`artifacts/`, `registry/`, scratch campaign and model metadata, and the
+`uv.lock` produced by `uv run`) were removed after verification.
+
+## Files changed (commit `4e13932`)
+
+```text
+README.md                                          |  73 ++++-
+docs/superpowers/specs/...-design.md               |  20 +-
+examples/campaigns/aks-shared-runners.yaml         |   1 +
+examples/campaigns/local-smoke.yaml                |   1 +
+src/korvid_prompt_lab/cli.py                       |  43 ++-
+src/korvid_prompt_lab/config.py                    |  22 +-
+src/korvid_prompt_lab/contracts.py                 |  16 ++
+src/korvid_prompt_lab/optimize.py                  |  95 ++++++-
+src/korvid_prompt_lab/runner.py                    |   9 +-
+src/korvid_prompt_lab/scoring.py                   |  23 ++
+tests/fixtures/fake_korvid_bridge.py               |  20 +-
+tests/test_adapter.py                              |   2 +-
+tests/test_cli.py                                  | 312 ++++++++++++++++++++-
+tests/test_contracts.py                            |  61 +++-
+tests/test_optimize.py                             | 149 ++++++++++
+tests/test_runner.py                               |  42 +++
+tests/test_scoring.py                              |  63 ++++-
+17 files changed, 922 insertions(+), 30 deletions(-)
+```
+
+## Concerns and follow-ups
+
+1. **Optimize artifact paths changed.** `best-candidate.yaml` and `optimization-summary.json`
+   moved from `<artifact-root>/` to `<artifact-root>/invocations/<run_id>/`. Any automation that
+   globbed the old fixed paths must read the paths the CLI prints (or the `invocation_dir` field
+   in the summary).
+2. **No resume is a deliberate trade-off.** A long search that dies mid-run cannot be continued;
+   it must be re-run under a new identity. Adding resume later requires an explicit, validated
+   `--resume <run_id>` that re-checks the recorded `run-identity.json` before touching state.
+3. **Run identity covers configuration, not proposer internals.** Two different injected
+   `candidate_proposer` callables share the label `candidate_proposer`, so a library caller who
+   swaps proposers without changing the seed hits the fail-closed error instead of getting a new
+   directory. That is safe (nothing is contaminated) but may look surprising.
+4. **`completion == 1.0` is an exact comparison.** A bridge that reports `0.999999` for a fully
+   completed operation now fails `pass^k`. That is intentional strictness, but real bridges must
+   emit exactly `1.0` for full completion; the contract is documented in the README.
+5. **pass^k got stricter again.** Grading changes shifted the bundled smoke aggregate from
+   `0.850` to `0.910`, so scores recorded by earlier waves are not directly comparable with new
+   ones. Already-published registry rows predate both the new pass criterion and the new grade.
+6. **`300` seconds is a judgement call.** No authoritative spec value existed; it is sized for a
+   full model-backed Korvid operation and is documented and overridable per campaign. Re-derive
+   it from real AKS bridge latency once measured.
+7. **AKS wiring is still proven only against a fake port-forward and a fake bridge.** The live
+   `rg-pension-guard` / `aks-shared-runners` path still needs one supervised run; nothing in this
+   wave touched the cluster.
