@@ -42,7 +42,7 @@ Documents the full operator setup required to dispatch a remote grounding round:
 | Secrets | `KORVID_APP_PRIVATE_KEY`, `GROUNDING_REFLECTION_CREDENTIAL` (env-scoped) |
 | GitHub App | Read-only install on `hellices/korvid` (`contents: read` only); App id in `vars.KORVID_APP_ID`, private key in `secrets.KORVID_APP_PRIVATE_KEY` |
 | ARC runner label | `korvid-runners` (existing ARC scale set) |
-| Dispatch inputs | All 14 inputs with defaults and validation rules documented |
+| Dispatch inputs | All 12 inputs with defaults and validation rules documented |
 | Result surfaces | Job Summary, artifact (`grounding-round-<run-id>`), sticky PR comment |
 | Cleanup semantics | `if: always()` step restores exact original `modeleval` count; covers SIGKILL/cancel; idempotent |
 | Rerun semantics | Each dispatch is independent; no accumulated state; fix root cause before redispatching |
