@@ -411,6 +411,53 @@ def test_verify_script_declares_no_new_dependencies() -> None:
         assert forbidden not in body, f"the verify script must not install anything ({forbidden})"
 
 
+def test_verify_script_pin_field_does_not_execute_the_declaration(tmp_path: Path) -> None:
+    """A bare-Python verifier must parse the declaration without importing it."""
+    import re
+    import subprocess
+    import sys
+
+    body = VERIFY_SCRIPT_PATH.read_text(encoding="utf-8")
+
+    # Extract the Python snippet from pin_field(), which receives the declaration
+    # path and requested field as positional arguments.
+    m = re.search(
+        r"pin_field\(\) \{[^}]*?\"?\$PYTHON\"? -c '(.*?)'\s+\"\$REPO_ROOT[^\"]+\"\s+\"\$1\"\s*\n\}",
+        body,
+        re.DOTALL,
+    )
+    assert m is not None, (
+        "could not locate the inline Python snippet inside pin_field(); "
+        "the test extraction pattern needs updating if the shell function changed"
+    )
+    snippet = m.group(1)
+
+    pin_path = tmp_path / "korvid_pin.py"
+    pin_path.write_text(
+        (
+            _REPO_ROOT / "src" / "korvid_prompt_lab" / "korvid_pin.py"
+        ).read_text(encoding="utf-8")
+        + '\nraise RuntimeError("the verifier executed the declaration")\n',
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", snippet, str(pin_path), "sha"],
+        capture_output=True,
+        text=True,
+        env={},
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"pin_field 'sha' failed under bare Python (-S).\n"
+        f"stdout: {result.stdout!r}\n"
+        f"stderr: {result.stderr!r}\n"
+        "The inline snippet must parse the declaration without executing it."
+    )
+    assert result.stdout.strip() == APPROVED_KORVID_SHA, (
+        f"pin_field 'sha' returned unexpected output: {result.stdout.strip()!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # The workflow must document the boundary it now enforces
 # ---------------------------------------------------------------------------

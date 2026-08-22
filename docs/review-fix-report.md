@@ -62,3 +62,60 @@ exit-code contract (130 for SIGINT, 143 for SIGTERM).
 - The provider→env-var mapping uses a fixed allowlist. If a new provider is introduced (e.g., `mistral`), the `*)` fallback sends to `OPENAI_API_KEY`, which would silently fail. This is a conscious design choice to fail loudly at LLM call time rather than at credential setup.
 - The test infrastructure uses `os.setpgrp` + `os.killpg` to send signals to the entire bash process group, which is the correct way to simulate terminal Ctrl+C in a test harness.
 - The credential value (`fake-token`) must not match any substring of a file path or other benign string to avoid false-positive test failures; the test uses `_BASE_ENV["GROUNDING_REFLECTION_CREDENTIAL"]` directly, so changing the credential in the future remains safe.
+
+---
+
+# Review Round 2 — Medium Operator Defect: `pin_field` Package Import
+
+**Commit:** (this commit)
+**Branch:** feat/prompt-lab-mvp
+**Date:** 2026-08-22
+
+## Defect
+
+`scripts/verify-korvid-pin.sh` is documented as requiring only `gh` and
+`python3`, but `pin_field()` used:
+
+```python
+from korvid_prompt_lab import korvid_pin
+```
+
+Importing the *package* triggers `korvid_prompt_lab/__init__.py` →
+`config.py` → `contracts.py`, which (a) requires third-party packages
+(`dspy`, `gepa`, `PyYAML`) not present in a bare Python environment and
+(b) uses `@dataclass(slots=True)` (Python 3.10+), crashing on the macOS
+system Python 3.9.
+
+## Fix applied (`scripts/verify-korvid-pin.sh`)
+
+Replaced the package import with a standard-library `ast` parser that reads
+literal declarations directly from
+`$REPO_ROOT/src/korvid_prompt_lab/korvid_pin.py`. The declaration is never
+executed, so package dependencies and Python-version-sensitive runtime features
+such as slotted dataclasses are irrelevant. `PYTHONPATH` manipulation is gone,
+and malformed or incomplete declarations fail before any credential-carrying
+operation.
+
+## Test added (`tests/test_korvid_pin.py`)
+
+`test_verify_script_pin_field_does_not_execute_the_declaration` extracts the
+inline Python snippet, gives it a declaration containing a deliberate runtime
+exception, and runs it under `python3 -S`. This was **RED** when the verifier
+executed the declaration and is **GREEN** with literal AST parsing.
+
+## Results
+
+| Check | Result |
+|-------|--------|
+| RED (before fix) | `RuntimeError: the verifier executed the declaration` |
+| GREEN (after fix) | 1 passed |
+| `env PYTHON=python3 ./scripts/verify-korvid-pin.sh` | **OK** — pin proven via PR #312 |
+| Full suite | **520 passed, 6 skipped** |
+| `ruff check .` | **0 errors** |
+| `mypy --python-version 3.12 src tests` | **no issues found in 35 source files** |
+| Shell syntax and workflow YAML | **OK** |
+
+## Notes
+
+- The live verification above used the macOS system Python 3.9.6 with no
+  project environment or third-party packages.

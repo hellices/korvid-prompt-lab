@@ -37,26 +37,74 @@ fi
 # Read the reviewed declaration rather than restating it: a second copy of the
 # SHA in this file is exactly the drift the pin exists to prevent.
 pin_field() {
-  PYTHONPATH="$REPO_ROOT/src" "$PYTHON" -c '
+  "$PYTHON" -c '
+import ast
 import sys
-from korvid_prompt_lab import korvid_pin
 
-field = sys.argv[1]
-if field == "sha":
-    print(korvid_pin.APPROVED_KORVID_SHA)
-elif field == "repository":
-    print(korvid_pin.KORVID_REPOSITORY)
-elif field == "default_branch":
-    print(korvid_pin.KORVID_DEFAULT_BRANCH)
-elif field == "pull_request":
-    print(korvid_pin.APPROVED_KORVID_PROVENANCE.pull_request)
-elif field == "paths":
-    print("\n".join(korvid_pin.REQUIRED_KORVID_SOURCE_PATHS))
-elif field == "summary":
-    print(korvid_pin.approved_pin_summary())
+_pin_path = sys.argv[1]
+_field = sys.argv[2]
+
+with open(_pin_path, encoding="utf-8") as pin_file:
+    tree = ast.parse(pin_file.read(), filename=_pin_path)
+
+values = {}
+
+def literal(node):
+    if isinstance(node, ast.Name):
+        return values[node.id]
+    if isinstance(node, ast.Tuple):
+        return tuple(literal(item) for item in node.elts)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        if node.func.id == "KorvidProvenance":
+            return {keyword.arg: literal(keyword.value) for keyword in node.keywords}
+        if node.func.id == "MappingProxyType" and len(node.args) == 1:
+            return literal(node.args[0])
+    return ast.literal_eval(node)
+
+for statement in tree.body:
+    target = None
+    value = None
+    if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+        target, value = statement.targets[0], statement.value
+    elif isinstance(statement, ast.AnnAssign):
+        target, value = statement.target, statement.value
+    if isinstance(target, ast.Name) and value is not None:
+        try:
+            values[target.id] = literal(value)
+        except (KeyError, ValueError, TypeError):
+            pass
+
+provenance = values["APPROVED_KORVID_PROVENANCE"]
+if _field == "sha":
+    print(values["APPROVED_KORVID_SHA"])
+elif _field == "repository":
+    print(values["KORVID_REPOSITORY"])
+elif _field == "default_branch":
+    print(values["KORVID_DEFAULT_BRANCH"])
+elif _field == "pull_request":
+    print(provenance["pull_request"])
+elif _field == "paths":
+    print("\n".join(values["REQUIRED_KORVID_SOURCE_PATHS"]))
+elif _field == "summary":
+    print(
+        values["KORVID_REPOSITORY"]
+        + "@"
+        + values["APPROVED_KORVID_SHA"]
+        + " (open PR #"
+        + str(provenance["pull_request"])
+        + " "
+        + provenance["branch"]
+        + " -> "
+        + provenance["base_branch"]
+        + "; compare vs "
+        + values["KORVID_DEFAULT_BRANCH"]
+        + ": "
+        + provenance["default_branch_compare_status"]
+        + ")"
+    )
 else:
-    raise SystemExit(f"unknown pin field: {field}")
-' "$1"
+    raise SystemExit("unknown pin field: " + _field)
+' "$REPO_ROOT/src/korvid_prompt_lab/korvid_pin.py" "$1"
 }
 
 KORVID_SHA="$(pin_field sha)"
