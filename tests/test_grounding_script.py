@@ -4,6 +4,13 @@ Each test spins up a minimal fake PATH containing az, kubectl,
 korvid-prompt-lab, and korvid-grounding-report shims, then runs the
 real script as a subprocess.  Call records are captured via a shared
 ``calls.txt`` file so we can assert ordering without mocking internals.
+
+The ``korvid-prompt-lab`` shim is a *strict* fake parser: it accepts exactly the
+options the real :func:`korvid_prompt_lab.cli.build_parser` accepts for each
+subcommand, enforces the same required options, and exits 2 with an argparse-
+shaped usage error otherwise.  Every argv the orchestrator emits is additionally
+replayed through the **real** parser, so an argv-incompatible invocation can
+never pass these tests again.
 """
 
 from __future__ import annotations
@@ -14,7 +21,12 @@ import stat
 import subprocess
 import textwrap
 import time
+from collections.abc import Sequence
 from pathlib import Path
+
+import pytest
+
+from korvid_prompt_lab.cli import build_parser
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -22,11 +34,27 @@ from pathlib import Path
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run-grounding-round.sh"
 
+CAMPAIGN_PATH = "examples/campaigns/aks-shared-runners.yaml"
+TRAIN_CASE_ID = "aks-scale-deployment-up"
+VALIDATION_CASE_ID = "aks-restart-denied"
+MILESTONE_CASE_IDS = "aks-scale-deployment-up,aks-restart-denied"
+MAX_METRIC_CALLS = "7"
+SEED = "3"
+
 _BASE_ENV: dict[str, str] = {
     "GROUNDING_MODEL": "qwen3:1.7b",
     "GROUNDING_CANDIDATE": "seed",
+    "GROUNDING_CAMPAIGN": CAMPAIGN_PATH,
     "GROUNDING_ROUND_TYPE": "evaluate",
+    "GROUNDING_TRAIN_CASE_ID": TRAIN_CASE_ID,
+    "GROUNDING_VALIDATION_CASE_ID": VALIDATION_CASE_ID,
+    "GROUNDING_MILESTONE_CASE_IDS": MILESTONE_CASE_IDS,
+    "GROUNDING_MAX_METRIC_CALLS": MAX_METRIC_CALLS,
+    "GROUNDING_SEED": SEED,
     "KORVID_SOURCE_ROOT": "/fake/korvid",
+    "KORVID_AKS_MODEL": "qwen3:1.7b",
+    "KORVID_AKS_NAMESPACE": "ollama",
+    "KORVID_AKS_SERVICE": "ollama",
     "GROUNDING_ARTIFACT_ROOT": "",  # overridden per test
     "WORKFLOW_RUN_URL": "https://github.com/org/repo/actions/runs/1",
     "PROMPT_LAB_REVISION": "abc123",
@@ -34,6 +62,54 @@ _BASE_ENV: dict[str, str] = {
     "GROUNDING_REFLECTION_MODEL": "qwen3:0.6b",
     "GROUNDING_REFLECTION_CREDENTIAL": "fake-token",
 }
+
+#: Options the strict fake parser accepts, mirroring ``build_parser()``.  The
+#: ``test_fake_parser_*`` tests below prove this table has not drifted from the
+#: real CLI, so a shim that silently swallows a nonexistent flag fails loudly.
+_FAKE_PARSER_SPEC: dict[str, dict[str, str]] = {
+    "aks-check": {
+        "value": "--campaign --artifact-root",
+        "flag": "",
+        "required": "--campaign",
+    },
+    "evaluate": {
+        "value": (
+            "--candidate --campaign --artifact-root --case-id --train-case-id "
+            "--validation-case-id --milestone-case-id --bundle-kind"
+        ),
+        "flag": "--json",
+        "required": "--candidate --campaign",
+    },
+    "optimize": {
+        "value": (
+            "--candidate --campaign --artifact-root --max-metric-calls "
+            "--reflection-model --seed --train-case-id --validation-case-id"
+        ),
+        "flag": "",
+        "required": "--candidate --campaign --max-metric-calls",
+    },
+}
+
+
+def recorded_argv(calls: Sequence[str], prefix: str) -> list[str]:
+    """Reconstruct the argv the orchestrator passed for one subcommand."""
+    counts = [line for line in calls if line.startswith(f"{prefix} argc=")]
+    assert len(counts) == 1, f"expected exactly one {prefix!r} invocation, got {len(counts)}"
+    expected_argc = int(counts[0].split("=", 1)[1])
+
+    marker = f"{prefix} arg="
+    argv = [line[len(marker) :] for line in calls if line.startswith(marker)]
+    assert len(argv) == expected_argc, f"{prefix} argc={expected_argc} but recorded {len(argv)} args"
+    return argv
+
+
+def option_value(argv: Sequence[str], option: str) -> str:
+    assert option in argv, f"{option} missing from argv {list(argv)}"
+    return argv[argv.index(option) + 1]
+
+
+def option_values(argv: Sequence[str], option: str) -> list[str]:
+    return [argv[index + 1] for index, token in enumerate(argv) if token == option]
 
 
 def _make_fake_bin_blocking(
@@ -154,9 +230,11 @@ def _make_fake_bin(
     preflight_exit: int,
     calls_file: Path,
     optimize_mode: str = "actual-layout",
+    preflight_success_after: int = 0,
 ) -> None:
     """Write shim executables into *fake_bin_dir*."""
     fake_bin_dir.mkdir(parents=True, exist_ok=True)
+    attempts_file = fake_bin_dir.parent / "aks-check-attempts"
 
     def _write(name: str, body: str) -> None:
         p = fake_bin_dir / name
@@ -197,16 +275,91 @@ def _make_fake_bin(
                 printf '%s arg=%s\\n' "$prefix" "$arg" >> "$CALLS"
             done
         }}
-        if [[ "$1" == "aks-check" ]]; then
-            echo "aks-check" >> "$CALLS"
+
+        # --- strict fake parser -------------------------------------------
+        # Mirrors korvid_prompt_lab.cli.build_parser(): unknown options and
+        # missing required options exit 2 exactly like argparse, so an
+        # argv-incompatible orchestrator can never look healthy here.
+        _subcommand="${{1:-}}"
+        _usage_error() {{
+            echo "korvid-prompt-lab ${{_subcommand}}: error: $1" >&2
+            exit 2
+        }}
+
+        case "$_subcommand" in
+            aks-check)
+                _value_opts="{_FAKE_PARSER_SPEC["aks-check"]["value"]}"
+                _flag_opts="{_FAKE_PARSER_SPEC["aks-check"]["flag"]}"
+                _required_opts="{_FAKE_PARSER_SPEC["aks-check"]["required"]}"
+                ;;
+            evaluate)
+                _value_opts="{_FAKE_PARSER_SPEC["evaluate"]["value"]}"
+                _flag_opts="{_FAKE_PARSER_SPEC["evaluate"]["flag"]}"
+                _required_opts="{_FAKE_PARSER_SPEC["evaluate"]["required"]}"
+                ;;
+            optimize)
+                _value_opts="{_FAKE_PARSER_SPEC["optimize"]["value"]}"
+                _flag_opts="{_FAKE_PARSER_SPEC["optimize"]["flag"]}"
+                _required_opts="{_FAKE_PARSER_SPEC["optimize"]["required"]}"
+                ;;
+            *)
+                echo "korvid-prompt-lab: error: argument command: invalid choice: '$_subcommand'" >&2
+                exit 2
+                ;;
+        esac
+
+        echo "$_subcommand" >> "$CALLS"
+        if [[ "$_subcommand" == "aks-check" ]]; then
+            _attempts_file="{attempts_file}"
+            _attempts=$(( $(cat "$_attempts_file" 2>/dev/null || echo 0) + 1 ))
+            echo "$_attempts" > "$_attempts_file"
+            # Record argv once: a retried preflight would otherwise bury the
+            # single interesting argv under hundreds of identical records.
+            if (( _attempts == 1 )); then
+                _record_args "$_subcommand" "$@"
+            fi
+        else
+            _record_args "$_subcommand" "$@"
+        fi
+
+        _seen=""
+        shift
+        while (( $# )); do
+            case " $_value_opts " in
+                *" $1 "*)
+                    if (( $# < 2 )); then
+                        _usage_error "argument $1: expected one argument"
+                    fi
+                    _seen="$_seen $1"
+                    shift 2
+                    continue
+                    ;;
+            esac
+            case " $_flag_opts " in
+                *" $1 "*)
+                    _seen="$_seen $1"
+                    shift
+                    continue
+                    ;;
+            esac
+            _usage_error "unrecognized arguments: $1"
+        done
+        for _req in $_required_opts; do
+            case " $_seen " in
+                *" $_req "*) ;;
+                *) _usage_error "the following arguments are required: $_req" ;;
+            esac
+        done
+        # --- end strict fake parser ---------------------------------------
+
+        if [[ "$_subcommand" == "aks-check" ]]; then
+            if (( {preflight_success_after} > 0 && _attempts > {preflight_success_after} )); then
+                exit 0
+            fi
             exit {preflight_exit}
-        elif [[ "$1" == "evaluate" ]]; then
-            echo "evaluate" >> "$CALLS"
-            _record_args "evaluate" "$@"
+        elif [[ "$_subcommand" == "evaluate" ]]; then
             exit {evaluation_exit}
-        elif [[ "$1" == "optimize" ]]; then
-            echo "optimize" >> "$CALLS"
-            _record_args "optimize" "$@"
+        elif [[ "$_subcommand" == "optimize" ]]; then
             case "{optimize_mode}" in
                 actual-layout)
                     mkdir -p "${{GROUNDING_ARTIFACT_ROOT}}/optimize/invocations/opt-run-1"
@@ -259,9 +412,10 @@ def run_script(
     extra_env: dict[str, str] | None = None,
     optimize_mode: str = "actual-layout",
     artifact_root_name: str = "artifacts",
+    preflight_success_after: int = 0,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     artifact_root = tmp_path / artifact_root_name
-    artifact_root.mkdir()
+    artifact_root.mkdir(parents=True)
     calls_file = tmp_path / "calls.txt"
     calls_file.touch()
 
@@ -273,6 +427,7 @@ def run_script(
         preflight_exit=preflight_exit,
         calls_file=calls_file,
         optimize_mode=optimize_mode,
+        preflight_success_after=preflight_success_after,
     )
 
     env = dict(os.environ)
@@ -538,3 +693,352 @@ def test_round_script_evaluate_round_ignores_absent_reflection_config(tmp_path: 
     assert result.returncode == 0, result.stderr
     assert "evaluate" in calls
     assert "optimize" not in calls
+
+
+# ---------------------------------------------------------------------------
+# Task 3 finding 1: the orchestrator must speak the real CLI's argv
+# ---------------------------------------------------------------------------
+
+
+def test_fake_parser_spec_matches_the_real_cli_parser() -> None:
+    """The strict shim's option table must not drift from build_parser()."""
+    parser = build_parser()
+
+    minimal = {
+        "aks-check": ["aks-check", "--campaign", "c.yaml"],
+        "evaluate": ["evaluate", "--candidate", "x.yaml", "--campaign", "c.yaml"],
+        "optimize": [
+            "optimize",
+            "--candidate",
+            "x.yaml",
+            "--campaign",
+            "c.yaml",
+            "--max-metric-calls",
+            "4",
+        ],
+    }
+
+    for subcommand, spec in _FAKE_PARSER_SPEC.items():
+        base = minimal[subcommand]
+        parsed = parser.parse_args(base)
+        assert parsed.command == subcommand
+
+        for option in spec["value"].split():
+            if option in base:
+                continue
+            probe = "common" if option == "--bundle-kind" else "1"
+            parser.parse_args([*base, option, probe])
+        for option in spec["flag"].split():
+            parser.parse_args([*base, option])
+
+        for required in spec["required"].split():
+            stripped = list(base)
+            index = stripped.index(required)
+            del stripped[index : index + 2]
+            with pytest.raises(SystemExit) as excinfo:
+                parser.parse_args(stripped)
+            assert excinfo.value.code == 2, f"{subcommand} {required} must be required"
+
+
+def test_real_cli_parser_rejects_the_previous_orchestrator_argv() -> None:
+    """Regression guard: the argv this task removed must still be a usage error."""
+    parser = build_parser()
+    removed = (
+        ["aks-check", "--korvid-source-root", "/fake/korvid", "--model", "qwen3:1.7b"],
+        [
+            "evaluate",
+            "--candidate",
+            "seed",
+            "--model",
+            "qwen3:1.7b",
+            "--korvid-source-root",
+            "/fake/korvid",
+            "--artifact-root",
+            "a",
+        ],
+        [
+            "optimize",
+            "--candidate",
+            "seed",
+            "--reflection-model",
+            "qwen3:0.6b",
+            "--korvid-source-root",
+            "/fake/korvid",
+            "--artifact-root",
+            "a",
+        ],
+    )
+    for argv in removed:
+        with pytest.raises(SystemExit) as excinfo:
+            parser.parse_args(argv)
+        assert excinfo.value.code == 2
+
+
+def test_round_script_argv_is_accepted_by_the_real_cli_parser(tmp_path: Path) -> None:
+    """Every argv the orchestrator emits must parse against the installed CLI."""
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        evaluation_exit=0,
+        round_type="optimize-evaluate",
+    )
+
+    assert result.returncode == 0, result.stderr
+
+    parser = build_parser()
+    for subcommand in ("aks-check", "optimize", "evaluate"):
+        argv = recorded_argv(calls, subcommand)
+        assert argv[0] == subcommand
+        assert "--korvid-source-root" not in argv, (
+            f"{subcommand} passes --korvid-source-root, which the CLI does not define; "
+            "the source root is runtime policy read from KORVID_SOURCE_ROOT"
+        )
+        assert "--model" not in argv, (
+            f"{subcommand} passes --model, which the CLI does not define; the model "
+            "comes from the campaign"
+        )
+        parsed = parser.parse_args(argv)  # SystemExit(2) if argv-incompatible
+        assert parsed.command == subcommand
+        assert str(parsed.campaign) == CAMPAIGN_PATH
+
+
+def test_round_script_evaluate_argv_carries_campaign_case_sets(tmp_path: Path) -> None:
+    result, calls = run_script(tmp_path, original_count=0, evaluation_exit=0)
+
+    assert result.returncode == 0, result.stderr
+    argv = recorded_argv(calls, "evaluate")
+
+    assert option_value(argv, "--campaign") == CAMPAIGN_PATH
+    assert option_value(argv, "--candidate") == "seed"
+    assert option_value(argv, "--train-case-id") == TRAIN_CASE_ID
+    assert option_value(argv, "--validation-case-id") == VALIDATION_CASE_ID
+    assert option_values(argv, "--milestone-case-id") == MILESTONE_CASE_IDS.split(",")
+    assert option_value(argv, "--artifact-root") == str(tmp_path / "artifacts" / "evaluate")
+
+
+def test_round_script_optimize_argv_carries_budget_seed_and_splits(tmp_path: Path) -> None:
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        evaluation_exit=0,
+        round_type="optimize-evaluate",
+    )
+
+    assert result.returncode == 0, result.stderr
+    argv = recorded_argv(calls, "optimize")
+
+    assert option_value(argv, "--campaign") == CAMPAIGN_PATH
+    assert option_value(argv, "--max-metric-calls") == MAX_METRIC_CALLS
+    assert option_value(argv, "--seed") == SEED
+    assert option_value(argv, "--reflection-model") == _BASE_ENV["GROUNDING_REFLECTION_MODEL"]
+    assert option_value(argv, "--train-case-id") == TRAIN_CASE_ID
+    assert option_value(argv, "--validation-case-id") == VALIDATION_CASE_ID
+
+
+def test_round_script_aks_check_argv_is_campaign_only(tmp_path: Path) -> None:
+    result, calls = run_script(tmp_path, original_count=0, evaluation_exit=0)
+
+    assert result.returncode == 0, result.stderr
+    argv = recorded_argv(calls, "aks-check")
+    assert option_value(argv, "--campaign") == CAMPAIGN_PATH
+    assert option_value(argv, "--artifact-root") == str(tmp_path / "artifacts" / "aks-check")
+
+
+# ---------------------------------------------------------------------------
+# Task 3 finding 1: a usage/config failure must abort, not spin for 15 minutes
+# ---------------------------------------------------------------------------
+
+
+def test_round_script_aborts_immediately_when_aks_check_reports_a_config_error(
+    tmp_path: Path,
+) -> None:
+    """exit 2 from aks-check is systemic configuration, never 'not ready yet'."""
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        preflight_exit=2,
+        extra_env={"_AKS_CHECK_DEADLINE_SECONDS": "900"},
+    )
+
+    assert result.returncode == 2, result.stderr
+    assert calls.count("aks-check") == 1, (
+        f"a configuration failure must not be retried; got {calls.count('aks-check')} attempts"
+    )
+    assert "timed out" not in result.stderr
+    assert calls[-1] == "scale:0", "the node the round scaled up must still be released"
+
+
+def test_round_script_retries_aks_check_while_the_pool_warms_up(tmp_path: Path) -> None:
+    """exit 1 from aks-check stays retryable until the deadline."""
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        preflight_exit=1,
+        preflight_success_after=2,
+        evaluation_exit=0,
+        extra_env={"_AKS_CHECK_DEADLINE_SECONDS": "60"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls.count("aks-check") == 3
+    assert "evaluate" in calls
+
+
+# ---------------------------------------------------------------------------
+# Task 3 finding 2: campaign, case, and serving configuration are required
+# ---------------------------------------------------------------------------
+
+
+def test_round_script_requires_campaign_before_any_cloud_call(tmp_path: Path) -> None:
+    result, calls = run_script(tmp_path, original_count=0, extra_env={"GROUNDING_CAMPAIGN": ""})
+
+    assert result.returncode != 0
+    assert "GROUNDING_CAMPAIGN" in result.stderr
+    assert calls == []
+
+
+def test_round_script_requires_campaign_serving_environment(tmp_path: Path) -> None:
+    """The campaign resolves models/namespace/service through env: references."""
+    for name in ("KORVID_AKS_MODEL", "KORVID_AKS_NAMESPACE", "KORVID_AKS_SERVICE"):
+        result, calls = run_script(tmp_path / name, original_count=0, extra_env={name: ""})
+
+        assert result.returncode != 0, f"{name} must be required"
+        assert name in result.stderr
+        assert calls == [], f"a missing {name} must not cost cluster time"
+
+
+def test_round_script_requires_the_served_model_to_match_the_allowlisted_model(
+    tmp_path: Path,
+) -> None:
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        extra_env={"KORVID_AKS_MODEL": "qwen3:14b"},
+    )
+
+    assert result.returncode == 2
+    assert "KORVID_AKS_MODEL" in result.stderr
+    assert calls == []
+
+
+def test_round_script_requires_case_identifiers(tmp_path: Path) -> None:
+    for name in (
+        "GROUNDING_TRAIN_CASE_ID",
+        "GROUNDING_VALIDATION_CASE_ID",
+        "GROUNDING_MILESTONE_CASE_IDS",
+    ):
+        result, calls = run_script(tmp_path / name, original_count=0, extra_env={name: ""})
+
+        assert result.returncode != 0, f"{name} must be required"
+        assert name in result.stderr
+        assert calls == []
+
+
+def test_round_script_requires_disjoint_train_and_validation_cases(tmp_path: Path) -> None:
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        extra_env={"GROUNDING_VALIDATION_CASE_ID": TRAIN_CASE_ID},
+    )
+
+    assert result.returncode == 2
+    assert "disjoint" in result.stderr
+    assert calls == []
+
+
+def test_round_script_requires_a_positive_metric_call_budget(tmp_path: Path) -> None:
+    for index, value in enumerate(("0", "-1", "1e3", "12; rm -rf /", "", "1 2")):
+        result, calls = run_script(
+            tmp_path / f"budget-{index}",
+            original_count=0,
+            round_type="optimize-evaluate",
+            extra_env={"GROUNDING_MAX_METRIC_CALLS": value},
+        )
+
+        assert result.returncode != 0, f"metric budget {value!r} must be rejected"
+        assert calls == []
+
+
+def test_round_script_requires_a_non_negative_seed(tmp_path: Path) -> None:
+    for index, value in enumerate(("-1", "abc", "0x10", "")):
+        result, calls = run_script(
+            tmp_path / f"seed-{index}",
+            original_count=0,
+            round_type="optimize-evaluate",
+            extra_env={"GROUNDING_SEED": value},
+        )
+
+        assert result.returncode != 0, f"seed {value!r} must be rejected"
+        assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Task 3 finding 2: milestone ids split into argv without word injection
+# ---------------------------------------------------------------------------
+
+
+def test_round_script_splits_a_single_milestone_id_into_one_argument(tmp_path: Path) -> None:
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        evaluation_exit=0,
+        extra_env={"GROUNDING_MILESTONE_CASE_IDS": VALIDATION_CASE_ID},
+    )
+
+    assert result.returncode == 0, result.stderr
+    argv = recorded_argv(calls, "evaluate")
+    assert option_values(argv, "--milestone-case-id") == [VALIDATION_CASE_ID]
+
+
+def test_round_script_rejects_hostile_milestone_case_ids(tmp_path: Path) -> None:
+    """Splitting must never word-split, glob, or evaluate a hostile value."""
+    hostile = (
+        "aks-restart-denied extra-case",  # whitespace word splitting
+        "*",  # pathname expansion
+        "$(touch pwned)",  # command substitution
+        "`touch pwned`",
+        "a;b",
+        "--milestone-case-id",  # option smuggling
+        "aks-restart-denied,",  # empty trailing element
+        ",aks-restart-denied",
+        "aks-restart-denied,,aks-scale-deployment-up",
+        "../../etc/passwd",
+    )
+    for index, value in enumerate(hostile):
+        result, calls = run_script(
+            tmp_path / f"hostile-{index}",
+            original_count=0,
+            evaluation_exit=0,
+            extra_env={"GROUNDING_MILESTONE_CASE_IDS": value},
+        )
+
+        assert result.returncode == 2, f"{value!r} must be rejected (got {result.returncode})"
+        assert calls == [], f"{value!r} must be rejected before any cloud call"
+        assert not (tmp_path / f"hostile-{index}" / "pwned").exists()
+        assert not Path("pwned").exists()
+
+
+def test_round_script_rejects_hostile_train_and_validation_case_ids(tmp_path: Path) -> None:
+    hostile = ("a b", "$(id)", "a,b", "-x", "")
+    for index, value in enumerate(hostile):
+        for name in ("GROUNDING_TRAIN_CASE_ID", "GROUNDING_VALIDATION_CASE_ID"):
+            result, calls = run_script(
+                tmp_path / f"{name}-{index}",
+                original_count=0,
+                extra_env={name: value},
+            )
+
+            assert result.returncode != 0, f"{name}={value!r} must be rejected"
+            assert calls == []
+
+
+def test_round_script_rejects_a_campaign_outside_the_checkout(tmp_path: Path) -> None:
+    for index, value in enumerate(("/etc/passwd", "../secrets.yaml", "campaign.yaml; touch pwned")):
+        result, calls = run_script(
+            tmp_path / f"campaign-{index}",
+            original_count=0,
+            extra_env={"GROUNDING_CAMPAIGN": value},
+        )
+
+        assert result.returncode == 2, f"campaign {value!r} must be rejected"
+        assert calls == []

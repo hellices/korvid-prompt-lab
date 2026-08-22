@@ -3,9 +3,18 @@
 #
 # Required environment variables:
 #   GROUNDING_MODEL            — allowed: qwen3:{0.6b,1.7b,4b,8b,14b}
-#   GROUNDING_CANDIDATE        — path or label of the candidate YAML
+#   GROUNDING_CANDIDATE        — path of the candidate YAML (checkout-relative)
+#   GROUNDING_CAMPAIGN         — path of the campaign YAML (checkout-relative)
 #   GROUNDING_ROUND_TYPE       — evaluate | optimize-evaluate
+#   GROUNDING_TRAIN_CASE_ID       — case id forming the train split
+#   GROUNDING_VALIDATION_CASE_ID  — case id forming the validation split
+#   GROUNDING_MILESTONE_CASE_IDS  — comma-separated milestone-pack case ids
+#   GROUNDING_MAX_METRIC_CALLS    — GEPA metric-call budget (positive integer)
+#   GROUNDING_SEED                — GEPA search seed (non-negative integer)
 #   KORVID_SOURCE_ROOT         — path to Korvid repository checkout
+#   KORVID_AKS_MODEL           — model the campaign serves; must equal GROUNDING_MODEL
+#   KORVID_AKS_NAMESPACE       — namespace the campaign port-forwards into
+#   KORVID_AKS_SERVICE         — service the campaign port-forwards to
 #   GROUNDING_ARTIFACT_ROOT    — directory for evaluation artifacts
 #   WORKFLOW_RUN_URL           — GitHub Actions run URL (for report)
 #   PROMPT_LAB_REVISION        — prompt-lab git revision (for report)
@@ -14,6 +23,11 @@
 # Additional required for optimize-evaluate:
 #   GROUNDING_REFLECTION_MODEL      — reflection LLM model identifier
 #   GROUNDING_REFLECTION_CREDENTIAL — API credential for reflection model
+#
+# The campaign resolves `models`, `serving.namespace`, `serving.service`, and
+# `serving.model` through `env:` references, so the KORVID_AKS_* variables are as
+# load-bearing as the campaign path itself: without them `load_campaign()` fails
+# and every subcommand exits 2.
 
 set -Eeuo pipefail
 
@@ -23,8 +37,17 @@ set -Eeuo pipefail
 
 : "${GROUNDING_MODEL:?GROUNDING_MODEL is required}"
 : "${GROUNDING_CANDIDATE:?GROUNDING_CANDIDATE is required}"
+: "${GROUNDING_CAMPAIGN:?GROUNDING_CAMPAIGN is required}"
 : "${GROUNDING_ROUND_TYPE:?GROUNDING_ROUND_TYPE is required}"
+: "${GROUNDING_TRAIN_CASE_ID:?GROUNDING_TRAIN_CASE_ID is required}"
+: "${GROUNDING_VALIDATION_CASE_ID:?GROUNDING_VALIDATION_CASE_ID is required}"
+: "${GROUNDING_MILESTONE_CASE_IDS:?GROUNDING_MILESTONE_CASE_IDS is required}"
+: "${GROUNDING_MAX_METRIC_CALLS:?GROUNDING_MAX_METRIC_CALLS is required}"
+: "${GROUNDING_SEED:?GROUNDING_SEED is required}"
 : "${KORVID_SOURCE_ROOT:?KORVID_SOURCE_ROOT is required}"
+: "${KORVID_AKS_MODEL:?KORVID_AKS_MODEL is required by the campaign env: references}"
+: "${KORVID_AKS_NAMESPACE:?KORVID_AKS_NAMESPACE is required by the campaign env: references}"
+: "${KORVID_AKS_SERVICE:?KORVID_AKS_SERVICE is required by the campaign env: references}"
 : "${GROUNDING_ARTIFACT_ROOT:?GROUNDING_ARTIFACT_ROOT is required}"
 : "${WORKFLOW_RUN_URL:?WORKFLOW_RUN_URL is required}"
 : "${PROMPT_LAB_REVISION:?PROMPT_LAB_REVISION is required}"
@@ -35,10 +58,90 @@ case "$GROUNDING_MODEL" in
   *) echo "unsupported grounding model: $GROUNDING_MODEL" >&2; exit 2 ;;
 esac
 
+# The allowlist only binds the round if the model the campaign actually serves is
+# the same one: otherwise the report would name one model and grade another.
+if [[ "$KORVID_AKS_MODEL" != "$GROUNDING_MODEL" ]]; then
+  echo "KORVID_AKS_MODEL ($KORVID_AKS_MODEL) must equal GROUNDING_MODEL ($GROUNDING_MODEL)" >&2
+  exit 2
+fi
+
 case "$GROUNDING_ROUND_TYPE" in
   evaluate|optimize-evaluate) ;;
   *) echo "unsupported round type: $GROUNDING_ROUND_TYPE" >&2; exit 2 ;;
 esac
+
+_CASE_ID_PATTERN='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+_CASE_ID_LIST_PATTERN='^[A-Za-z0-9][A-Za-z0-9._-]*(,[A-Za-z0-9][A-Za-z0-9._-]*)*$'
+_RELATIVE_YAML_PATTERN='^[A-Za-z0-9._/-]+\.(yaml|yml)$'
+
+if [[ ! "$GROUNDING_CAMPAIGN" =~ $_RELATIVE_YAML_PATTERN ]] \
+  || [[ "$GROUNDING_CAMPAIGN" == /* ]] \
+  || [[ "$GROUNDING_CAMPAIGN" == *".."* ]]; then
+  echo "GROUNDING_CAMPAIGN must be a relative YAML path inside the checkout: $GROUNDING_CAMPAIGN" >&2
+  exit 2
+fi
+
+require_case_id() {
+  local value="$1" label="$2"
+  if [[ ! "$value" =~ $_CASE_ID_PATTERN ]]; then
+    echo "invalid $label: case ids must match $_CASE_ID_PATTERN (got: $value)" >&2
+    exit 2
+  fi
+}
+
+# Splits a comma-separated list into the global array `split_case_ids_out`.
+# `IFS=',' read -r -a` splits on commas only: no eval, no word splitting on
+# whitespace, and no pathname expansion, so a hostile value can never become an
+# extra argv token.  Every element is then checked against the case-id
+# vocabulary, which rejects whitespace, globs, and option-looking values.
+split_case_ids() {
+  local raw="$1" label="$2"
+  local -a parts=()
+  local part
+  split_case_ids_out=()
+
+  # Validate the whole list first: `read -a` silently drops empty leading and
+  # trailing fields, so "a," or ",a" would otherwise pass unnoticed.
+  if [[ ! "$raw" =~ $_CASE_ID_LIST_PATTERN ]]; then
+    echo "invalid $label: expected a comma-separated case id list (got: $raw)" >&2
+    exit 2
+  fi
+
+  IFS=',' read -r -a parts <<< "$raw"
+  for part in ${parts[@]+"${parts[@]}"}; do
+    require_case_id "$part" "$label"
+    split_case_ids_out+=("$part")
+  done
+
+  if (( ${#split_case_ids_out[@]} == 0 )); then
+    echo "invalid $label: at least one case id is required" >&2
+    exit 2
+  fi
+}
+
+require_case_id "$GROUNDING_TRAIN_CASE_ID" "GROUNDING_TRAIN_CASE_ID"
+require_case_id "$GROUNDING_VALIDATION_CASE_ID" "GROUNDING_VALIDATION_CASE_ID"
+
+if [[ "$GROUNDING_TRAIN_CASE_ID" == "$GROUNDING_VALIDATION_CASE_ID" ]]; then
+  echo "train and validation case sets must be disjoint: $GROUNDING_TRAIN_CASE_ID" >&2
+  exit 2
+fi
+
+split_case_ids "$GROUNDING_MILESTONE_CASE_IDS" "GROUNDING_MILESTONE_CASE_IDS"
+_milestone_args=()
+for _milestone_case_id in "${split_case_ids_out[@]}"; do
+  _milestone_args+=(--milestone-case-id "$_milestone_case_id")
+done
+
+if [[ ! "$GROUNDING_MAX_METRIC_CALLS" =~ ^[1-9][0-9]{0,4}$ ]]; then
+  echo "GROUNDING_MAX_METRIC_CALLS must be a positive integer: $GROUNDING_MAX_METRIC_CALLS" >&2
+  exit 2
+fi
+
+if [[ ! "$GROUNDING_SEED" =~ ^[0-9]{1,9}$ ]]; then
+  echo "GROUNDING_SEED must be a non-negative integer: $GROUNDING_SEED" >&2
+  exit 2
+fi
 
 # Optimization credentials are validated here — before the pool is read, scaled,
 # or waited on — so a misconfigured round never costs cluster time.
@@ -147,15 +250,32 @@ fi
 
 # ---------------------------------------------------------------------------
 # Preflight: AKS readiness check (bounded 15-minute deadline)
+#
+# exit 1 means "not ready yet" and is retried until the deadline.  Any other
+# non-zero exit — argparse usage errors and campaign/config failures both exit 2
+# — is systemic: retrying it would burn the full deadline on a GPU node for a
+# failure that can never resolve itself.
 # ---------------------------------------------------------------------------
+
+_aks_check_artifact_root="${GROUNDING_ARTIFACT_ROOT}/aks-check"
+mkdir -p "$_aks_check_artifact_root"
+_aks_check_args=(
+  aks-check
+  --campaign "$GROUNDING_CAMPAIGN"
+  --artifact-root "$_aks_check_artifact_root"
+)
 
 _preflight_deadline=$(( $(date +%s) + ${_AKS_CHECK_DEADLINE_SECONDS:-900} ))
 _aks_check_poll_interval="${_AKS_CHECK_POLL_INTERVAL:-10}"
 while true; do
-  if korvid-prompt-lab aks-check \
-       --korvid-source-root "$KORVID_SOURCE_ROOT" \
-       --model "$GROUNDING_MODEL"; then
+  _preflight_exit=0
+  korvid-prompt-lab "${_aks_check_args[@]}" || _preflight_exit=$?
+  if (( _preflight_exit == 0 )); then
     break
+  fi
+  if (( _preflight_exit != 1 )); then
+    echo "aks-check failed with exit $_preflight_exit (usage or configuration); not retrying" >&2
+    exit "$_preflight_exit"
   fi
   if (( $(date +%s) >= _preflight_deadline )); then
     echo "aks-check timed out after 15 minutes" >&2
@@ -177,9 +297,13 @@ if [[ "$GROUNDING_ROUND_TYPE" == "optimize-evaluate" ]]; then
   _optimize_args=(
     optimize
     --candidate "$_candidate"
-    --reflection-model "$GROUNDING_REFLECTION_MODEL"
-    --korvid-source-root "$KORVID_SOURCE_ROOT"
+    --campaign "$GROUNDING_CAMPAIGN"
     --artifact-root "$_opt_artifact_root"
+    --max-metric-calls "$GROUNDING_MAX_METRIC_CALLS"
+    --seed "$GROUNDING_SEED"
+    --reflection-model "$GROUNDING_REFLECTION_MODEL"
+    --train-case-id "$GROUNDING_TRAIN_CASE_ID"
+    --validation-case-id "$GROUNDING_VALIDATION_CASE_ID"
   )
 
   # optimize — never fall back to seed on failure; credential scoped to subprocess only
@@ -203,9 +327,11 @@ mkdir -p "$_eval_artifact_root"
 _evaluate_args=(
   evaluate
   --candidate "$_candidate"
-  --model "$GROUNDING_MODEL"
-  --korvid-source-root "$KORVID_SOURCE_ROOT"
+  --campaign "$GROUNDING_CAMPAIGN"
   --artifact-root "$_eval_artifact_root"
+  --train-case-id "$GROUNDING_TRAIN_CASE_ID"
+  --validation-case-id "$GROUNDING_VALIDATION_CASE_ID"
+  "${_milestone_args[@]}"
 )
 
 evaluate_exit=0

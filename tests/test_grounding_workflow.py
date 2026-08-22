@@ -20,14 +20,19 @@ quotes the key.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml  # type: ignore[import-untyped]
+
+from korvid_prompt_lab.config import load_campaign
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = _REPO_ROOT / ".github" / "workflows" / "grounding-round.yml"
 ORCHESTRATOR_PATH = _REPO_ROOT / "scripts" / "run-grounding-round.sh"
+CAMPAIGN_PATH = _REPO_ROOT / "examples" / "campaigns" / "aks-shared-runners.yaml"
 
 #: Workspace-relative artifact root the orchestrator writes into.  ``artifacts/``
 #: is gitignored, so live evidence never lands in a tracked path.
@@ -595,3 +600,432 @@ def test_grounding_workflow_installs_prompt_lab_on_path() -> None:
     ).get("UV_PROJECT_ENVIRONMENT"), (
         "Prompt Lab and Korvid must not share one uv environment"
     )
+
+
+# ---------------------------------------------------------------------------
+# Campaign, case, and budget dispatch inputs (design "Trigger and trust boundary")
+# ---------------------------------------------------------------------------
+
+
+def campaign_env_references() -> set[str]:
+    """Every ``env:NAME`` reference the AKS campaign resolves at load time."""
+    text = CAMPAIGN_PATH.read_text(encoding="utf-8")
+    return set(re.findall(r"\benv:([A-Z_][A-Z0-9_]*)", text))
+
+
+def test_grounding_workflow_declares_campaign_case_and_budget_inputs() -> None:
+    workflow = load_workflow()
+    inputs = _on_triggers(workflow)["workflow_dispatch"]["inputs"]
+
+    for name in (
+        "campaign",
+        "train_case_id",
+        "validation_case_id",
+        "milestone_case_ids",
+        "max_metric_calls",
+        "seed",
+    ):
+        assert name in inputs, (
+            f"the design requires a {name!r} dispatch input; without it the round "
+            "cannot select a campaign, its case splits, or its optimization budget"
+        )
+        assert inputs[name]["required"] is True
+
+    assert inputs["campaign"]["type"] == "string"
+    assert inputs["campaign"]["default"].endswith(".yaml")
+    assert inputs["train_case_id"]["type"] == "string"
+    assert inputs["validation_case_id"]["type"] == "string"
+    assert inputs["milestone_case_ids"]["type"] == "string"
+    assert inputs["max_metric_calls"]["type"] == "number"
+    assert inputs["seed"]["type"] == "number"
+
+    assert inputs["train_case_id"]["default"] != inputs["validation_case_id"]["default"], (
+        "the shipped defaults must keep the train and validation splits disjoint"
+    )
+    assert "," in inputs["milestone_case_ids"]["description"].lower() or "comma" in str(
+        inputs["milestone_case_ids"]["description"]
+    ).lower(), "milestone_case_ids must document that it is a comma-separated list"
+
+
+def test_grounding_workflow_validates_campaign_case_and_budget_inputs_first() -> None:
+    workflow = load_workflow()
+    validation_step = steps(workflow)[0]
+    validation_env = effective_env(workflow, validation_step)
+    body = str(validation_step["run"])
+
+    expected = {
+        "CAMPAIGN": "${{ inputs.campaign }}",
+        "TRAIN_CASE_ID": "${{ inputs.train_case_id }}",
+        "VALIDATION_CASE_ID": "${{ inputs.validation_case_id }}",
+        "MILESTONE_CASE_IDS": "${{ inputs.milestone_case_ids }}",
+        "MAX_METRIC_CALLS": "${{ inputs.max_metric_calls }}",
+        "SEED": "${{ inputs.seed }}",
+    }
+    for name, expression in expected.items():
+        assert validation_env.get(name) == expression, (
+            f"{name} must reach the validation step through env:, not interpolation"
+        )
+        assert f'"${name}"' in body, f"{name} must actually be validated, not merely bound"
+
+    login_index = step_index(workflow, "azure/login")
+    assert steps(workflow).index(validation_step) < login_index
+
+    assert "case ids" in body.lower() or "case id" in body.lower()
+    assert "disjoint" in body.lower(), (
+        "the train and validation splits must be proven disjoint before cluster time"
+    )
+
+
+def test_grounding_workflow_wires_campaign_cases_and_budget_to_the_orchestrator() -> None:
+    workflow = load_workflow()
+    env = effective_env(workflow, orchestrator_step(workflow))
+
+    assert env["GROUNDING_CAMPAIGN"] == "${{ inputs.campaign }}"
+    assert env["GROUNDING_TRAIN_CASE_ID"] == "${{ inputs.train_case_id }}"
+    assert env["GROUNDING_VALIDATION_CASE_ID"] == "${{ inputs.validation_case_id }}"
+    assert env["GROUNDING_MILESTONE_CASE_IDS"] == "${{ inputs.milestone_case_ids }}"
+    assert env["GROUNDING_MAX_METRIC_CALLS"] == "${{ inputs.max_metric_calls }}"
+    assert env["GROUNDING_SEED"] == "${{ inputs.seed }}"
+
+
+def test_grounding_workflow_supplies_every_campaign_environment_reference() -> None:
+    """The campaign resolves models/serving through env:; the job must set them."""
+    workflow = load_workflow()
+    env = effective_env(workflow, orchestrator_step(workflow))
+    references = campaign_env_references()
+
+    assert references, "the AKS campaign must resolve its serving identity from env:"
+    missing = sorted(references - set(env))
+    assert not missing, (
+        "load_campaign() raises 'references missing environment variable' without: "
+        f"{missing}"
+    )
+
+    assert env["KORVID_AKS_MODEL"] == "${{ inputs.model }}", (
+        "the allowlisted model input must be the model the campaign actually serves"
+    )
+    for name in ("KORVID_AKS_NAMESPACE", "KORVID_AKS_SERVICE"):
+        assert env[name] == f"${{{{ vars.{name} }}}}", (
+            f"{name} must come from the protected Environment configuration"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle step 12: bounded runtime and an always() node-pool restore
+# ---------------------------------------------------------------------------
+
+
+def nodepool_record_step(workflow: dict[str, Any]) -> dict[str, Any]:
+    matches = [
+        s
+        for s in steps(workflow)
+        if "nodepool show" in str(s.get("run", "")) and "GITHUB_OUTPUT" in str(s.get("run", ""))
+    ]
+    assert len(matches) == 1, (
+        "exactly one step must record the original modeleval node count as a step output"
+    )
+    return matches[0]
+
+
+def nodepool_restore_step(workflow: dict[str, Any]) -> dict[str, Any]:
+    matches = [s for s in steps(workflow) if "nodepool scale" in str(s.get("run", ""))]
+    assert len(matches) == 1, "exactly one step must restore the modeleval node count"
+    return matches[0]
+
+
+def test_grounding_workflow_bounds_job_and_orchestrator_runtime() -> None:
+    workflow = load_workflow()
+    job = grounding_job(workflow)
+
+    job_timeout = job.get("timeout-minutes")
+    assert isinstance(job_timeout, int), (
+        "without timeout-minutes the job inherits the 360-minute default, so a hung "
+        "round burns a GPU node for six hours behind cancel-in-progress: false"
+    )
+    assert 0 < job_timeout <= 360
+
+    orchestrator = orchestrator_step(workflow)
+    step_timeout = orchestrator.get("timeout-minutes")
+    assert isinstance(step_timeout, int), "the orchestrator step must be bounded"
+    assert 0 < step_timeout < job_timeout, (
+        "the orchestrator step must expire before the job does, so the always() "
+        "cleanup step still gets to run"
+    )
+
+
+def test_grounding_workflow_records_the_original_node_count_before_the_round() -> None:
+    workflow = load_workflow()
+    all_steps = steps(workflow)
+    record = nodepool_record_step(workflow)
+
+    assert record.get("id"), "the record step needs an id so cleanup can read its output"
+    assert all_steps.index(record) < all_steps.index(orchestrator_step(workflow)), (
+        "the original count must be captured before the round can scale the pool"
+    )
+    assert all_steps.index(record) > step_index(workflow, "azure/login")
+
+    body = str(record["run"])
+    assert "modeleval" in body
+    assert "GITHUB_OUTPUT" in body
+    assert "--node-count" not in body, "the record step must be read-only"
+
+
+def test_grounding_workflow_restores_the_recorded_node_count_with_always() -> None:
+    workflow = load_workflow()
+    all_steps = steps(workflow)
+    record = nodepool_record_step(workflow)
+    restore = nodepool_restore_step(workflow)
+
+    assert str(restore["if"]).strip() == "always()", (
+        "the design requires restoration in BOTH a shell trap and an always() step; "
+        "a cancelled runner kills the trap mid-flight and leaks the GPU node"
+    )
+    assert "continue-on-error" not in restore, (
+        "cleanup failure must be visible, never hidden by the evaluation result"
+    )
+
+    restore_index = all_steps.index(restore)
+    assert restore_index == len(all_steps) - 1, "cleanup must be the final step"
+    for needle in ("upload-artifact", "github-script"):
+        assert step_index(workflow, needle) < restore_index, (
+            f"{needle} must run before cleanup so evidence survives a cleanup failure"
+        )
+    summary_index = next(
+        index
+        for index, step in enumerate(all_steps)
+        if "GITHUB_STEP_SUMMARY" in str(step.get("run", ""))
+    )
+    assert summary_index < restore_index
+
+    env = effective_env(workflow, restore)
+    output_ref = f"${{{{ steps.{record['id']}.outputs."
+    assert any(value.startswith(output_ref) for value in env.values()), (
+        "cleanup must restore the count recorded before the round, not re-derive it"
+    )
+
+    body = str(restore["run"])
+    assert "--node-count 0" in body, "cleanup may only ever scale the pool back to 0"
+    assert "--node-count 1" not in body
+    assert "nodepool show" in body, (
+        "cleanup must be idempotent: only scale when the pool is not already restored"
+    )
+    for forbidden in ("nodepool add", "nodepool delete", "nodepool update", "aks create"):
+        assert forbidden not in body
+
+
+def test_grounding_workflow_orchestrator_failure_still_fails_the_job() -> None:
+    workflow = load_workflow()
+    orchestrator = orchestrator_step(workflow)
+
+    assert "if" not in orchestrator
+    assert "continue-on-error" not in orchestrator
+
+    all_steps = steps(workflow)
+    tail = all_steps[all_steps.index(orchestrator) + 1 :]
+    assert tail, "summary, upload, comment, and cleanup must follow the round"
+    for step in tail:
+        assert "always()" in str(step.get("if", "")), (
+            f"step {step.get('name')!r} runs after a possibly failed round and must "
+            "declare always() explicitly"
+        )
+
+
+def test_campaign_loads_only_with_the_variables_the_workflow_exports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prove the contract against the real loader, not just the workflow text."""
+    workflow = load_workflow()
+    env = effective_env(workflow, orchestrator_step(workflow))
+    references = campaign_env_references()
+
+    #: The concrete values the workflow's expressions resolve to at run time.
+    resolved = {
+        "KORVID_AKS_MODEL": "qwen3:1.7b",
+        "KORVID_AKS_NAMESPACE": "ollama",
+        "KORVID_AKS_SERVICE": "ollama",
+    }
+    assert set(resolved) == references, (
+        "this test must cover exactly the campaign's env: references"
+    )
+    assert references <= set(env)
+
+    for name, value in resolved.items():
+        monkeypatch.setenv(name, value)
+    campaign = load_campaign(CAMPAIGN_PATH)
+    assert campaign.models == ("qwen3:1.7b",)
+
+    for name in sorted(references):
+        monkeypatch.delenv(name)
+        with pytest.raises(ValueError, match=f"missing environment variable {name}"):
+            load_campaign(CAMPAIGN_PATH)
+        monkeypatch.setenv(name, resolved[name])
+
+
+# ---------------------------------------------------------------------------
+# Executable cleanup logic: run the workflow's own shell against a fake `az`
+# ---------------------------------------------------------------------------
+
+
+def _write_fake_az(bin_dir: Path, *, current_count: str, calls_file: Path, exit_code: int = 0) -> None:
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    az = bin_dir / "az"
+    az.write_text(
+        "#!/usr/bin/env bash\n"
+        f'CALLS="{calls_file}"\n'
+        'if [[ "$*" == *"nodepool show"* ]]; then\n'
+        '  echo "show" >> "$CALLS"\n'
+        f'  echo "{current_count}"\n'
+        f"  exit {exit_code}\n"
+        'elif [[ "$*" == *"nodepool scale"* ]]; then\n'
+        '  prev=""\n'
+        '  for arg in "$@"; do\n'
+        '    if [[ "$prev" == "--node-count" ]]; then echo "scale:$arg" >> "$CALLS"; fi\n'
+        '    prev="$arg"\n'
+        "  done\n"
+        f"  exit {exit_code}\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    az.chmod(0o755)
+
+
+def _run_step_body(
+    body: str,
+    tmp_path: Path,
+    *,
+    env: dict[str, str],
+    current_count: str = "1",
+    az_exit: int = 0,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    calls_file = tmp_path / "calls.txt"
+    calls_file.touch()
+    bin_dir = tmp_path / "bin"
+    _write_fake_az(bin_dir, current_count=current_count, calls_file=calls_file, exit_code=az_exit)
+
+    script = tmp_path / "step.sh"
+    script.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin", **env},
+        timeout=30,
+    )
+    calls = [line for line in calls_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return result, calls
+
+
+def test_grounding_workflow_record_step_publishes_the_original_count(tmp_path: Path) -> None:
+    body = str(nodepool_record_step(load_workflow())["run"])
+    output_file = tmp_path / "run" / "github-output"
+    output_file.parent.mkdir(parents=True)
+    output_file.touch()
+
+    result, calls = _run_step_body(
+        body,
+        tmp_path / "record",
+        env={"GITHUB_OUTPUT": str(output_file)},
+        current_count="0",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls == ["show"], "recording must be read-only"
+    assert "original-count=0" in output_file.read_text(encoding="utf-8")
+
+
+def test_grounding_workflow_record_step_rejects_an_unexpected_count(tmp_path: Path) -> None:
+    body = str(nodepool_record_step(load_workflow())["run"])
+    output_file = tmp_path / "github-output"
+    output_file.touch()
+
+    result, calls = _run_step_body(
+        body,
+        tmp_path / "record",
+        env={"GITHUB_OUTPUT": str(output_file)},
+        current_count="4",
+    )
+
+    assert result.returncode != 0
+    assert "unexpected modeleval node count" in result.stdout
+    assert "scale" not in " ".join(calls)
+    assert output_file.read_text(encoding="utf-8") == ""
+
+
+def test_grounding_workflow_restore_step_scales_back_to_the_recorded_zero(tmp_path: Path) -> None:
+    body = str(nodepool_restore_step(load_workflow())["run"])
+
+    result, calls = _run_step_body(
+        body,
+        tmp_path / "leaked",
+        env={"ORIGINAL_NODE_COUNT": "0"},
+        current_count="1",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls == ["show", "scale:0"], (
+        "a leaked node must be released with an exact scale to the recorded count"
+    )
+
+
+def test_grounding_workflow_restore_step_is_idempotent(tmp_path: Path) -> None:
+    """The trap usually wins the race; cleanup must then be a no-op, not a retry."""
+    body = str(nodepool_restore_step(load_workflow())["run"])
+
+    result, calls = _run_step_body(
+        body,
+        tmp_path / "already-restored",
+        env={"ORIGINAL_NODE_COUNT": "0"},
+        current_count="0",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls == ["show"], "an already-restored pool must not be scaled again"
+
+
+def test_grounding_workflow_restore_step_never_touches_preexisting_capacity(tmp_path: Path) -> None:
+    body = str(nodepool_restore_step(load_workflow())["run"])
+
+    result, calls = _run_step_body(
+        body,
+        tmp_path / "preexisting",
+        env={"ORIGINAL_NODE_COUNT": "1"},
+        current_count="1",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls == [], "a pool that already had a node must not even be queried"
+
+
+def test_grounding_workflow_restore_step_tolerates_a_round_that_never_started(
+    tmp_path: Path,
+) -> None:
+    """always() also fires when Azure login failed, so the output may be empty."""
+    body = str(nodepool_restore_step(load_workflow())["run"])
+
+    result, calls = _run_step_body(
+        body,
+        tmp_path / "never-recorded",
+        env={"ORIGINAL_NODE_COUNT": ""},
+        current_count="0",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls == []
+
+
+def test_grounding_workflow_restore_step_fails_visibly(tmp_path: Path) -> None:
+    """Design: cleanup failure is a separate failing step, never hidden."""
+    body = str(nodepool_restore_step(load_workflow())["run"])
+
+    result, _calls = _run_step_body(
+        body,
+        tmp_path / "az-broken",
+        env={"ORIGINAL_NODE_COUNT": "0"},
+        current_count="1",
+        az_exit=3,
+    )
+
+    assert result.returncode != 0, "a failed scale-down must fail the step"

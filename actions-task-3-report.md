@@ -165,3 +165,161 @@ the real orchestrator with fake `az`/CLI shims, completing both `evaluate` and
    and `tests/test_contracts.py` still carry their uncommitted Task 4 edits. The
    README prerequisite about a pre-synced Korvid checkout is now satisfied by the
    workflow itself and should be documented in Task 4.
+
+---
+
+# Task 3 Review Fix — Round 3 (executable pipeline)
+
+## Status: ✅ COMPLETE
+
+**Branch:** `feat/prompt-lab-mvp`
+
+The previous round closed every trust-boundary finding but left the pipeline
+**non-executable**: all three subcommand invocations were argv-incompatible with
+the installed CLI, no campaign or `KORVID_AKS_*` variable was supplied, and the
+design's `if: always()` cleanup step did not exist. All three findings are now
+closed, and — critically — the tests can no longer pass without them.
+
+## Finding 1 — orchestrator argv did not match the real CLI
+
+`aks-check`, `evaluate`, and `optimize` all passed `--korvid-source-root` and
+`--model` (which the parser never defines) and omitted `--campaign` (required on
+all three) and `--max-metric-calls` (required on `optimize`). Every invocation
+exited 2 before doing work, and because `aks-check` sat inside the retry loop the
+argparse failure was indistinguishable from "pool not ready yet": each round
+scaled a GPU node to 1 and spun for the full 15-minute deadline.
+
+**Fix** (`scripts/run-grounding-round.sh`):
+
+| subcommand | argv now emitted |
+|---|---|
+| `aks-check` | `--campaign`, `--artifact-root` |
+| `optimize` | `--candidate`, `--campaign`, `--artifact-root`, `--max-metric-calls`, `--seed`, `--reflection-model`, `--train-case-id`, `--validation-case-id` |
+| `evaluate` | `--candidate`, `--campaign`, `--artifact-root`, `--train-case-id`, `--validation-case-id`, repeated `--milestone-case-id` |
+
+`KORVID_SOURCE_ROOT` stays runtime policy read from the environment — it is never
+argv. The model comes from the campaign, not a flag.
+
+The preflight loop now distinguishes failure classes: **exit 1 is retryable**
+("not ready yet"); **any other non-zero exit aborts immediately** and propagates
+its status, because argparse usage errors and campaign/config failures both exit
+2 and can never resolve themselves.
+
+## Finding 2 — no campaign, and none of the variables the campaign resolves
+
+`examples/campaigns/aks-shared-runners.yaml` resolves `models`,
+`serving.namespace`, `serving.service`, and `serving.model` through
+`env:KORVID_AKS_{MODEL,NAMESPACE,SERVICE}`; `_resolve_env_string` raises when any
+is absent, so campaign loading failed even after the argv fix.
+
+**Fix** (`.github/workflows/grounding-round.yml`): six new dispatch inputs —
+`campaign`, `train_case_id`, `validation_case_id`, `milestone_case_ids`
+(comma-separated), `max_metric_calls` (number), `seed` (number) — all validated
+in step 1, **before** the Korvid app token or Azure OIDC login. The orchestrator
+step now also exports `KORVID_AKS_MODEL` from the allowlisted `model` input and
+`KORVID_AKS_NAMESPACE`/`KORVID_AKS_SERVICE` from protected Environment `vars`.
+
+Splitting is injection-safe: `IFS=',' read -r -a` splits on commas only — no
+`eval`, no whitespace word-splitting, no pathname expansion — and the *whole*
+list is matched against a closed vocabulary first, because `read -a` silently
+drops empty leading/trailing fields (`a,` and `,a` would otherwise slip through).
+Train/validation disjointness is enforced in the workflow *and* the script, and
+`KORVID_AKS_MODEL` must equal `GROUNDING_MODEL`, so the allowlist actually binds
+the model that gets served rather than only the one named in the report.
+
+## Finding 3 — no `if: always()` restore step, no timeouts
+
+On cancellation the runner SIGKILLs about ten seconds in, while
+`az aks nodepool scale` takes minutes — so the trap was guaranteed to die
+mid-flight and leak the GPU node. Job eviction and the 360-minute default timeout
+never ran the trap at all.
+
+**Fix:** `timeout-minutes: 180` on the job and `150` on the orchestrator step (so
+the step expires first and cleanup still runs); a new read-only step records the
+original count as `steps.modeleval.outputs.original-count` before the round; and
+a final `if: always()` step restores it idempotently — original `1` is left
+untouched without even querying, original `0` re-reads the current count and
+requests an exact scale to `0` only when it is not already there. The step is
+last, so summary, upload, and PR comment publish evidence first, and it carries
+no `continue-on-error`, so cleanup failure stays visible. The shell trap is
+retained as the fast path.
+
+## Why the tests could not catch this before — and now can
+
+The old fake `korvid-prompt-lab` shim accepted **any** argv, and the workflow
+contract test derived "required" from `${VAR:?}` guards in the shell script,
+which is strictly weaker than what the CLI and campaign loader need. Both holes
+are closed:
+
+- **Strict fake parser.** The shim now mirrors `build_parser()`: unknown options
+  and missing required options exit 2 with an argparse-shaped usage error.
+  `test_fake_parser_spec_matches_the_real_cli_parser` proves the shim's option
+  table against the real parser, so it cannot drift.
+- **Real-parser replay.** `test_round_script_argv_is_accepted_by_the_real_cli_parser`
+  runs the orchestrator, then feeds every recorded argv to the real
+  `build_parser().parse_args()`. `test_real_cli_parser_rejects_the_previous_orchestrator_argv`
+  pins the old argv as a usage error.
+- **Real campaign loader.** `test_campaign_loads_only_with_the_variables_the_workflow_exports`
+  calls the real `load_campaign()` with the values the workflow's expressions
+  resolve to, and asserts that deleting *any one* of them raises
+  "references missing environment variable".
+- **Executable cleanup logic.** The record and restore step bodies are extracted
+  from the workflow YAML and run against a fake `az`, covering leaked-node
+  restore, idempotent no-op, pre-existing capacity, never-recorded output, and
+  a failing `az` (which must fail the step).
+
+## Verification
+
+```
+tests/test_grounding_workflow.py                          40 passed
+tests/test_grounding_script.py                            37 passed
+Task 2 + Task 3 (workflow + script + rounds)              89 passed
+full suite (KORVID_SOURCE_ROOT set)                      433 passed
+ruff check .                                             All checks passed!
+mypy --python-version 3.12 src tests                     no issues (33 files)
+bash -n scripts/run-grounding-round.sh                   OK
+bash -n on all 7 workflow run: bodies                    OK
+node --check on the github-script body                   OK
+YAML parse                                               OK
+```
+
+Out-of-band evidence (not committed):
+
+- The **real** `korvid-prompt-lab` binary was run with the exact new argv:
+  `aks-check --campaign examples/campaigns/aks-shared-runners.yaml --artifact-root …`
+  now reaches the live AKS probe and exits **1**
+  (`aks-check failed: AKS Service must expose Ready endpoints`) — the retryable
+  signal. With `KORVID_AKS_MODEL` unset it exits **2**
+  (`campaign.models references missing environment variable KORVID_AKS_MODEL`) —
+  the immediate-abort signal. The old argv still exits 2 with
+  `the following arguments are required: --campaign`.
+- The validation step was executed against **26** input cases (accept baseline
+  plus absolute/traversal/non-YAML/injected campaign, whitespace, command
+  substitution, option-smuggling, glob and empty case ids, overlapping splits,
+  leading/trailing/double-comma milestone lists, zero/negative/float/injected
+  budgets, negative and alphabetic seeds, non-default branch, short SHA, tag ref,
+  injected `pr_number`); every case produced the expected accept/reject outcome
+  and no `pwned` marker was ever created.
+
+An empty `qwen3:1.7b/` directory left in the worktree root by the old broken
+argv was removed.
+
+## Concerns / follow-ups
+
+1. **`vars.KORVID_AKS_NAMESPACE` and `vars.KORVID_AKS_SERVICE` must be configured
+   on the `aks-grounding` Environment** before the first round. They are blank by
+   default, and the script aborts in seconds with a named variable rather than
+   failing deep inside campaign loading.
+2. **The shipped case-id defaults are campaign-specific.** They match
+   `examples/campaigns/aks-shared-runners.yaml`; dispatching a different campaign
+   requires overriding all three case-id inputs, and the CLI rejects case ids that
+   are not drawn from the campaign's evaluated cases.
+3. **`timeout-minutes: 150` on the orchestrator is a first estimate.** It has to
+   cover a 15-minute preflight plus optimization at the chosen metric-call budget;
+   raise both numbers together if a legitimate round is ever truncated.
+4. **A pre-existing node (`original-count: 1`) is never released**, by design, but
+   nothing in this workflow can distinguish "another round is using it" from "a
+   previous round leaked it". That remains an operator responsibility.
+5. **Task 4 scope untouched**: `README.md`,
+   `examples/campaigns/aks-shared-runners.yaml`, and `tests/test_contracts.py`
+   still carry their uncommitted Task 4 edits and are not part of this commit.

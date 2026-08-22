@@ -43,6 +43,36 @@ name: Grounding Round
         required: true
         type: string
         default: "examples/candidates/shipped-small.yaml"
+      campaign:
+        description: "Path to campaign YAML (relative to the Prompt Lab checkout)"
+        required: true
+        type: string
+        default: "examples/campaigns/aks-shared-runners.yaml"
+      train_case_id:
+        description: "Campaign case id forming the train split"
+        required: true
+        type: string
+        default: "aks-scale-deployment-up"
+      validation_case_id:
+        description: "Campaign case id forming the validation split (must differ from train)"
+        required: true
+        type: string
+        default: "aks-restart-denied"
+      milestone_case_ids:
+        description: "Comma-separated campaign case ids forming the milestone pack"
+        required: true
+        type: string
+        default: "aks-scale-deployment-up,aks-restart-denied"
+      max_metric_calls:
+        description: "GEPA metric-call budget for optimize-evaluate rounds"
+        required: true
+        type: number
+        default: 12
+      seed:
+        description: "GEPA search seed (non-negative integer)"
+        required: true
+        type: number
+        default: 0
       pr_number:
         description: "Pull request number for the sticky comment (leave blank to skip)"
         required: false
@@ -62,6 +92,10 @@ jobs:
     name: Grounding round
     runs-on: korvid-runners
     environment: aks-grounding
+    # Without this the job inherits the 360-minute default; behind a
+    # repository-wide `cancel-in-progress: false` group a hung round would hold a
+    # GPU node — and every later round — for six hours.
+    timeout-minutes: 180
 
     env:
       # One artifact root, derived once.  `artifacts/` is gitignored, so live
@@ -83,7 +117,13 @@ jobs:
           KORVID_REF: ${{ inputs.korvid_ref }}
           PR_NUMBER: ${{ inputs.pr_number }}
           CANDIDATE: ${{ inputs.candidate }}
+          CAMPAIGN: ${{ inputs.campaign }}
           ROUND_TYPE: ${{ inputs.round_type }}
+          TRAIN_CASE_ID: ${{ inputs.train_case_id }}
+          VALIDATION_CASE_ID: ${{ inputs.validation_case_id }}
+          MILESTONE_CASE_IDS: ${{ inputs.milestone_case_ids }}
+          MAX_METRIC_CALLS: ${{ inputs.max_metric_calls }}
+          SEED: ${{ inputs.seed }}
         run: |
           set -Eeuo pipefail
 
@@ -114,10 +154,51 @@ jobs:
             exit 1
           fi
 
+          if [[ ! "$CAMPAIGN" =~ ^[A-Za-z0-9._/-]+\.(yaml|yml)$ ]] \
+            || [[ "$CAMPAIGN" == /* ]] \
+            || [[ "$CAMPAIGN" == *".."* ]]; then
+            echo "::error::campaign must be a relative YAML path inside the Prompt Lab checkout"
+            exit 1
+          fi
+
           case "$ROUND_TYPE" in
             evaluate|optimize-evaluate) ;;
             *) echo "::error::unsupported round type"; exit 1 ;;
           esac
+
+          # Case ids reach the orchestrator as argv, so the vocabulary is closed:
+          # no whitespace, globs, option-looking values, or path traversal.  Each
+          # value is matched literally — never through eval or indirection.
+          case_id_pattern='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+          if [[ ! "$TRAIN_CASE_ID" =~ $case_id_pattern ]]; then
+            echo "::error::train_case_id must be a single case id matching $case_id_pattern"
+            exit 1
+          fi
+
+          if [[ ! "$VALIDATION_CASE_ID" =~ $case_id_pattern ]]; then
+            echo "::error::validation_case_id must be a single case id matching $case_id_pattern"
+            exit 1
+          fi
+
+          if [[ "$TRAIN_CASE_ID" == "$VALIDATION_CASE_ID" ]]; then
+            echo "::error::train and validation case ids must be disjoint"
+            exit 1
+          fi
+
+          if [[ ! "$MILESTONE_CASE_IDS" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(,[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]]; then
+            echo "::error::milestone_case_ids must be a comma-separated list of case ids"
+            exit 1
+          fi
+
+          if [[ ! "$MAX_METRIC_CALLS" =~ ^[1-9][0-9]{0,4}$ ]]; then
+            echo "::error::max_metric_calls must be a positive integer"
+            exit 1
+          fi
+
+          if [[ ! "$SEED" =~ ^[0-9]{1,9}$ ]]; then
+            echo "::error::seed must be a non-negative integer"
+            exit 1
+          fi
 
       # -----------------------------------------------------------------------
       # 2. Check out the approved Prompt Lab commit (read-only GITHUB_TOKEN)
@@ -218,20 +299,59 @@ jobs:
           fi
 
       # -----------------------------------------------------------------------
-      # 9. Run the grounding orchestrator
+      # 9. Record the original modeleval node count
+      #
+      # Captured as a step output *before* anything can scale the pool, so the
+      # always() cleanup step at the end restores the exact original count even
+      # when the runner is cancelled, evicted, or hits the job timeout — none of
+      # which give the orchestrator's shell trap time to finish `nodepool scale`.
+      # -----------------------------------------------------------------------
+      - name: Record original modeleval node count
+        id: modeleval
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          count="$(az aks nodepool show \
+            --resource-group rg-pension-guard \
+            --cluster-name aks-shared-runners \
+            --name modeleval \
+            --query count \
+            --output tsv)"
+          case "$count" in
+            0|1) ;;
+            *) echo "::error::unexpected modeleval node count: $count"; exit 1 ;;
+          esac
+          echo "original modeleval node count: $count"
+          printf 'original-count=%s\n' "$count" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # 10. Run the grounding orchestrator
       # -----------------------------------------------------------------------
       - name: Run grounding round
         working-directory: prompt-lab
         shell: bash
+        timeout-minutes: 150
         env:
           GROUNDING_MODEL: ${{ inputs.model }}
           GROUNDING_CANDIDATE: ${{ inputs.candidate }}
+          GROUNDING_CAMPAIGN: ${{ inputs.campaign }}
           GROUNDING_ROUND_TYPE: ${{ inputs.round_type }}
+          GROUNDING_TRAIN_CASE_ID: ${{ inputs.train_case_id }}
+          GROUNDING_VALIDATION_CASE_ID: ${{ inputs.validation_case_id }}
+          GROUNDING_MILESTONE_CASE_IDS: ${{ inputs.milestone_case_ids }}
+          GROUNDING_MAX_METRIC_CALLS: ${{ inputs.max_metric_calls }}
+          GROUNDING_SEED: ${{ inputs.seed }}
           # Reflection credentials exist only for optimize rounds; an
           # evaluate-only round never materialises them.
           GROUNDING_REFLECTION_MODEL: ${{ inputs.round_type == 'optimize-evaluate' && vars.GROUNDING_REFLECTION_MODEL || '' }}
           GROUNDING_REFLECTION_CREDENTIAL: ${{ inputs.round_type == 'optimize-evaluate' && secrets.GROUNDING_REFLECTION_CREDENTIAL || '' }}
           KORVID_SOURCE_ROOT: ${{ github.workspace }}/korvid
+          # The campaign resolves models/serving.namespace/serving.service/
+          # serving.model through `env:` references; without these three
+          # load_campaign() raises and every subcommand exits 2.
+          KORVID_AKS_MODEL: ${{ inputs.model }}
+          KORVID_AKS_NAMESPACE: ${{ vars.KORVID_AKS_NAMESPACE }}
+          KORVID_AKS_SERVICE: ${{ vars.KORVID_AKS_SERVICE }}
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/korvid-uv-env
           PROMPT_LAB_REVISION: ${{ inputs.prompt_lab_ref }}
           KORVID_REVISION: ${{ inputs.korvid_ref }}
@@ -239,7 +359,7 @@ jobs:
         run: bash scripts/run-grounding-round.sh
 
       # -----------------------------------------------------------------------
-      # 10. Append the safe round summary to the Job Summary
+      # 11. Append the safe round summary to the Job Summary
       # -----------------------------------------------------------------------
       - name: Append round summary to Job Summary
         if: always() && hashFiles('prompt-lab/artifacts/grounding-round/safe-evidence/round-summary.md') != ''
@@ -249,7 +369,7 @@ jobs:
           cat "$GROUNDING_SAFE_EVIDENCE_DIR/round-summary.md" >> "$GITHUB_STEP_SUMMARY"
 
       # -----------------------------------------------------------------------
-      # 11. Upload only the safe-evidence package (never raw live artifacts)
+      # 12. Upload only the safe-evidence package (never raw live artifacts)
       # -----------------------------------------------------------------------
       - name: Upload safe evidence
         if: always()
@@ -261,7 +381,7 @@ jobs:
           if-no-files-found: error
 
       # -----------------------------------------------------------------------
-      # 12. Sticky PR comment (optional, only when pr_number is provided)
+      # 13. Sticky PR comment (optional, only when pr_number is provided)
       # -----------------------------------------------------------------------
       - name: Update sticky PR comment
         if: always() && inputs.pr_number != ''
@@ -340,3 +460,51 @@ jobs:
                 body,
               });
             }
+
+      # -----------------------------------------------------------------------
+      # 14. Restore the recorded modeleval node count (design lifecycle step 12)
+      #
+      # The orchestrator's shell trap covers an orderly exit, but a cancelled or
+      # evicted runner SIGKILLs it about ten seconds in — far short of the
+      # minutes `nodepool scale` takes — so the pool would stay at one node.
+      # This step is idempotent: it only ever scales back to the recorded
+      # original count, never up, and leaves a pre-existing node untouched.  It
+      # runs last so summary, upload, and comment publish evidence first, and it
+      # carries no continue-on-error, so a failed cleanup stays visible.
+      # -----------------------------------------------------------------------
+      - name: Restore modeleval node count
+        if: always()
+        shell: bash
+        env:
+          ORIGINAL_NODE_COUNT: ${{ steps.modeleval.outputs.original-count }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "$ORIGINAL_NODE_COUNT" ]]; then
+            echo "modeleval count was never recorded (the round ended before Azure login); nothing to restore"
+            exit 0
+          fi
+
+          if [[ "$ORIGINAL_NODE_COUNT" != "0" ]]; then
+            echo "modeleval had $ORIGINAL_NODE_COUNT node(s) before this round; leaving it untouched"
+            exit 0
+          fi
+
+          current="$(az aks nodepool show \
+            --resource-group rg-pension-guard \
+            --cluster-name aks-shared-runners \
+            --name modeleval \
+            --query count \
+            --output tsv)"
+
+          if [[ "$current" == "0" ]]; then
+            echo "modeleval is already back at its original count of 0"
+            exit 0
+          fi
+
+          echo "restoring modeleval from $current to its original count of 0"
+          az aks nodepool scale \
+            --resource-group rg-pension-guard \
+            --cluster-name aks-shared-runners \
+            --name modeleval \
+            --node-count 0
