@@ -648,7 +648,7 @@ and fill in:
 | Input | Required | Default | Notes |
 | --- | --- | --- | --- |
 | `prompt_lab_ref` | yes | — | Exact 40-hex SHA of the Prompt Lab commit to evaluate; must be contained in the default branch, or be the head of the same-repository PR named by `pr_number` |
-| `korvid_ref` | yes | pinned SHA | Exact 40-hex SHA of the Korvid commit to use; must be an ancestor of (or equal to) the current default branch of `hellices/korvid` — unmerged, diverged, fork, and unknown SHAs are rejected |
+| `korvid_ref` | yes | `fc7eece2adb66a5b2a18d378bdfd7503ddbdd2ca` | Exact 40-hex SHA of the Korvid commit to use; must be proven authoritative `hellices/korvid` code — contained in its default branch, or in the head of one of its own **open** pull requests targeting that default branch. Fork heads, closed pull requests, and unknown SHAs are rejected |
 | `model` | yes | `qwen3:1.7b` | Ollama tag from the closed allowlist |
 | `round_type` | yes | `evaluate` | `evaluate` or `optimize-evaluate` |
 | `candidate` | yes | shipped-small | Relative path inside the Prompt Lab checkout |
@@ -686,21 +686,58 @@ requires write access); fork heads never are.
 
 ### Trust boundary for `korvid_ref`
 
-`korvid_ref` must be an exact 40-hex SHA **and** must be proven to be a commit
-already reachable from (merged into or equal to) the current default branch of
-the authoritative repository `hellices/korvid`. The check runs in the same
-pre-credential `actions/github-script` trust step, using only the job's own
-read-only `GITHUB_TOKEN` against the public Korvid repository — before the
-Korvid GitHub App token, Azure login, or any checkout.
+`korvid_ref` must be an exact 40-hex SHA **and** must be proven to be
+authoritative code in `hellices/korvid` before any credential exists. The check
+runs in the same pre-credential `actions/github-script` trust step, using only
+the job's own read-only `GITHUB_TOKEN` against the public Korvid repository —
+before the Korvid GitHub App token, Azure login, or any checkout.
 
-| `korvid_ref` | Accepted | Rejected |
+Provenance is proven by one of two routes, tried in order:
+
+| Route | Accepted when | Rejected when |
 | --- | --- | --- |
-| Any 40-hex SHA | The compare status against the Korvid default branch is `identical` (SHA equals the current tip) or `ahead` (the default branch is ahead — the SHA is an ancestor) | `behind` / `diverged` (unmerged branch or fork divergence), the Korvid API cannot resolve the SHA, or any API failure |
+| Default branch | `compare/<korvid_ref>...<default branch>` is `identical` (the SHA is the current tip) or `ahead` (the default branch is ahead — the SHA is an ancestor) | `behind` / `diverged`, or the compare cannot be resolved |
+| Open pull request | An **open** pull request of `hellices/korvid` whose **head repository is `hellices/korvid` itself** and whose **base is the default branch** has a head commit that contains `korvid_ref` (compare `identical` or `ahead`) | The vouching pull request is a fork PR, is closed, targets another base, or no open pull request contains the SHA |
 
-Supplying a SHA from an unmerged branch, a fork, or an arbitrary experiment
-commit fails the round before any code is checked out or any credential is used.
-The Korvid repo identity (`{owner}/korvid`) is derived from
-`github.repository_owner` — it is never user-controlled.
+If neither route proves the ref, the round fails before any code is checked out
+or any credential is used. Fork heads, closed pull requests, arbitrary
+experiment commits, and API failures are all refused — an unprovable ref fails
+closed. The Korvid repo identity (`{owner}/korvid`) is derived from
+`github.repository_owner`; it is never user-controlled.
+
+#### Why the pull-request route exists
+
+The pinned default
+`fc7eece2adb66a5b2a18d378bdfd7503ddbdd2ca` is deliberately *not* a default-branch
+commit. The operation-journey harness the bridge imports —
+`korvid.evals.operation`, `tests.evals.operation_app`,
+`tests.evals.operation_campaign` and `tests.evals.operation_scripts` — has never
+existed on `hellices/korvid` `main`; it is introduced by open pull request
+**#312** (`feat/307-small-operator-foundation` → `main`). Repinning to a `main`
+commit would clear a default-branch-only gate and then fail at run time with
+"korvid operation harness is not importable", *after* the Korvid app token, the
+Azure OIDC session, and the GPU node pool had already been spent.
+
+A same-repository branch already requires write access to `hellices/korvid`,
+which is the same trust argument this workflow already accepts for
+`prompt_lab_ref` pull request heads — so the pull-request route reuses that
+boundary rather than widening it to anonymous code.
+
+The pin is declared once, in
+[`src/korvid_prompt_lab/korvid_pin.py`](src/korvid_prompt_lab/korvid_pin.py): the
+approved SHA, a dated snapshot of its provenance, and the exact Korvid modules
+the bridge imports. Contract tests bind the workflow default, this README, and
+the bridge worker's own imports to that declaration, so none of them can drift
+apart again. To re-prove the pin against the live GitHub API:
+
+```bash
+scripts/verify-korvid-pin.sh
+```
+
+It re-runs the provenance compares and confirms every required Korvid source
+path still exists at the pinned commit. Run it after the Korvid pull request is
+merged, force pushed, or closed — and repin (updating `korvid_pin.py`) once the
+harness lands on `main`.
 
 ### Result locations
 

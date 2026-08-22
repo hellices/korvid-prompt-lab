@@ -83,6 +83,12 @@ def _on_triggers(workflow: dict[str, Any]) -> dict[str, Any]:
     return workflow["on"]
 
 
+def workflow_inputs(workflow: dict[str, Any]) -> dict[str, Any]:
+    """The ``workflow_dispatch`` inputs, including their shipped defaults."""
+    inputs: dict[str, Any] = _on_triggers(workflow)["workflow_dispatch"]["inputs"]
+    return inputs
+
+
 def grounding_job(workflow: dict[str, Any]) -> dict[str, Any]:
     return workflow["jobs"]["grounding"]
 
@@ -446,9 +452,14 @@ def run_trust_script(
     # existing prompt_lab tests remain green
     korvid_ref: str = KORVID_SHA,
     korvid_repo: str = KORVID_REPO_FULL,
+    korvid_default_branch: str = "main",
     korvid_compare: dict[str, Any] | None = None,
     korvid_compare_error: str | None = None,
     korvid_repo_error: str | None = None,
+    korvid_pulls: list[dict[str, Any]] | None = None,
+    korvid_pulls_error: str | None = None,
+    korvid_pull_compare: dict[str, Any] | None = None,
+    korvid_pull_compare_error: str | None = None,
 ) -> dict[str, Any]:
     """Execute the workflow's own trust script against a scripted GitHub API.
 
@@ -456,12 +467,26 @@ def run_trust_script(
     - ``repo == 'korvid'``  →  korvid fixture branch (korvidCompare / korvidCompareError)
     - any other repo         →  prompt-lab fixture branch (compare / compareError)
 
+    Korvid compares are routed a second time by their *head*: a compare whose head
+    is the Korvid default branch answers from ``korvidCompare``, and a compare
+    whose head is anything else — i.e. a pull request head SHA — answers from
+    ``korvidPullCompare``.  That separation is what lets a test state "this ref is
+    diverged from main but contained in an open pull request head", which is
+    exactly the shipped default's real situation.
+
     ``repos.get`` is always routed to the korvid fixture
-    (korvidRepoData / korvidRepoError); the default returns ``{ default_branch: 'main' }``
-    so the korvid ancestor check does not fail the existing prompt-lab-only tests.
+    (korvidDefaultBranch / korvidRepoError); the default returns
+    ``{ default_branch: 'main' }`` so the korvid ancestor check does not fail the
+    existing prompt-lab-only tests.  ``pulls.list`` defaults to an empty list so a
+    ref that is not contained in the default branch stays rejected unless a test
+    supplies a vouching pull request.
     """
     if korvid_compare is None:
         korvid_compare = {"status": "ahead"}
+    if korvid_pulls is None:
+        korvid_pulls = []
+    if korvid_pull_compare is None:
+        korvid_pull_compare = {"status": "diverged"}
     script = str(trust_verification_step(load_workflow())["with"]["script"])
     tmp_path.mkdir(parents=True, exist_ok=True)
 
@@ -480,6 +505,11 @@ def run_trust_script(
                 "korvidCompare": korvid_compare,
                 "korvidCompareError": korvid_compare_error,
                 "korvidRepoError": korvid_repo_error,
+                "korvidDefaultBranch": korvid_default_branch,
+                "korvidPulls": korvid_pulls,
+                "korvidPullsError": korvid_pulls_error,
+                "korvidPullCompare": korvid_pull_compare,
+                "korvidPullCompareError": korvid_pull_compare_error,
             }
         ),
         encoding="utf-8",
@@ -503,7 +533,14 @@ def run_trust_script(
         "const compare = (name) => async (params) => {\n"
         "  calls.push({ name, params });\n"
         "  const isKorvid = params && params.repo === 'korvid';\n"
+        "  const basehead = (params && params.basehead)\n"
+        "    || (((params && params.base) || '') + '...' + ((params && params.head) || ''));\n"
+        "  const head = String(basehead).split('...')[1] || '';\n"
         "  if (isKorvid) {\n"
+        "    if (head && head !== fixture.korvidDefaultBranch) {\n"
+        "      if (fixture.korvidPullCompareError) { throw new Error(fixture.korvidPullCompareError); }\n"
+        "      return { data: fixture.korvidPullCompare };\n"
+        "    }\n"
         "    if (fixture.korvidCompareError) { throw new Error(fixture.korvidCompareError); }\n"
         "    return { data: fixture.korvidCompare };\n"
         "  }\n"
@@ -517,14 +554,21 @@ def run_trust_script(
         "repos.get = async (params) => {\n"
         "  calls.push({ name: 'repos.get', params });\n"
         "  if (fixture.korvidRepoError) { throw new Error(fixture.korvidRepoError); }\n"
-        "  return { data: { default_branch: 'main' } };\n"
+        "  return { data: { default_branch: fixture.korvidDefaultBranch } };\n"
         "};\n"
         "const github = { rest: {\n"
-        "  pulls: { get: async (params) => {\n"
-        "    calls.push({ name: 'pulls.get', params });\n"
-        "    if (fixture.pullError) { throw new Error(fixture.pullError); }\n"
-        "    return { data: fixture.pull };\n"
-        "  } },\n"
+        "  pulls: {\n"
+        "    get: async (params) => {\n"
+        "      calls.push({ name: 'pulls.get', params });\n"
+        "      if (fixture.pullError) { throw new Error(fixture.pullError); }\n"
+        "      return { data: fixture.pull };\n"
+        "    },\n"
+        "    list: async (params) => {\n"
+        "      calls.push({ name: 'pulls.list', params });\n"
+        "      if (fixture.korvidPullsError) { throw new Error(fixture.korvidPullsError); }\n"
+        "      return { data: fixture.korvidPulls };\n"
+        "    },\n"
+        "  },\n"
         "  repos,\n"
         "} };\n"
         "const step = async function (github, context, core, require) {\n"
@@ -1702,7 +1746,13 @@ def test_trust_script_korvid_accepts_default_branch_ancestor(
 def test_trust_script_korvid_rejects_unmerged_ref(
     tmp_path: Path, status: str
 ) -> None:
-    """A korvid_ref that has diverged from or is not contained in the default branch is rejected."""
+    """A korvid_ref no authoritative branch contains is rejected.
+
+    ``korvid_pulls`` defaults to empty here, so the pull-request provenance route
+    finds nothing to vouch for the ref: neither acceptance route succeeds and the
+    ref must be refused.  ``tests/test_korvid_pin.py`` covers the case where an
+    open same-repository pull request *does* contain it.
+    """
     outcome = run_trust_script(
         tmp_path / f"korvid-unmerged-{status}",
         compare={"status": "ahead"},  # prompt_lab passes; korvid should fail
@@ -1710,8 +1760,8 @@ def test_trust_script_korvid_rejects_unmerged_ref(
     )
 
     assert outcome["failures"], (
-        "a korvid_ref that is not contained in the default branch must be rejected; "
-        "only commits already merged/reachable from the Korvid default branch are accepted"
+        "a korvid_ref that neither the default branch nor an open same-repository "
+        "pull request head contains must be rejected"
     )
     failure_text = " ".join(outcome["failures"]).lower()
     assert "korvid" in failure_text or "default branch" in failure_text, (
@@ -1720,7 +1770,12 @@ def test_trust_script_korvid_rejects_unmerged_ref(
 
 
 def test_trust_script_korvid_rejects_api_failure(tmp_path: Path) -> None:
-    """An API failure when verifying korvid_ref must fail the trust check, not silently pass."""
+    """An API failure when verifying korvid_ref must fail the trust check, not silently pass.
+
+    An unresolvable compare falls through to the pull-request route rather than
+    failing immediately, so this asserts the *end* state: with no pull request able
+    to vouch for the ref either, provenance is unproven and the round closes.
+    """
     outcome = run_trust_script(
         tmp_path / "korvid-api-failure",
         compare={"status": "ahead"},  # prompt_lab passes; korvid compare should fail

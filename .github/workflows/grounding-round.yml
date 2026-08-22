@@ -8,6 +8,10 @@ name: Grounding Round
 # proven to be repository code before anything is checked out: either the head
 # commit of a same-repository pull request named by `pr_number`, or a commit the
 # trusted default branch contains.  Fork pull request heads are refused.
+# `korvid_ref` is proven the same way against the authoritative Korvid
+# repository: it must be contained in that repository's default branch, or in
+# the head of one of its own OPEN pull requests targeting that default branch.
+# Fork heads are refused there too.
 # Dispatch inputs are validated and the ref's provenance is established before
 # any credential is used, and no input is ever interpolated into shell or
 # JavaScript source text: values reach scripts only through `env:` and are read
@@ -21,9 +25,15 @@ name: Grounding Round
         required: true
         type: string
       korvid_ref:
-        description: "Korvid commit SHA to check out (exact 40-hex commit SHA)"
+        description: "Korvid commit SHA to check out (exact 40-hex commit SHA, proven authoritative before any credential)"
         required: true
         type: string
+        # The operation-journey harness the bridge imports is not on the Korvid
+        # default branch yet, so this pin is a commit of the open pull request
+        # that introduces it.  `src/korvid_prompt_lab/korvid_pin.py` is the
+        # reviewed declaration of this SHA, its provenance, and the bridge
+        # dependencies it must contain; `scripts/verify-korvid-pin.sh` re-proves
+        # both against the live GitHub API.
         default: "fc7eece2adb66a5b2a18d378bdfd7503ddbdd2ca"
       model:
         description: "Ollama model tag to evaluate"
@@ -380,24 +390,95 @@ jobs:
                   });
               korvidComparison = resp.data;
             } catch (error) {
-              core.setFailed(
-                'korvid_ref is not a commit reachable from the default branch of ' + korvidRepo +
-                '; supply a SHA that is already merged/reachable from the Korvid default branch'
-              );
-              return;
+              korvidComparison = null;
             }
 
             const korvidStatus = (korvidComparison && korvidComparison.status) || '';
-            if (korvidStatus !== 'identical' && korvidStatus !== 'ahead') {
-              core.setFailed(
-                'korvid_ref is neither the tip of ' + korvidDefaultBranch + ' in ' + korvidRepo +
-                ' nor an ancestor of it (compare status: ' + (korvidStatus || 'unknown') +
-                '); only commits already merged/reachable from the Korvid default branch are accepted'
-              );
-              return;
-            }
+            if (korvidStatus === 'identical' || korvidStatus === 'ahead') {
+              core.info('korvid_ref is contained in ' + korvidDefaultBranch + ' of ' + korvidRepo);
+            } else {
+              // The operation-journey harness Prompt Lab grounds against is not on the
+              // Korvid default branch yet, so default-branch containment alone would
+              // reject every runnable Korvid revision.  A commit still under review in
+              // the *authoritative* repository is therefore also accepted — but only
+              // when an OPEN pull request whose head repository is that same
+              // authoritative repository, and whose base is its default branch,
+              // contains it.  A same-repository branch already requires write access;
+              // fork heads, closed pull requests, and commits no such branch contains
+              // stay refused, and an unprovable ref still fails closed below.
+              let korvidPulls = [];
+              try {
+                const pullsResp = await github.rest.pulls.list({
+                  owner: korvidOwner,
+                  repo: korvidRepoName,
+                  state: 'open',
+                  base: korvidDefaultBranch,
+                  per_page: 100,
+                });
+                korvidPulls = (pullsResp && pullsResp.data) || [];
+              } catch (error) {
+                korvidPulls = [];
+              }
 
-            core.info('korvid_ref is contained in ' + korvidDefaultBranch + ' of ' + korvidRepo);
+              let vouchingPull = 0;
+              for (const pull of korvidPulls) {
+                const pullHead = (pull && pull.head) || {};
+                const pullBase = (pull && pull.base) || {};
+                const pullHeadRepository = (pullHead.repo && pullHead.repo.full_name) || '';
+                if (pullHeadRepository.toLowerCase() !== korvidRepo.toLowerCase()) {
+                  continue;
+                }
+                if (pullBase.ref !== korvidDefaultBranch) {
+                  continue;
+                }
+                const pullHeadSha = String(pullHead.sha || '');
+                if (!/^[0-9a-f]{40}$/.test(pullHeadSha)) {
+                  continue;
+                }
+
+                let pullComparison;
+                try {
+                  const resp = github.rest.repos.compareCommitsWithBasehead
+                    ? await github.rest.repos.compareCommitsWithBasehead({
+                        owner: korvidOwner,
+                        repo: korvidRepoName,
+                        basehead: korvidRef + '...' + pullHeadSha,
+                      })
+                    : await github.rest.repos.compareCommits({
+                        owner: korvidOwner,
+                        repo: korvidRepoName,
+                        base: korvidRef,
+                        head: pullHeadSha,
+                      });
+                  pullComparison = resp.data;
+                } catch (error) {
+                  continue;
+                }
+
+                const pullStatus = (pullComparison && pullComparison.status) || '';
+                if (pullStatus === 'identical' || pullStatus === 'ahead') {
+                  vouchingPull = pull.number;
+                  break;
+                }
+              }
+
+              if (!vouchingPull) {
+                core.setFailed(
+                  'korvid_ref is neither contained in ' + korvidDefaultBranch + ' of ' +
+                  korvidRepo + ' (compare status: ' + (korvidStatus || 'unknown') +
+                  ') nor contained in the head of an open ' + korvidRepo +
+                  ' pull request targeting ' + korvidDefaultBranch +
+                  '; fork pull requests, closed pull requests, unknown commits, and API' +
+                  ' failures are all refused'
+                );
+                return;
+              }
+
+              core.info(
+                'korvid_ref is contained in open same-repository pull request ' +
+                vouchingPull + ' of ' + korvidRepo + ' targeting ' + korvidDefaultBranch
+              );
+            }
 
       # -----------------------------------------------------------------------
       # 3. Check out the approved Prompt Lab commit (read-only GITHUB_TOKEN)
