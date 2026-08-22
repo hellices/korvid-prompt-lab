@@ -29,6 +29,8 @@ from korvid_prompt_lab.aks import (
 )
 from korvid_prompt_lab.contracts import AKSPortForwardServing
 
+_KUBELOGIN_ARGS_PREFIX = ("kubelogin", "convert-kubeconfig", "--login", "azurecli", "--kubeconfig")
+
 
 @dataclass(slots=True)
 class FakeCompletedCommand:
@@ -175,6 +177,8 @@ def _successful_results(
             stdout=json.dumps({"name": cluster_name, "resourceGroup": resource_group}),
         ),
         FakeCompletedCommand(stdout="merged"),
+        # kubelogin convert-kubeconfig --login azurecli
+        FakeCompletedCommand(stdout=""),
         FakeCompletedCommand(
             stdout=json.dumps(
                 {
@@ -393,7 +397,7 @@ def test_aks_port_forward_binds_loopback_uses_unique_kubeconfigs_and_cleans_only
     ) as second_forward:
         assert second_forward.base_url == "http://127.0.0.1:41002"
 
-    second_kubeconfig = Path(commands.calls[5][commands.calls[5].index("--file") + 1])
+    second_kubeconfig = Path(commands.calls[6][commands.calls[6].index("--file") + 1])
     assert first_kubeconfig != second_kubeconfig
     assert not second_kubeconfig.exists()
     assert second_process.terminate_calls == 1
@@ -650,3 +654,118 @@ def test_subprocess_port_forward_surfaces_reader_failures_instead_of_empty_outpu
         forward.close()
 
     assert not _reader_threads_alive()
+
+
+# ---------------------------------------------------------------------------
+# RED tests: kubelogin non-interactive conversion
+# ---------------------------------------------------------------------------
+
+
+def test_kubelogin_convert_called_with_exact_args_after_get_credentials(tmp_path: Path) -> None:
+    """kubelogin convert-kubeconfig must be called immediately after az aks get-credentials,
+    using --login azurecli and the exact same kubeconfig path, before any kubectl call."""
+    commands = FakeCommandRunner(_successful_results())
+    process = FakeProcess(lines=("Forwarding from 127.0.0.1:41001 -> 8080\n",))
+    launcher = FakeProcessLauncher([process])
+    http_get = FakeHttpGet([{"data": [{"id": "qwen3-4b"}]}])
+
+    with AKSPortForward(
+        _serving(),
+        workspace_dir=tmp_path,
+        command_runner=commands,
+        process_launcher=launcher,
+        http_get_json=http_get,
+        cleanup_wait_timeout_seconds=0.5,
+    ):
+        pass
+
+    # call[0] = az aks show, call[1] = az aks get-credentials, call[2] = kubelogin
+    assert len(commands.calls) == 5, f"expected 5 calls, got {len(commands.calls)}: {commands.calls}"
+    get_credentials_call = commands.calls[1]
+    kubelogin_call = commands.calls[2]
+
+    # get-credentials must carry --file pointing to the kubeconfig
+    assert "--file" in get_credentials_call
+    kubeconfig_path = get_credentials_call[get_credentials_call.index("--file") + 1]
+
+    # kubelogin call must be exactly the expected argument list
+    assert kubelogin_call == (
+        "kubelogin",
+        "convert-kubeconfig",
+        "--login",
+        "azurecli",
+        "--kubeconfig",
+        kubeconfig_path,
+    ), f"unexpected kubelogin call: {kubelogin_call}"
+
+    # kubectl service lookup must come after kubelogin (index 3)
+    assert commands.calls[3][0] == "kubectl"
+    assert "service" in commands.calls[3]
+
+
+def test_kubelogin_conversion_failure_cleans_kubeconfig_and_raises(tmp_path: Path) -> None:
+    """If kubelogin exits non-zero, AKSPortForwardError must be raised,
+    the temp kubeconfig must be deleted, and no kubectl calls must follow."""
+    az_show = FakeCompletedCommand(
+        stdout=json.dumps({"name": "cluster-one", "resourceGroup": "rg-team-a"})
+    )
+    get_credentials = FakeCompletedCommand(stdout="merged")
+    kubelogin_fail = FakeCompletedCommand(returncode=1, stderr="kubelogin: command not found")
+    commands = FakeCommandRunner([az_show, get_credentials, kubelogin_fail])
+
+    with pytest.raises(AKSPortForwardError, match="kubelogin conversion failed"), AKSPortForward(
+        _serving(),
+        workspace_dir=tmp_path,
+        command_runner=commands,
+    ):
+        pytest.fail("context should not open")
+
+    # No kubectl calls must have been made
+    kubectl_calls = [c for c in commands.calls if c[0] == "kubectl"]
+    assert kubectl_calls == [], f"kubectl must not run after kubelogin failure: {kubectl_calls}"
+
+    # The kubeconfig temp file must be cleaned up
+    kubeconfig_path = Path(commands.calls[1][commands.calls[1].index("--file") + 1])
+    assert not kubeconfig_path.exists(), "temp kubeconfig must be deleted after kubelogin failure"
+
+
+def test_service_lookup_cannot_run_before_kubelogin_conversion(tmp_path: Path) -> None:
+    """Ordering contract: if kubelogin is missing (FileNotFoundError), the service lookup
+    must never be attempted and the error must be AKSPortForwardError."""
+    az_show = FakeCompletedCommand(
+        stdout=json.dumps({"name": "cluster-one", "resourceGroup": "rg-team-a"})
+    )
+    get_credentials = FakeCompletedCommand(stdout="merged")
+
+    service_sentinel = FakeCompletedCommand(
+        stdout=json.dumps(
+            {
+                "metadata": {"name": "korvid-api", "namespace": "korvid"},
+                "spec": {"ports": [{"port": 8080, "protocol": "TCP"}]},
+            }
+        )
+    )
+
+    calls: list[tuple[str, ...]] = []
+
+    def raising_on_kubelogin(args: tuple[str, ...]) -> _CommandResult:
+        calls.append(args)
+        if args[0] == "kubelogin":
+            raise FileNotFoundError("kubelogin not found")
+        if args[0] == "kubectl" and "service" in args:
+            return service_sentinel
+        if args[0] == "az" and "show" in args:
+            return az_show
+        return get_credentials
+
+    with pytest.raises((AKSPortForwardError, FileNotFoundError)), AKSPortForward(
+        _serving(),
+        workspace_dir=tmp_path,
+        command_runner=cast(_CommandRunner, raising_on_kubelogin),
+    ):
+        pytest.fail("context should not open")
+
+    service_calls = [c for c in calls if c[0] == "kubectl" and "service" in c]
+    assert service_calls == [], (
+        f"kubectl service lookup ran before kubelogin conversion completed: {service_calls}"
+    )

@@ -222,6 +222,7 @@ class AKSPortForward:
         try:
             self._validate_cluster()
             self._write_kubeconfig()
+            self._convert_kubeconfig()
             service_port = self._validate_service()
             self._validate_endpoints()
             self._start_port_forward(service_port)
@@ -281,6 +282,26 @@ class AKSPortForward:
         )
         if result.returncode != 0:
             raise AKSPortForwardError("AKS kubeconfig acquisition failed")
+
+    def _convert_kubeconfig(self) -> None:
+        assert self._kubeconfig_path is not None
+        try:
+            result = self.command_runner(
+                (
+                    "kubelogin",
+                    "convert-kubeconfig",
+                    "--login",
+                    "azurecli",
+                    "--kubeconfig",
+                    str(self._kubeconfig_path),
+                )
+            )
+        except FileNotFoundError as exc:
+            self._kubeconfig_path.unlink(missing_ok=True)
+            raise AKSPortForwardError("kubelogin conversion failed: kubelogin not found") from exc
+        if result.returncode != 0:
+            self._kubeconfig_path.unlink(missing_ok=True)
+            raise AKSPortForwardError("kubelogin conversion failed")
 
     def _validate_service(self) -> int:
         payload = self._kubectl_get("service", self.serving.service, "AKS Service lookup failed")
