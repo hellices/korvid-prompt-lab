@@ -174,6 +174,8 @@ def test_load_campaign_from_example_yaml(monkeypatch: pytest.MonkeyPatch) -> Non
         "{request}",
         "--response",
         "{response}",
+        "--turn-timeout",
+        "300",
     )
 
 

@@ -323,3 +323,44 @@ argv was removed.
 5. **Task 4 scope untouched**: `README.md`,
    `examples/campaigns/aks-shared-runners.yaml`, and `tests/test_contracts.py`
    still carry their uncommitted Task 4 edits and are not part of this commit.
+
+---
+
+## Task 3 — Preflight Classification Gap (commit 89e33da)
+
+### Changes
+
+| Layer | File | Summary |
+|-------|------|---------|
+| Domain | `src/korvid_prompt_lab/aks.py` | Added `AKSPreflightTransientError` (retryable) and `AKSMissingToolError` (permanent). Endpoints not-ready/empty, port-forward early-exit, model probe HTTP, model not-advertised → transient. Cluster identity, credentials, kubelogin, service lookup, malformed payload → permanent. |
+| CLI | `src/korvid_prompt_lab/cli.py` | `aks-check` returns 75 for transient, 1 for permanent/missing-tool, 2 for config. |
+| Script | `scripts/run-grounding-round.sh` | Retry loop keys on exit 75 only; 1/2 abort immediately. Prerequisite tool check before node-count read. |
+| Workflow | `.github/workflows/grounding-round.yml` | New "Verify required CLI tools" step before node-count record. |
+
+### Exit Code Taxonomy
+
+| Code | Meaning | Retried? |
+|------|---------|----------|
+| 0 | Success | N/A |
+| 75 (EX_TEMPFAIL) | Transient readiness condition | Yes (until deadline) |
+| 1 | Permanent preflight failure | No |
+| 2 | Usage / configuration error | No |
+
+### Tests Added (all GREEN)
+
+- `test_aks.py`: 12 new tests — transient vs permanent for each failure mode, missing tool errors
+- `test_cli.py`: 3 new tests — exit 75 transient, exit 1 permanent, exit 1 missing tool (no traceback)
+- `test_grounding_script.py`: 3 new tests — missing tools before scale, permanent exit 1 no-retry, transient exit 75 retry
+- `test_grounding_workflow.py`: 1 new test — tool verification step precedes node-count
+
+### Verification
+
+- 445 tests passed, 6 skipped
+- ruff check: clean
+- mypy: clean
+- YAML: valid
+
+### Concerns
+
+- `shellcheck` not available on this machine — script not lint-checked
+- Existing tests that relied on exit 1 being retryable were updated to use exit 75

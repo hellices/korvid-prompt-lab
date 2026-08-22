@@ -167,6 +167,17 @@ if [[ "$GROUNDING_ROUND_TYPE" == "optimize-evaluate" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Prerequisite: verify required tools are available before scaling
+# ---------------------------------------------------------------------------
+
+for _required_tool in az kubectl kubelogin uv; do
+  if ! command -v "$_required_tool" >/dev/null 2>&1; then
+    echo "required tool not found: $_required_tool" >&2
+    exit 1
+  fi
+done
+
+# ---------------------------------------------------------------------------
 # Node-count snapshot and conditional cleanup trap
 # ---------------------------------------------------------------------------
 
@@ -251,10 +262,9 @@ fi
 # ---------------------------------------------------------------------------
 # Preflight: AKS readiness check (bounded 15-minute deadline)
 #
-# exit 1 means "not ready yet" and is retried until the deadline.  Any other
-# non-zero exit — argparse usage errors and campaign/config failures both exit 2
-# — is systemic: retrying it would burn the full deadline on a GPU node for a
-# failure that can never resolve itself.
+# exit 75 (EX_TEMPFAIL) means "not ready yet" and is retried until the deadline.
+# exit 1 is a permanent preflight failure (cluster identity, credentials, missing
+# tools) and exit 2 is usage/configuration — neither is retried.
 # ---------------------------------------------------------------------------
 
 _aks_check_artifact_root="${GROUNDING_ARTIFACT_ROOT}/aks-check"
@@ -273,8 +283,8 @@ while true; do
   if (( _preflight_exit == 0 )); then
     break
   fi
-  if (( _preflight_exit != 1 )); then
-    echo "aks-check failed with exit $_preflight_exit (usage or configuration); not retrying" >&2
+  if (( _preflight_exit != 75 )); then
+    echo "aks-check failed with exit $_preflight_exit (permanent or configuration); not retrying" >&2
     exit "$_preflight_exit"
   fi
   if (( $(date +%s) >= _preflight_deadline )); then

@@ -45,7 +45,10 @@ WORKSPACE_EXPR = "${{ github.workspace }}"
 #: against the upstream repositories; a fabricated near-miss SHA fails here.
 KNOWN_ACTION_PINS: dict[str, tuple[str, str]] = {
     "actions/checkout": ("11bd71901bbe5b1630ceea73d27597364c9af683", "v4.2.2"),
-    "actions/create-github-app-token": ("df432ceedc7162793a195dd1713ff69aefc7379e", "v2.0.6"),
+    "actions/create-github-app-token": (
+        "df432ceedc7162793a195dd1713ff69aefc7379e",
+        "v2.0.6",
+    ),
     "azure/login": ("a65d910e8af852a8061c627c456678983e180302", "v2.2.0"),
     "actions/setup-python": ("a26af69be951a213d495a4c3e4e4022e16d87065", "v5.6.0"),
     "astral-sh/setup-uv": ("e92bafb6253dcd438e0484186d7669ea7a8ca1cc", "v6.4.3"),
@@ -90,7 +93,9 @@ def steps(workflow: dict[str, Any]) -> list[dict[str, Any]]:
     return list(grounding_job(workflow).get("steps", []))
 
 
-def step_index(workflow: dict[str, Any], predicate_substring: str, *, key: str = "uses") -> int:
+def step_index(
+    workflow: dict[str, Any], predicate_substring: str, *, key: str = "uses"
+) -> int:
     for index, step in enumerate(steps(workflow)):
         if predicate_substring in str(step.get(key, "")):
             return index
@@ -450,8 +455,14 @@ def test_grounding_workflow_defines_one_artifact_root_and_safe_evidence_path() -
     env = job_env(workflow)
 
     assert env["GROUNDING_ARTIFACT_ROOT"] == f"{WORKSPACE_EXPR}/{ARTIFACT_ROOT_RELPATH}"
-    assert env["GROUNDING_SAFE_EVIDENCE_DIR"] == f"{WORKSPACE_EXPR}/{SAFE_EVIDENCE_RELPATH}"
-    assert env["GROUNDING_SAFE_EVIDENCE_DIR"] == f"{env['GROUNDING_ARTIFACT_ROOT']}/safe-evidence", (
+    assert (
+        env["GROUNDING_SAFE_EVIDENCE_DIR"]
+        == f"{WORKSPACE_EXPR}/{SAFE_EVIDENCE_RELPATH}"
+    )
+    assert (
+        env["GROUNDING_SAFE_EVIDENCE_DIR"]
+        == f"{env['GROUNDING_ARTIFACT_ROOT']}/safe-evidence"
+    ), (
         "the safe-evidence directory must be derived from the single artifact root "
         "the orchestrator actually writes to"
     )
@@ -471,14 +482,24 @@ def test_grounding_workflow_uploads_exactly_the_safe_evidence_directory() -> Non
     assert with_block["retention-days"] == 30
     assert str(upload["if"]).strip() == "always()"
 
-    for forbidden in ("artifacts/live", "runs/", "audit", "request.json", ".kubeconfig"):
+    for forbidden in (
+        "artifacts/live",
+        "runs/",
+        "audit",
+        "request.json",
+        ".kubeconfig",
+    ):
         assert forbidden not in with_block["path"]
 
 
 def test_grounding_workflow_step_summary_uses_the_same_safe_path() -> None:
     workflow = load_workflow()
-    summary_steps = [s for s in steps(workflow) if "GITHUB_STEP_SUMMARY" in str(s.get("run", ""))]
-    assert len(summary_steps) == 1, "workflow must append the round summary exactly once"
+    summary_steps = [
+        s for s in steps(workflow) if "GITHUB_STEP_SUMMARY" in str(s.get("run", ""))
+    ]
+    assert len(summary_steps) == 1, (
+        "workflow must append the round summary exactly once"
+    )
     summary_step = summary_steps[0]
 
     condition = str(summary_step["if"])
@@ -500,9 +521,9 @@ def test_grounding_workflow_pr_comment_reads_the_same_safe_path() -> None:
     env = effective_env(workflow, comment_step)
     summary_path = env["GROUNDING_SUMMARY_PATH"]
 
-    assert summary_path == f"{WORKSPACE_EXPR}/{SAFE_EVIDENCE_RELPATH}/round-summary.md", (
-        "the PR comment must read the same file the orchestrator writes"
-    )
+    assert (
+        summary_path == f"{WORKSPACE_EXPR}/{SAFE_EVIDENCE_RELPATH}/round-summary.md"
+    ), "the PR comment must read the same file the orchestrator writes"
     assert "process.env.GROUNDING_SUMMARY_PATH" in str(comment_step["with"]["script"])
 
 
@@ -518,9 +539,7 @@ def test_grounding_workflow_supplies_every_required_orchestrator_variable() -> N
 
     assert required, "orchestrator script must guard its inputs with ${VAR:?...}"
     missing = sorted(required - provided)
-    assert not missing, (
-        f"run-grounding-round.sh aborts under set -u without: {missing}"
-    )
+    assert not missing, f"run-grounding-round.sh aborts under set -u without: {missing}"
 
 
 def test_grounding_workflow_never_suppresses_failures() -> None:
@@ -587,7 +606,8 @@ def test_grounding_workflow_installs_prompt_lab_on_path() -> None:
     install = [
         s
         for s in steps(workflow)
-        if s.get("working-directory") == "prompt-lab" and "GITHUB_PATH" in str(s.get("run", ""))
+        if s.get("working-directory") == "prompt-lab"
+        and "GITHUB_PATH" in str(s.get("run", ""))
     ]
     assert install, (
         "the orchestrator calls korvid-prompt-lab/korvid-grounding-report directly, so "
@@ -639,12 +659,13 @@ def test_grounding_workflow_declares_campaign_case_and_budget_inputs() -> None:
     assert inputs["max_metric_calls"]["type"] == "number"
     assert inputs["seed"]["type"] == "number"
 
-    assert inputs["train_case_id"]["default"] != inputs["validation_case_id"]["default"], (
-        "the shipped defaults must keep the train and validation splits disjoint"
-    )
-    assert "," in inputs["milestone_case_ids"]["description"].lower() or "comma" in str(
-        inputs["milestone_case_ids"]["description"]
-    ).lower(), "milestone_case_ids must document that it is a comma-separated list"
+    assert (
+        inputs["train_case_id"]["default"] != inputs["validation_case_id"]["default"]
+    ), "the shipped defaults must keep the train and validation splits disjoint"
+    assert (
+        "," in inputs["milestone_case_ids"]["description"].lower()
+        or "comma" in str(inputs["milestone_case_ids"]["description"]).lower()
+    ), "milestone_case_ids must document that it is a comma-separated list"
 
 
 def test_grounding_workflow_validates_campaign_case_and_budget_inputs_first() -> None:
@@ -665,7 +686,9 @@ def test_grounding_workflow_validates_campaign_case_and_budget_inputs_first() ->
         assert validation_env.get(name) == expression, (
             f"{name} must reach the validation step through env:, not interpolation"
         )
-        assert f'"${name}"' in body, f"{name} must actually be validated, not merely bound"
+        assert f'"${name}"' in body, (
+            f"{name} must actually be validated, not merely bound"
+        )
 
     login_index = step_index(workflow, "azure/login")
     assert steps(workflow).index(validation_step) < login_index
@@ -676,7 +699,9 @@ def test_grounding_workflow_validates_campaign_case_and_budget_inputs_first() ->
     )
 
 
-def test_grounding_workflow_wires_campaign_cases_and_budget_to_the_orchestrator() -> None:
+def test_grounding_workflow_wires_campaign_cases_and_budget_to_the_orchestrator() -> (
+    None
+):
     workflow = load_workflow()
     env = effective_env(workflow, orchestrator_step(workflow))
 
@@ -719,7 +744,8 @@ def nodepool_record_step(workflow: dict[str, Any]) -> dict[str, Any]:
     matches = [
         s
         for s in steps(workflow)
-        if "nodepool show" in str(s.get("run", "")) and "GITHUB_OUTPUT" in str(s.get("run", ""))
+        if "nodepool show" in str(s.get("run", ""))
+        and "GITHUB_OUTPUT" in str(s.get("run", ""))
     ]
     assert len(matches) == 1, (
         "exactly one step must record the original modeleval node count as a step output"
@@ -758,7 +784,9 @@ def test_grounding_workflow_records_the_original_node_count_before_the_round() -
     all_steps = steps(workflow)
     record = nodepool_record_step(workflow)
 
-    assert record.get("id"), "the record step needs an id so cleanup can read its output"
+    assert record.get("id"), (
+        "the record step needs an id so cleanup can read its output"
+    )
     assert all_steps.index(record) < all_steps.index(orchestrator_step(workflow)), (
         "the original count must be captured before the round can scale the pool"
     )
@@ -809,7 +837,12 @@ def test_grounding_workflow_restores_the_recorded_node_count_with_always() -> No
     assert "nodepool show" in body, (
         "cleanup must be idempotent: only scale when the pool is not already restored"
     )
-    for forbidden in ("nodepool add", "nodepool delete", "nodepool update", "aks create"):
+    for forbidden in (
+        "nodepool add",
+        "nodepool delete",
+        "nodepool update",
+        "aks create",
+    ):
         assert forbidden not in body
 
 
@@ -866,7 +899,9 @@ def test_campaign_loads_only_with_the_variables_the_workflow_exports(
 # ---------------------------------------------------------------------------
 
 
-def _write_fake_az(bin_dir: Path, *, current_count: str, calls_file: Path, exit_code: int = 0) -> None:
+def _write_fake_az(
+    bin_dir: Path, *, current_count: str, calls_file: Path, exit_code: int = 0
+) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)
     az = bin_dir / "az"
     az.write_text(
@@ -901,7 +936,9 @@ def _run_step_body(
     calls_file = tmp_path / "calls.txt"
     calls_file.touch()
     bin_dir = tmp_path / "bin"
-    _write_fake_az(bin_dir, current_count=current_count, calls_file=calls_file, exit_code=az_exit)
+    _write_fake_az(
+        bin_dir, current_count=current_count, calls_file=calls_file, exit_code=az_exit
+    )
 
     script = tmp_path / "step.sh"
     script.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
@@ -914,11 +951,17 @@ def _run_step_body(
         env={"PATH": f"{bin_dir}:/usr/bin:/bin", **env},
         timeout=30,
     )
-    calls = [line for line in calls_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    calls = [
+        line
+        for line in calls_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
     return result, calls
 
 
-def test_grounding_workflow_record_step_publishes_the_original_count(tmp_path: Path) -> None:
+def test_grounding_workflow_record_step_publishes_the_original_count(
+    tmp_path: Path,
+) -> None:
     body = str(nodepool_record_step(load_workflow())["run"])
     output_file = tmp_path / "run" / "github-output"
     output_file.parent.mkdir(parents=True)
@@ -936,7 +979,9 @@ def test_grounding_workflow_record_step_publishes_the_original_count(tmp_path: P
     assert "original-count=0" in output_file.read_text(encoding="utf-8")
 
 
-def test_grounding_workflow_record_step_rejects_an_unexpected_count(tmp_path: Path) -> None:
+def test_grounding_workflow_record_step_rejects_an_unexpected_count(
+    tmp_path: Path,
+) -> None:
     body = str(nodepool_record_step(load_workflow())["run"])
     output_file = tmp_path / "github-output"
     output_file.touch()
@@ -954,7 +999,9 @@ def test_grounding_workflow_record_step_rejects_an_unexpected_count(tmp_path: Pa
     assert output_file.read_text(encoding="utf-8") == ""
 
 
-def test_grounding_workflow_restore_step_scales_back_to_the_recorded_zero(tmp_path: Path) -> None:
+def test_grounding_workflow_restore_step_scales_back_to_the_recorded_zero(
+    tmp_path: Path,
+) -> None:
     body = str(nodepool_restore_step(load_workflow())["run"])
 
     result, calls = _run_step_body(
@@ -985,7 +1032,9 @@ def test_grounding_workflow_restore_step_is_idempotent(tmp_path: Path) -> None:
     assert calls == ["show"], "an already-restored pool must not be scaled again"
 
 
-def test_grounding_workflow_restore_step_never_touches_preexisting_capacity(tmp_path: Path) -> None:
+def test_grounding_workflow_restore_step_never_touches_preexisting_capacity(
+    tmp_path: Path,
+) -> None:
     body = str(nodepool_restore_step(load_workflow())["run"])
 
     result, calls = _run_step_body(
@@ -1029,3 +1078,44 @@ def test_grounding_workflow_restore_step_fails_visibly(tmp_path: Path) -> None:
     )
 
     assert result.returncode != 0, "a failed scale-down must fail the step"
+
+
+# ---------------------------------------------------------------------------
+# Task 3: Prerequisite step verifies tools before node-count read
+# ---------------------------------------------------------------------------
+
+
+def test_grounding_workflow_has_tool_verification_step_before_node_count() -> None:
+    """A step verifying az/kubectl/kubelogin/uv must precede the node-count record step."""
+    workflow = load_workflow()
+    steps = grounding_job(workflow)["steps"]
+    step_names = [s.get("name", "") for s in steps]
+
+    tool_step_idx = next(
+        (i for i, name in enumerate(step_names) if "Verify required CLI tools" in name),
+        None,
+    )
+    node_count_idx = next(
+        (
+            i
+            for i, name in enumerate(step_names)
+            if "Record original modeleval node count" in name
+        ),
+        None,
+    )
+
+    assert tool_step_idx is not None, (
+        "workflow must have a 'Verify required CLI tools' step"
+    )
+    assert node_count_idx is not None, (
+        "workflow must have a 'Record original modeleval node count' step"
+    )
+    assert tool_step_idx < node_count_idx, (
+        f"tool verification step (index {tool_step_idx}) must precede node-count step (index {node_count_idx})"
+    )
+
+    # The step must check all four tools
+    tool_step = steps[tool_step_idx]
+    body = str(tool_step.get("run", ""))
+    for tool in ("az", "kubectl", "kubelogin", "uv"):
+        assert tool in body, f"tool verification step must check for '{tool}'"

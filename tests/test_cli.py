@@ -12,7 +12,11 @@ import yaml  # type: ignore[import-untyped]
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from korvid_prompt_lab.aks import AKSPortForwardError
+from korvid_prompt_lab.aks import (
+    AKSMissingToolError,
+    AKSPortForwardError,
+    AKSPreflightTransientError,
+)
 from korvid_prompt_lab.cli import main
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,7 +48,9 @@ def _candidate_payload() -> dict[str, Any]:
     }
 
 
-def _process_campaign_payload(case_id: str = "smoke-happy", *, extra_case_ids: tuple[str, ...] = ()) -> dict[str, Any]:
+def _process_campaign_payload(
+    case_id: str = "smoke-happy", *, extra_case_ids: tuple[str, ...] = ()
+) -> dict[str, Any]:
     cases = [
         {
             "case_id": case_id,
@@ -123,7 +129,9 @@ def _aks_campaign_payload(
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> Path:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     return path
 
 
@@ -229,15 +237,21 @@ def test_evaluate_runs_fake_bridge_and_emits_json_summary(tmp_path: Path) -> Non
         _case_model_pair("smoke-happy", "mock-small"),
         _case_model_pair("smoke-guardrail", "mock-small"),
     ]
-    assert any(ref.endswith("evaluation-summary.json") for ref in summary["artifact_refs"])
+    assert any(
+        ref.endswith("evaluation-summary.json") for ref in summary["artifact_refs"]
+    )
     assert (artifact_root / "evaluation-summary.json").is_file()
 
 
-def test_evaluate_summary_records_how_every_run_produced_its_grade(tmp_path: Path) -> None:
+def test_evaluate_summary_records_how_every_run_produced_its_grade(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
-        _process_campaign_payload("smoke-happy", extra_case_ids=("smoke-scripted[scripted-mode]",)),
+        _process_campaign_payload(
+            "smoke-happy", extra_case_ids=("smoke-scripted[scripted-mode]",)
+        ),
     )
 
     exit_code, stdout, _ = _run_cli(
@@ -266,7 +280,9 @@ def test_evaluate_summary_records_how_every_run_produced_its_grade(tmp_path: Pat
     }
 
 
-def test_evaluate_summary_of_a_wholly_live_campaign_declares_live_only(tmp_path: Path) -> None:
+def test_evaluate_summary_of_a_wholly_live_campaign_declares_live_only(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
@@ -298,7 +314,9 @@ def test_evaluate_returns_exit_1_for_systemic_bridge_failure(tmp_path: Path) -> 
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
-        _process_campaign_payload("bridge-outage[systemic-status]", extra_case_ids=("bridge-standby",)),
+        _process_campaign_payload(
+            "bridge-outage[systemic-status]", extra_case_ids=("bridge-standby",)
+        ),
     )
 
     exit_code, stdout, stderr = _run_cli(
@@ -322,7 +340,9 @@ def test_evaluate_returns_exit_1_for_systemic_bridge_failure(tmp_path: Path) -> 
     assert "systemic" in stderr
 
 
-def test_evaluate_partial_model_specific_run_does_not_claim_milestone_passed(tmp_path: Path) -> None:
+def test_evaluate_partial_model_specific_run_does_not_claim_milestone_passed(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
@@ -370,7 +390,9 @@ def test_evaluate_partial_model_specific_run_does_not_claim_milestone_passed(tmp
     assert summary["case_sets"]["milestone"] == []
 
 
-def test_evaluate_model_specific_target_model_pack_can_pass_without_full_campaign(tmp_path: Path) -> None:
+def test_evaluate_model_specific_target_model_pack_can_pass_without_full_campaign(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
@@ -441,7 +463,11 @@ def test_evaluate_model_specific_target_model_pack_can_pass_without_full_campaig
     summary = json.loads(stdout)
     assert summary["milestone_passed"] is True
     assert summary["evaluated_models"] == ["mock-large"]
-    assert summary["campaign_case_ids"] == ["small-case", "large-case", "large-guardrail"]
+    assert summary["campaign_case_ids"] == [
+        "small-case",
+        "large-case",
+        "large-guardrail",
+    ]
     assert summary["evaluated_case_ids"] == ["large-case", "large-guardrail"]
     assert summary["case_sets"]["milestone"] == ["large-case", "large-guardrail"]
     assert summary["case_sets"]["train"] == ["large-case"]
@@ -457,7 +483,9 @@ def test_evaluate_model_specific_target_model_pack_can_pass_without_full_campaig
     ]
 
 
-def test_evaluate_model_specific_multi_model_run_does_not_claim_milestone_passed(tmp_path: Path) -> None:
+def test_evaluate_model_specific_multi_model_run_does_not_claim_milestone_passed(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
@@ -535,7 +563,10 @@ def test_optimize_requires_reflection_model_and_invokes_optimizer(
         summary_path = tmp_path / "optimization-summary.json"
         best_candidate_path = tmp_path / "best-candidate.yaml"
         summary_path.write_text("{}", encoding="utf-8")
-        best_candidate_path.write_text("schema_version: 1\ncandidate_id: shipped-small\ncomponents:\n  system: ok\n", encoding="utf-8")
+        best_candidate_path.write_text(
+            "schema_version: 1\ncandidate_id: shipped-small\ncomponents:\n  system: ok\n",
+            encoding="utf-8",
+        )
         return type(
             "Artifacts",
             (),
@@ -548,8 +579,12 @@ def test_optimize_requires_reflection_model_and_invokes_optimizer(
             },
         )()
 
-    monkeypatch.setattr("korvid_prompt_lab.cli._build_reflection_lm", fake_build_reflection_lm)
-    monkeypatch.setattr("korvid_prompt_lab.cli.optimize_campaign", fake_optimize_campaign)
+    monkeypatch.setattr(
+        "korvid_prompt_lab.cli._build_reflection_lm", fake_build_reflection_lm
+    )
+    monkeypatch.setattr(
+        "korvid_prompt_lab.cli.optimize_campaign", fake_optimize_campaign
+    )
 
     exit_code, stdout, stderr = _run_cli(
         [
@@ -600,7 +635,9 @@ def test_optimize_requires_reflection_model_and_invokes_optimizer(
     assert "reflection-model" in missing_stderr
 
 
-def test_aks_check_performs_read_only_preflight(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_aks_check_performs_read_only_preflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     calls: dict[str, Any] = {}
 
     class FakeAKSPortForward:
@@ -632,6 +669,103 @@ def test_aks_check_performs_read_only_preflight(monkeypatch: pytest.MonkeyPatch,
     assert stderr == ""
     assert "http://127.0.0.1:41001" in stdout
     assert calls["workspace_dir"] == tmp_path / "aks-check"
+
+
+def test_aks_check_returns_75_for_transient_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Transient AKS errors (endpoints not ready) must return EX_TEMPFAIL 75."""
+
+    class FailingTransient:
+        def __init__(self, serving: object, workspace_dir: Path | str) -> None:
+            pass
+
+        def __enter__(self) -> Self:
+            raise AKSPreflightTransientError("AKS Service must expose Ready endpoints")
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            pass
+
+    monkeypatch.setattr("korvid_prompt_lab.cli.AKSPortForward", FailingTransient)
+    campaign_path = _write_yaml(tmp_path / "aks-campaign.yaml", _aks_campaign_payload())
+
+    exit_code, _stdout, stderr = _run_cli(
+        [
+            "aks-check",
+            "--campaign",
+            str(campaign_path),
+            "--artifact-root",
+            str(tmp_path / "aks-check"),
+        ]
+    )
+
+    assert exit_code == 75
+    assert "(transient)" in stderr
+
+
+def test_aks_check_returns_1_for_permanent_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Permanent AKS errors (cluster identity) must return exit 1."""
+
+    class FailingPermanent:
+        def __init__(self, serving: object, workspace_dir: Path | str) -> None:
+            pass
+
+        def __enter__(self) -> Self:
+            raise AKSPortForwardError("AKS cluster lookup failed")
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            pass
+
+    monkeypatch.setattr("korvid_prompt_lab.cli.AKSPortForward", FailingPermanent)
+    campaign_path = _write_yaml(tmp_path / "aks-campaign.yaml", _aks_campaign_payload())
+
+    exit_code, _stdout, stderr = _run_cli(
+        [
+            "aks-check",
+            "--campaign",
+            str(campaign_path),
+            "--artifact-root",
+            str(tmp_path / "aks-check"),
+        ]
+    )
+
+    assert exit_code == 1
+    assert "(transient)" not in stderr
+
+
+def test_aks_check_returns_1_for_missing_tool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Missing kubectl/az raises AKSMissingToolError which returns exit 1 (permanent)."""
+
+    class FailingMissingTool:
+        def __init__(self, serving: object, workspace_dir: Path | str) -> None:
+            pass
+
+        def __enter__(self) -> Self:
+            raise AKSMissingToolError("kubectl not found")
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            pass
+
+    monkeypatch.setattr("korvid_prompt_lab.cli.AKSPortForward", FailingMissingTool)
+    campaign_path = _write_yaml(tmp_path / "aks-campaign.yaml", _aks_campaign_payload())
+
+    exit_code, _stdout, stderr = _run_cli(
+        [
+            "aks-check",
+            "--campaign",
+            str(campaign_path),
+            "--artifact-root",
+            str(tmp_path / "aks-check"),
+        ]
+    )
+
+    assert exit_code == 1
+    assert "kubectl not found" in stderr
+    assert "Traceback" not in stderr
 
 
 def test_publish_reads_inputs_and_writes_registry(tmp_path: Path) -> None:
@@ -721,7 +855,9 @@ def test_publish_reads_inputs_and_writes_registry(tmp_path: Path) -> None:
     assert (registry_root / "scoreboard.md").is_file()
 
 
-def test_publish_rejects_mismatched_candidate_identity_in_summary(tmp_path: Path) -> None:
+def test_publish_rejects_mismatched_candidate_identity_in_summary(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
@@ -801,7 +937,9 @@ def test_publish_rejects_mismatched_candidate_identity_in_summary(tmp_path: Path
     assert "candidate_id" in stderr or "candidate_fingerprint" in stderr
 
 
-def test_publish_rejects_model_specific_summary_without_full_milestone_pack(tmp_path: Path) -> None:
+def test_publish_rejects_model_specific_summary_without_full_milestone_pack(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
@@ -851,7 +989,14 @@ def test_publish_rejects_model_specific_summary_without_full_milestone_pack(tmp_
                 "milestone": ["smoke-a", "smoke-b"],
             },
             "artifact_refs": ["artifacts/evaluation-summary.json"],
-            "reproduction_command": ["uv", "run", "--python", "3.12", "korvid-prompt-lab", "evaluate"],
+            "reproduction_command": [
+                "uv",
+                "run",
+                "--python",
+                "3.12",
+                "korvid-prompt-lab",
+                "evaluate",
+            ],
         },
     )
     baseline_code, _, baseline_stderr = _run_cli(
@@ -899,7 +1044,14 @@ def test_publish_rejects_model_specific_summary_without_full_milestone_pack(tmp_
                 "milestone": ["smoke-a"],
             },
             "artifact_refs": ["artifacts/evaluation-summary.json"],
-            "reproduction_command": ["uv", "run", "--python", "3.12", "korvid-prompt-lab", "evaluate"],
+            "reproduction_command": [
+                "uv",
+                "run",
+                "--python",
+                "3.12",
+                "korvid-prompt-lab",
+                "evaluate",
+            ],
         },
     )
 
@@ -924,10 +1076,19 @@ def test_publish_rejects_model_specific_summary_without_full_milestone_pack(tmp_
     assert exit_code == 2
     assert stdout == ""
     assert "milestone" in stderr
-    assert len(json.loads((registry_root / "index.json").read_text(encoding="utf-8"))["bundles"]) == 1
+    assert (
+        len(
+            json.loads((registry_root / "index.json").read_text(encoding="utf-8"))[
+                "bundles"
+            ]
+        )
+        == 1
+    )
 
 
-def test_publish_rejects_common_summary_without_full_case_model_matrix(tmp_path: Path) -> None:
+def test_publish_rejects_common_summary_without_full_case_model_matrix(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
@@ -948,7 +1109,7 @@ def test_publish_rejects_common_summary_without_full_case_model_matrix(tmp_path:
                     "template_id": "smoke-template",
                     "prompt": "Confirm smoke-b.",
                     "models": ["mock-small", "mock-large"],
-                }
+                },
             ],
             "serving": {
                 "backend": "process",
@@ -1008,7 +1169,14 @@ def test_publish_rejects_common_summary_without_full_case_model_matrix(tmp_path:
                 "milestone": ["smoke-a", "smoke-b"],
             },
             "artifact_refs": ["artifacts/evaluation-summary.json"],
-            "reproduction_command": ["uv", "run", "--python", "3.12", "korvid-prompt-lab", "evaluate"],
+            "reproduction_command": [
+                "uv",
+                "run",
+                "--python",
+                "3.12",
+                "korvid-prompt-lab",
+                "evaluate",
+            ],
         },
     )
 
@@ -1033,7 +1201,9 @@ def test_publish_rejects_common_summary_without_full_case_model_matrix(tmp_path:
     assert "case_model" in stderr or "common" in stderr
 
 
-def test_publish_accepts_common_summary_with_full_model_matrix_despite_model_order(tmp_path: Path) -> None:
+def test_publish_accepts_common_summary_with_full_model_matrix_despite_model_order(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
@@ -1115,7 +1285,14 @@ def test_publish_accepts_common_summary_with_full_model_matrix_despite_model_ord
                 "milestone": ["smoke-happy", "smoke-guardrail"],
             },
             "artifact_refs": ["artifacts/evaluation-summary.json"],
-            "reproduction_command": ["uv", "run", "--python", "3.12", "korvid-prompt-lab", "evaluate"],
+            "reproduction_command": [
+                "uv",
+                "run",
+                "--python",
+                "3.12",
+                "korvid-prompt-lab",
+                "evaluate",
+            ],
         },
     )
 
@@ -1218,7 +1395,14 @@ def test_publish_accepts_common_summary_with_sorted_case_lists(tmp_path: Path) -
                 "milestone": ["a-case", "b-case"],
             },
             "artifact_refs": ["artifacts/evaluation-summary.json"],
-            "reproduction_command": ["uv", "run", "--python", "3.12", "korvid-prompt-lab", "evaluate"],
+            "reproduction_command": [
+                "uv",
+                "run",
+                "--python",
+                "3.12",
+                "korvid-prompt-lab",
+                "evaluate",
+            ],
         },
     )
 
@@ -1243,7 +1427,9 @@ def test_publish_accepts_common_summary_with_sorted_case_lists(tmp_path: Path) -
     assert stderr == ""
 
 
-def test_publish_rejects_common_summary_with_unrelated_model_metadata(tmp_path: Path) -> None:
+def test_publish_rejects_common_summary_with_unrelated_model_metadata(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
@@ -1291,7 +1477,14 @@ def test_publish_rejects_common_summary_with_unrelated_model_metadata(tmp_path: 
                 "milestone": ["smoke-happy", "smoke-guardrail"],
             },
             "artifact_refs": ["artifacts/evaluation-summary.json"],
-            "reproduction_command": ["uv", "run", "--python", "3.12", "korvid-prompt-lab", "evaluate"],
+            "reproduction_command": [
+                "uv",
+                "run",
+                "--python",
+                "3.12",
+                "korvid-prompt-lab",
+                "evaluate",
+            ],
         },
     )
 
@@ -1316,7 +1509,9 @@ def test_publish_rejects_common_summary_with_unrelated_model_metadata(tmp_path: 
     assert "model_family" in stderr or "target model" in stderr
 
 
-def test_publish_rejects_model_specific_summary_not_bound_to_target_model(tmp_path: Path) -> None:
+def test_publish_rejects_model_specific_summary_not_bound_to_target_model(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
@@ -1400,7 +1595,14 @@ def test_publish_rejects_model_specific_summary_not_bound_to_target_model(tmp_pa
                 "milestone": ["smoke-happy", "smoke-guardrail"],
             },
             "artifact_refs": ["artifacts/evaluation-summary.json"],
-            "reproduction_command": ["uv", "run", "--python", "3.12", "korvid-prompt-lab", "evaluate"],
+            "reproduction_command": [
+                "uv",
+                "run",
+                "--python",
+                "3.12",
+                "korvid-prompt-lab",
+                "evaluate",
+            ],
         },
     )
     baseline_code, _, baseline_stderr = _run_cli(
@@ -1455,7 +1657,14 @@ def test_publish_rejects_model_specific_summary_not_bound_to_target_model(tmp_pa
                 "milestone": ["smoke-happy", "smoke-guardrail"],
             },
             "artifact_refs": ["artifacts/evaluation-summary.json"],
-            "reproduction_command": ["uv", "run", "--python", "3.12", "korvid-prompt-lab", "evaluate"],
+            "reproduction_command": [
+                "uv",
+                "run",
+                "--python",
+                "3.12",
+                "korvid-prompt-lab",
+                "evaluate",
+            ],
         },
     )
 
@@ -1484,7 +1693,7 @@ def test_publish_rejects_model_specific_summary_not_bound_to_target_model(tmp_pa
 
 def _recording_bridge(path: Path, events_path: Path) -> list[str]:
     path.write_text(
-        '''
+        """
 import json
 import sys
 from pathlib import Path
@@ -1523,7 +1732,7 @@ response_path.write_text(
     ),
     encoding="utf-8",
 )
-'''.strip()
+""".strip()
         + "\n",
         encoding="utf-8",
     )
@@ -1574,7 +1783,8 @@ def test_evaluate_keeps_one_loopback_forward_open_for_the_whole_aks_run(
     events_path = tmp_path / "events.log"
     calls: dict[str, Any] = {}
     monkeypatch.setattr(
-        "korvid_prompt_lab.cli.AKSPortForward", _fake_port_forward_class(events_path, calls)
+        "korvid_prompt_lab.cli.AKSPortForward",
+        _fake_port_forward_class(events_path, calls),
     )
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
@@ -1627,7 +1837,8 @@ def test_evaluate_closes_the_aks_forward_when_the_bridge_fails_systemically(
     events_path = tmp_path / "events.log"
     calls: dict[str, Any] = {}
     monkeypatch.setattr(
-        "korvid_prompt_lab.cli.AKSPortForward", _fake_port_forward_class(events_path, calls)
+        "korvid_prompt_lab.cli.AKSPortForward",
+        _fake_port_forward_class(events_path, calls),
     )
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
@@ -1664,12 +1875,15 @@ def test_evaluate_returns_exit_1_when_the_aks_preflight_fails(
     monkeypatch.setattr(
         "korvid_prompt_lab.cli.AKSPortForward",
         _fake_port_forward_class(
-            events_path, calls, enter_error=AKSPortForwardError("AKS Service must expose Ready endpoints")
+            events_path,
+            calls,
+            enter_error=AKSPortForwardError("AKS Service must expose Ready endpoints"),
         ),
     )
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
-        tmp_path / "aks-campaign.yaml", _aks_campaign_payload(case_ids=("aks-case", "aks-guardrail"))
+        tmp_path / "aks-campaign.yaml",
+        _aks_campaign_payload(case_ids=("aks-case", "aks-guardrail")),
     )
 
     exit_code, stdout, stderr = _run_cli(
@@ -1699,9 +1913,12 @@ def test_optimize_runs_the_whole_search_inside_one_aks_forward(
     events_path = tmp_path / "events.log"
     calls: dict[str, Any] = {}
     monkeypatch.setattr(
-        "korvid_prompt_lab.cli.AKSPortForward", _fake_port_forward_class(events_path, calls)
+        "korvid_prompt_lab.cli.AKSPortForward",
+        _fake_port_forward_class(events_path, calls),
     )
-    monkeypatch.setattr("korvid_prompt_lab.cli._build_reflection_lm", lambda model: {"model": model})
+    monkeypatch.setattr(
+        "korvid_prompt_lab.cli._build_reflection_lm", lambda model: {"model": model}
+    )
 
     def fake_optimize_campaign(**kwargs: Any) -> object:
         calls["runner"] = kwargs["runner"]
@@ -1711,7 +1928,8 @@ def test_optimize_runs_the_whole_search_inside_one_aks_forward(
         best_candidate_path = tmp_path / "best-candidate.yaml"
         summary_path.write_text("{}", encoding="utf-8")
         best_candidate_path.write_text(
-            "schema_version: 1\ncandidate_id: shipped-small\ncomponents:\n  system: ok\n", encoding="utf-8"
+            "schema_version: 1\ncandidate_id: shipped-small\ncomponents:\n  system: ok\n",
+            encoding="utf-8",
         )
         return type(
             "Artifacts",
@@ -1725,7 +1943,9 @@ def test_optimize_runs_the_whole_search_inside_one_aks_forward(
             },
         )()
 
-    monkeypatch.setattr("korvid_prompt_lab.cli.optimize_campaign", fake_optimize_campaign)
+    monkeypatch.setattr(
+        "korvid_prompt_lab.cli.optimize_campaign", fake_optimize_campaign
+    )
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "aks-campaign.yaml",
@@ -1753,13 +1973,19 @@ def test_optimize_runs_the_whole_search_inside_one_aks_forward(
     )
 
     assert exit_code == 0, stderr
-    assert events_path.read_text(encoding="utf-8").split() == ["enter", "optimize", "exit"]
+    assert events_path.read_text(encoding="utf-8").split() == [
+        "enter",
+        "optimize",
+        "exit",
+    ]
     assert calls["instances"] == 1
     assert calls["workspace_dir"] == tmp_path / "optimization"
     assert calls["runner"].model_endpoint == "http://127.0.0.1:41001"
 
 
-def test_evaluate_pass_hat_k_requires_full_operation_completion_not_a_positive_score(tmp_path: Path) -> None:
+def test_evaluate_pass_hat_k_requires_full_operation_completion_not_a_positive_score(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_payload = _process_campaign_payload(
         "smoke-happy", extra_case_ids=("smoke-partial[partial-completion]",)
@@ -1799,14 +2025,20 @@ def test_evaluate_pass_hat_k_requires_full_operation_completion_not_a_positive_s
     assert summary["pass_at_3"] == pytest.approx(0.5)
 
 
-def test_evaluate_reports_insufficient_pass_hat_k_evidence_for_short_campaigns(tmp_path: Path) -> None:
+def test_evaluate_reports_insufficient_pass_hat_k_evidence_for_short_campaigns(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
-    campaign_payload = _process_campaign_payload("smoke-happy", extra_case_ids=("smoke-guardrail",))
+    campaign_payload = _process_campaign_payload(
+        "smoke-happy", extra_case_ids=("smoke-guardrail",)
+    )
     campaign_payload["repetitions"] = 1
     campaign_path = _write_yaml(tmp_path / "campaign.yaml", campaign_payload)
 
     exit_code, stdout, stderr = _run_cli(
-        _evaluate_args(candidate_path, campaign_path, tmp_path / "artifacts", extra=("--json",))
+        _evaluate_args(
+            candidate_path, campaign_path, tmp_path / "artifacts", extra=("--json",)
+        )
     )
 
     assert exit_code == 0, stderr
@@ -1841,9 +2073,13 @@ def test_evaluate_pass_hat_k_requires_every_repetition_to_pass(tmp_path: Path) -
     assert summary["pass_at_5"] == pytest.approx(0.5)
 
 
-def test_evaluate_prints_insufficient_pass_hat_k_evidence_in_the_text_summary(tmp_path: Path) -> None:
+def test_evaluate_prints_insufficient_pass_hat_k_evidence_in_the_text_summary(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
-    campaign_payload = _process_campaign_payload("smoke-happy", extra_case_ids=("smoke-guardrail",))
+    campaign_payload = _process_campaign_payload(
+        "smoke-happy", extra_case_ids=("smoke-guardrail",)
+    )
     campaign_payload["repetitions"] = 1
     campaign_path = _write_yaml(tmp_path / "campaign.yaml", campaign_payload)
 
@@ -1966,7 +2202,9 @@ def test_evaluate_rejects_case_sets_that_were_not_evaluated(tmp_path: Path) -> N
     assert "evaluated" in stderr
 
 
-def test_evaluate_rejects_milestone_cases_that_were_not_evaluated(tmp_path: Path) -> None:
+def test_evaluate_rejects_milestone_cases_that_were_not_evaluated(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
@@ -2033,7 +2271,9 @@ def test_optimize_threads_an_explicit_seed_and_reports_the_invocation_identity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     calls: dict[str, Any] = {}
-    monkeypatch.setattr("korvid_prompt_lab.cli._build_reflection_lm", lambda model: {"model": model})
+    monkeypatch.setattr(
+        "korvid_prompt_lab.cli._build_reflection_lm", lambda model: {"model": model}
+    )
 
     def fake_optimize_campaign(**kwargs: Any) -> object:
         calls["optimize"] = kwargs
@@ -2043,7 +2283,8 @@ def test_optimize_threads_an_explicit_seed_and_reports_the_invocation_identity(
         best_candidate_path = invocation_dir / "best-candidate.yaml"
         summary_path.write_text("{}", encoding="utf-8")
         best_candidate_path.write_text(
-            "schema_version: 1\ncandidate_id: shipped-small\ncomponents:\n  system: ok\n", encoding="utf-8"
+            "schema_version: 1\ncandidate_id: shipped-small\ncomponents:\n  system: ok\n",
+            encoding="utf-8",
         )
         return type(
             "Artifacts",
@@ -2057,7 +2298,9 @@ def test_optimize_threads_an_explicit_seed_and_reports_the_invocation_identity(
             },
         )()
 
-    monkeypatch.setattr("korvid_prompt_lab.cli.optimize_campaign", fake_optimize_campaign)
+    monkeypatch.setattr(
+        "korvid_prompt_lab.cli.optimize_campaign", fake_optimize_campaign
+    )
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
@@ -2092,9 +2335,13 @@ def test_optimize_threads_an_explicit_seed_and_reports_the_invocation_identity(
     assert str(tmp_path / "optimization" / "invocations" / "abc123def4567890") in stdout
 
 
-def test_optimize_defaults_to_a_zero_seed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_optimize_defaults_to_a_zero_seed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     calls: dict[str, Any] = {}
-    monkeypatch.setattr("korvid_prompt_lab.cli._build_reflection_lm", lambda model: {"model": model})
+    monkeypatch.setattr(
+        "korvid_prompt_lab.cli._build_reflection_lm", lambda model: {"model": model}
+    )
 
     def fake_optimize_campaign(**kwargs: Any) -> object:
         calls["optimize"] = kwargs
@@ -2104,7 +2351,8 @@ def test_optimize_defaults_to_a_zero_seed(monkeypatch: pytest.MonkeyPatch, tmp_p
         best_candidate_path = invocation_dir / "best-candidate.yaml"
         summary_path.write_text("{}", encoding="utf-8")
         best_candidate_path.write_text(
-            "schema_version: 1\ncandidate_id: shipped-small\ncomponents:\n  system: ok\n", encoding="utf-8"
+            "schema_version: 1\ncandidate_id: shipped-small\ncomponents:\n  system: ok\n",
+            encoding="utf-8",
         )
         return type(
             "Artifacts",
@@ -2118,7 +2366,9 @@ def test_optimize_defaults_to_a_zero_seed(monkeypatch: pytest.MonkeyPatch, tmp_p
             },
         )()
 
-    monkeypatch.setattr("korvid_prompt_lab.cli.optimize_campaign", fake_optimize_campaign)
+    monkeypatch.setattr(
+        "korvid_prompt_lab.cli.optimize_campaign", fake_optimize_campaign
+    )
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
@@ -2197,14 +2447,18 @@ def test_evaluate_and_optimize_use_the_campaign_bridge_timeout_for_every_bridge_
         return runner
 
     monkeypatch.setattr("korvid_prompt_lab.cli.KorvidProcessRunner", recording_runner)
-    monkeypatch.setattr("korvid_prompt_lab.cli._build_reflection_lm", lambda model: {"model": model})
+    monkeypatch.setattr(
+        "korvid_prompt_lab.cli._build_reflection_lm", lambda model: {"model": model}
+    )
     monkeypatch.setattr(
         "korvid_prompt_lab.cli.optimize_campaign",
         lambda **kwargs: _fake_optimization_artifacts(tmp_path / "invocation", kwargs),
     )
 
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
-    campaign_payload = _process_campaign_payload("smoke-happy", extra_case_ids=("smoke-guardrail",))
+    campaign_payload = _process_campaign_payload(
+        "smoke-happy", extra_case_ids=("smoke-guardrail",)
+    )
     campaign_payload["bridge_timeout_seconds"] = 12.5
     campaign_path = _write_yaml(tmp_path / "campaign.yaml", campaign_payload)
 
@@ -2235,12 +2489,19 @@ def test_evaluate_and_optimize_use_the_campaign_bridge_timeout_for_every_bridge_
     assert optimize_code == 0, optimize_stderr
 
     assert len(created) == 2
-    assert [runner.timeout_seconds for runner in created] == [pytest.approx(12.5), pytest.approx(12.5)]
+    assert [runner.timeout_seconds for runner in created] == [
+        pytest.approx(12.5),
+        pytest.approx(12.5),
+    ]
 
 
-def test_evaluate_aborts_when_the_bridge_exceeds_the_campaign_bridge_timeout(tmp_path: Path) -> None:
+def test_evaluate_aborts_when_the_bridge_exceeds_the_campaign_bridge_timeout(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
-    campaign_payload = _process_campaign_payload("smoke-slow[timeout]", extra_case_ids=("smoke-guardrail",))
+    campaign_payload = _process_campaign_payload(
+        "smoke-slow[timeout]", extra_case_ids=("smoke-guardrail",)
+    )
     campaign_payload["bridge_timeout_seconds"] = 0.1
     campaign_path = _write_yaml(tmp_path / "campaign.yaml", campaign_payload)
 
@@ -2259,9 +2520,13 @@ def test_evaluate_aborts_when_the_bridge_exceeds_the_campaign_bridge_timeout(tmp
     assert "bridge timed out after 0.1 seconds" in stderr
 
 
-def test_evaluate_rejects_a_non_positive_campaign_bridge_timeout(tmp_path: Path) -> None:
+def test_evaluate_rejects_a_non_positive_campaign_bridge_timeout(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
-    campaign_payload = _process_campaign_payload("smoke-happy", extra_case_ids=("smoke-guardrail",))
+    campaign_payload = _process_campaign_payload(
+        "smoke-happy", extra_case_ids=("smoke-guardrail",)
+    )
     campaign_payload["bridge_timeout_seconds"] = 0
     campaign_path = _write_yaml(tmp_path / "campaign.yaml", campaign_payload)
 
@@ -2280,7 +2545,8 @@ def _fake_optimization_artifacts(invocation_dir: Path, kwargs: dict[str, Any]) -
     best_candidate_path = invocation_dir / "best-candidate.yaml"
     summary_path.write_text("{}", encoding="utf-8")
     best_candidate_path.write_text(
-        "schema_version: 1\ncandidate_id: shipped-small\ncomponents:\n  system: ok\n", encoding="utf-8"
+        "schema_version: 1\ncandidate_id: shipped-small\ncomponents:\n  system: ok\n",
+        encoding="utf-8",
     )
     return type(
         "Artifacts",
@@ -2295,7 +2561,9 @@ def _fake_optimization_artifacts(invocation_dir: Path, kwargs: dict[str, Any]) -
     )()
 
 
-def _publish_summary_payload(*, bundle_kind: str, aggregate_score: float) -> dict[str, Any]:
+def _publish_summary_payload(
+    *, bundle_kind: str, aggregate_score: float
+) -> dict[str, Any]:
     return {
         "bundle_kind": bundle_kind,
         "candidate_id": "shipped-small",
@@ -2326,11 +2594,20 @@ def _publish_summary_payload(*, bundle_kind: str, aggregate_score: float) -> dic
             "milestone": ["smoke-happy", "smoke-guardrail"],
         },
         "artifact_refs": ["artifacts/evaluation-summary.json"],
-        "reproduction_command": ["uv", "run", "--python", "3.12", "korvid-prompt-lab", "evaluate"],
+        "reproduction_command": [
+            "uv",
+            "run",
+            "--python",
+            "3.12",
+            "korvid-prompt-lab",
+            "evaluate",
+        ],
     }
 
 
-def test_publish_blocks_a_marginal_model_specific_override_with_the_default_threshold(tmp_path: Path) -> None:
+def test_publish_blocks_a_marginal_model_specific_override_with_the_default_threshold(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
@@ -2375,13 +2652,17 @@ def test_publish_blocks_a_marginal_model_specific_override_with_the_default_thre
     marginal_code, marginal_stdout, marginal_stderr = publish(
         _write_json(
             tmp_path / "marginal-summary.json",
-            _publish_summary_payload(bundle_kind="model-specific", aggregate_score=0.5078125),
+            _publish_summary_payload(
+                bundle_kind="model-specific", aggregate_score=0.5078125
+            ),
         )
     )
     clear_code, clear_stdout, clear_stderr = publish(
         _write_json(
             tmp_path / "clear-summary.json",
-            _publish_summary_payload(bundle_kind="model-specific", aggregate_score=0.75),
+            _publish_summary_payload(
+                bundle_kind="model-specific", aggregate_score=0.75
+            ),
         )
     )
 
@@ -2410,7 +2691,9 @@ def test_publish_rejects_insufficient_pass_hat_k_evidence(tmp_path: Path) -> Non
             "serving_engine": "korvid-process",
         },
     )
-    summary_payload = _publish_summary_payload(bundle_kind="common", aggregate_score=0.85)
+    summary_payload = _publish_summary_payload(
+        bundle_kind="common", aggregate_score=0.85
+    )
     summary_payload["repetitions_per_case"] = 1
     summary_payload["pass_at_3"] = None
     summary_payload["pass_at_5"] = None
@@ -2441,7 +2724,9 @@ def test_publish_rejects_insufficient_pass_hat_k_evidence(tmp_path: Path) -> Non
     "execution_modes",
     [None, ["scripted"], ["live", "scripted"], "live", []],
 )
-def test_publish_refuses_a_summary_that_is_not_wholly_live(tmp_path: Path, execution_modes: Any) -> None:
+def test_publish_refuses_a_summary_that_is_not_wholly_live(
+    tmp_path: Path, execution_modes: Any
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
@@ -2459,7 +2744,9 @@ def test_publish_refuses_a_summary_that_is_not_wholly_live(tmp_path: Path, execu
         },
     )
     summary = _publish_summary_payload(bundle_kind="common", aggregate_score=0.85)
-    summary["candidate_fingerprint"] = "05386c2e97901414449c3e2356ff736f1def9c9ca5172e28d7b63fa120a335d7"
+    summary["candidate_fingerprint"] = (
+        "05386c2e97901414449c3e2356ff736f1def9c9ca5172e28d7b63fa120a335d7"
+    )
     if execution_modes is None:
         del summary["execution_modes"]
     else:
@@ -2507,7 +2794,9 @@ def test_publish_accepts_a_summary_whose_runs_were_all_live(tmp_path: Path) -> N
         },
     )
     summary = _publish_summary_payload(bundle_kind="common", aggregate_score=0.85)
-    summary["candidate_fingerprint"] = "05386c2e97901414449c3e2356ff736f1def9c9ca5172e28d7b63fa120a335d7"
+    summary["candidate_fingerprint"] = (
+        "05386c2e97901414449c3e2356ff736f1def9c9ca5172e28d7b63fa120a335d7"
+    )
     evaluation_summary_path = _write_json(tmp_path / "evaluation-summary.json", summary)
     registry_root = tmp_path / "registry"
 

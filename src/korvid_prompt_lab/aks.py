@@ -24,11 +24,29 @@ _READ_CHUNK_BYTES = 4096
 
 
 class AKSPortForwardError(RuntimeError):
-    """Raised when AKS discovery or port-forward preparation fails."""
+    """Raised when AKS discovery or port-forward preparation fails permanently."""
 
 
-class AKSPortForwardTimeoutError(AKSPortForwardError):
+class AKSPreflightTransientError(AKSPortForwardError):
+    """Raised for genuinely retryable AKS readiness conditions (EX_TEMPFAIL 75).
+
+    Transient conditions include:
+    - Endpoints not ready or empty (pods still warming up)
+    - Port-forward readiness timeout or early exit
+    - Model probe temporarily unavailable (HTTP error)
+    - Configured model not yet advertised by the serving endpoint
+
+    Permanent failures (cluster identity, get-credentials, kubelogin, service
+    lookup, malformed payload, missing binaries) raise plain AKSPortForwardError.
+    """
+
+
+class AKSPortForwardTimeoutError(AKSPreflightTransientError):
     """Raised when the AKS port-forward does not become ready before a deadline."""
+
+
+class AKSMissingToolError(AKSPortForwardError):
+    """Raised when a required CLI tool (kubectl, kubelogin, az) is not found."""
 
 
 class _CommandResult(Protocol):
@@ -77,16 +95,24 @@ class _SubprocessPortForward:
     max_buffered_bytes: int = _MAX_BUFFERED_OUTPUT_BYTES
     output_poll_interval_seconds: float = _OUTPUT_POLL_INTERVAL_SECONDS
     reader_join_timeout_seconds: float = _READER_JOIN_TIMEOUT_SECONDS
-    _lock: threading.Lock = field(init=False, repr=False, compare=False, default_factory=threading.Lock)
-    _buffer: bytearray = field(init=False, repr=False, compare=False, default_factory=bytearray)
+    _lock: threading.Lock = field(
+        init=False, repr=False, compare=False, default_factory=threading.Lock
+    )
+    _buffer: bytearray = field(
+        init=False, repr=False, compare=False, default_factory=bytearray
+    )
     _output_ready: threading.Event = field(
         init=False, repr=False, compare=False, default_factory=threading.Event
     )
     _closing: threading.Event = field(
         init=False, repr=False, compare=False, default_factory=threading.Event
     )
-    _failure: BaseException | None = field(init=False, repr=False, compare=False, default=None)
-    _reader: threading.Thread | None = field(init=False, repr=False, compare=False, default=None)
+    _failure: BaseException | None = field(
+        init=False, repr=False, compare=False, default=None
+    )
+    _reader: threading.Thread | None = field(
+        init=False, repr=False, compare=False, default=None
+    )
 
     def __post_init__(self) -> None:
         stream = self.process.stdout
@@ -243,24 +269,30 @@ class AKSPortForward:
         return kubeconfig_path
 
     def _validate_cluster(self) -> None:
-        result = self.command_runner(
-            (
-                "az",
-                "aks",
-                "show",
-                "--resource-group",
-                self.serving.resource_group,
-                "--name",
-                self.serving.cluster_name,
-                "--output",
-                "json",
-                "--only-show-errors",
+        try:
+            result = self.command_runner(
+                (
+                    "az",
+                    "aks",
+                    "show",
+                    "--resource-group",
+                    self.serving.resource_group,
+                    "--name",
+                    self.serving.cluster_name,
+                    "--output",
+                    "json",
+                    "--only-show-errors",
+                )
             )
-        )
+        except FileNotFoundError as exc:
+            raise AKSMissingToolError("az not found") from exc
         if result.returncode != 0:
             raise AKSPortForwardError("AKS cluster lookup failed")
         payload = self._load_json(result.stdout, "AKS cluster metadata")
-        if payload.get("name") != self.serving.cluster_name or payload.get("resourceGroup") != self.serving.resource_group:
+        if (
+            payload.get("name") != self.serving.cluster_name
+            or payload.get("resourceGroup") != self.serving.resource_group
+        ):
             raise AKSPortForwardError("AKS cluster validation failed")
 
     def _write_kubeconfig(self) -> None:
@@ -298,15 +330,22 @@ class AKSPortForward:
             )
         except FileNotFoundError as exc:
             self._kubeconfig_path.unlink(missing_ok=True)
-            raise AKSPortForwardError("kubelogin conversion failed: kubelogin not found") from exc
+            raise AKSPortForwardError(
+                "kubelogin conversion failed: kubelogin not found"
+            ) from exc
         if result.returncode != 0:
             self._kubeconfig_path.unlink(missing_ok=True)
             raise AKSPortForwardError("kubelogin conversion failed")
 
     def _validate_service(self) -> int:
-        payload = self._kubectl_get("service", self.serving.service, "AKS Service lookup failed")
+        payload = self._kubectl_get(
+            "service", self.serving.service, "AKS Service lookup failed"
+        )
         metadata = _require_mapping(payload.get("metadata"), "service.metadata")
-        if metadata.get("name") != self.serving.service or metadata.get("namespace") != self.serving.namespace:
+        if (
+            metadata.get("name") != self.serving.service
+            or metadata.get("namespace") != self.serving.namespace
+        ):
             raise AKSPortForwardError("AKS Service validation failed")
         spec = _require_mapping(payload.get("spec"), "service.spec")
         raw_ports = spec.get("ports")
@@ -322,13 +361,18 @@ class AKSPortForward:
         raise AKSPortForwardError("AKS Service does not expose a TCP port")
 
     def _validate_endpoints(self) -> None:
-        payload = self._kubectl_get("endpoints", self.serving.service, "AKS endpoints lookup failed")
+        payload = self._kubectl_get(
+            "endpoints", self.serving.service, "AKS endpoints lookup failed"
+        )
         metadata = _require_mapping(payload.get("metadata"), "endpoints.metadata")
-        if metadata.get("name") != self.serving.service or metadata.get("namespace") != self.serving.namespace:
+        if (
+            metadata.get("name") != self.serving.service
+            or metadata.get("namespace") != self.serving.namespace
+        ):
             raise AKSPortForwardError("AKS endpoints validation failed")
         raw_subsets = payload.get("subsets")
         if not isinstance(raw_subsets, list) or not raw_subsets:
-            raise AKSPortForwardError("AKS Service must expose Ready endpoints")
+            raise AKSPreflightTransientError("AKS Service must expose Ready endpoints")
         ready_addresses = 0
         for item in raw_subsets:
             subset = _require_mapping(item, "endpoints subset")
@@ -337,47 +381,57 @@ class AKSPortForward:
             if not isinstance(addresses, list) or not isinstance(not_ready, list):
                 raise AKSPortForwardError("AKS endpoints payload is invalid")
             if not_ready:
-                raise AKSPortForwardError("AKS Service must expose Ready endpoints only")
+                raise AKSPreflightTransientError(
+                    "AKS Service must expose Ready endpoints only"
+                )
             ready_addresses += len(addresses)
         if ready_addresses == 0:
-            raise AKSPortForwardError("AKS Service must expose Ready endpoints")
+            raise AKSPreflightTransientError("AKS Service must expose Ready endpoints")
 
-    def _kubectl_get(self, resource_type: str, resource_name: str, error_message: str) -> Mapping[str, Any]:
+    def _kubectl_get(
+        self, resource_type: str, resource_name: str, error_message: str
+    ) -> Mapping[str, Any]:
         assert self._kubeconfig_path is not None
-        result = self.command_runner(
-            (
-                "kubectl",
-                "--kubeconfig",
-                str(self._kubeconfig_path),
-                "--namespace",
-                self.serving.namespace,
-                "get",
-                resource_type,
-                resource_name,
-                "--output",
-                "json",
+        try:
+            result = self.command_runner(
+                (
+                    "kubectl",
+                    "--kubeconfig",
+                    str(self._kubeconfig_path),
+                    "--namespace",
+                    self.serving.namespace,
+                    "get",
+                    resource_type,
+                    resource_name,
+                    "--output",
+                    "json",
+                )
             )
-        )
+        except FileNotFoundError as exc:
+            raise AKSMissingToolError("kubectl not found") from exc
         if result.returncode != 0:
             raise AKSPortForwardError(error_message)
         return self._load_json(result.stdout, resource_type)
 
     def _start_port_forward(self, service_port: int) -> None:
         assert self._kubeconfig_path is not None
-        self._process = self.process_launcher(
-            (
-                "kubectl",
-                "--kubeconfig",
-                str(self._kubeconfig_path),
-                "--namespace",
-                self.serving.namespace,
-                "port-forward",
-                "--address",
-                "127.0.0.1",
-                f"service/{self.serving.service}",
-                f":{service_port}",
+        try:
+            self._process = self.process_launcher(
+                (
+                    "kubectl",
+                    "--kubeconfig",
+                    str(self._kubeconfig_path),
+                    "--namespace",
+                    self.serving.namespace,
+                    "port-forward",
+                    "--address",
+                    "127.0.0.1",
+                    f"service/{self.serving.service}",
+                    f":{service_port}",
+                )
             )
-        )
+        except FileNotFoundError as exc:
+            raise AKSMissingToolError("kubectl not found") from exc
         local_port = self._wait_for_port_forward()
         self._base_url = f"http://127.0.0.1:{local_port}"
 
@@ -392,19 +446,25 @@ class AKSPortForward:
                 return int(match.group(1))
             returncode = self._process.poll()
             if returncode is not None:
-                raise AKSPortForwardError("port-forward exited before it became ready")
+                raise AKSPreflightTransientError(
+                    "port-forward exited before it became ready"
+                )
             if self.monotonic_clock() >= deadline:
-                raise AKSPortForwardTimeoutError("timed out waiting for port-forward readiness")
+                raise AKSPortForwardTimeoutError(
+                    "timed out waiting for port-forward readiness"
+                )
             if len(output) > 4096:
                 output = output[-4096:]
 
     def _probe_models(self) -> None:
         try:
-            payload = _require_mapping(self.http_get_json(f"{self.base_url}/v1/models"), "models probe")
+            payload = _require_mapping(
+                self.http_get_json(f"{self.base_url}/v1/models"), "models probe"
+            )
         except AKSPortForwardError:
             raise
         except Exception as exc:
-            raise AKSPortForwardError("model probe failed") from exc
+            raise AKSPreflightTransientError("model probe failed") from exc
         raw_models = payload.get("data")
         if not isinstance(raw_models, list):
             raise AKSPortForwardError("model probe returned an invalid payload")
@@ -414,7 +474,9 @@ class AKSPortForward:
             if isinstance(item.get("id"), str)
         }
         if self.serving.model not in model_ids:
-            raise AKSPortForwardError(f"model probe did not advertise model {self.serving.model}")
+            raise AKSPreflightTransientError(
+                f"model probe did not advertise model {self.serving.model}"
+            )
 
     def _load_json(self, text: str, context: str) -> Mapping[str, Any]:
         try:
@@ -460,7 +522,9 @@ class AKSPortForward:
         if process.poll() is not None:
             self._reap_process(process)
 
-    def _wait_for_process_exit(self, process: _PortForwardProcess, timeout: float) -> bool:
+    def _wait_for_process_exit(
+        self, process: _PortForwardProcess, timeout: float
+    ) -> bool:
         try:
             process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:

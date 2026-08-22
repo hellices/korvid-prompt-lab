@@ -9,7 +9,12 @@ from typing import Any
 
 import dspy  # type: ignore[import-untyped]
 
-from .aks import AKSPortForward, AKSPortForwardError
+from .aks import (
+    AKSMissingToolError,
+    AKSPortForward,
+    AKSPortForwardError,
+    AKSPreflightTransientError,
+)
 from .artifacts import write_json_artifact
 from .bridge_worker import EXECUTION_MODE_LIVE
 from .config import load_campaign, load_candidate
@@ -28,11 +33,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="korvid-prompt-lab")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    validate_parser = subparsers.add_parser("validate", help="Validate candidate and campaign inputs.")
+    validate_parser = subparsers.add_parser(
+        "validate", help="Validate candidate and campaign inputs."
+    )
     _add_candidate_campaign_arguments(validate_parser)
     validate_parser.set_defaults(func=command_validate)
 
-    evaluate_parser = subparsers.add_parser("evaluate", help="Run bridge evaluation and emit a summary artifact.")
+    evaluate_parser = subparsers.add_parser(
+        "evaluate", help="Run bridge evaluation and emit a summary artifact."
+    )
     _add_candidate_campaign_arguments(evaluate_parser)
     evaluate_parser.add_argument(
         "--artifact-root",
@@ -74,10 +83,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="common",
         help="Bundle kind recorded in the evaluation summary.",
     )
-    evaluate_parser.add_argument("--json", action="store_true", help="Write the evaluation summary JSON to stdout.")
+    evaluate_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Write the evaluation summary JSON to stdout.",
+    )
     evaluate_parser.set_defaults(func=command_evaluate)
 
-    optimize_parser = subparsers.add_parser("optimize", help="Run GEPA optimization with DSPy reflection.")
+    optimize_parser = subparsers.add_parser(
+        "optimize", help="Run GEPA optimization with DSPy reflection."
+    )
     _add_candidate_campaign_arguments(optimize_parser)
     optimize_parser.add_argument(
         "--artifact-root",
@@ -120,8 +135,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     optimize_parser.set_defaults(func=command_optimize)
 
-    aks_parser = subparsers.add_parser("aks-check", help="Perform a read-only AKS serving preflight.")
-    aks_parser.add_argument("--campaign", type=Path, required=True, help="Path to a campaign YAML file.")
+    aks_parser = subparsers.add_parser(
+        "aks-check", help="Perform a read-only AKS serving preflight."
+    )
+    aks_parser.add_argument(
+        "--campaign", type=Path, required=True, help="Path to a campaign YAML file."
+    )
     aks_parser.add_argument(
         "--artifact-root",
         type=Path,
@@ -130,9 +149,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     aks_parser.set_defaults(func=command_aks_check)
 
-    publish_parser = subparsers.add_parser("publish", help="Publish a prompt bundle into a registry.")
+    publish_parser = subparsers.add_parser(
+        "publish", help="Publish a prompt bundle into a registry."
+    )
     _add_candidate_campaign_arguments(publish_parser)
-    publish_parser.add_argument("--model-metadata", type=Path, required=True, help="Path to model metadata JSON.")
+    publish_parser.add_argument(
+        "--model-metadata",
+        type=Path,
+        required=True,
+        help="Path to model metadata JSON.",
+    )
     publish_parser.add_argument(
         "--evaluation-summary",
         type=Path,
@@ -160,8 +186,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _add_candidate_campaign_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--candidate", type=Path, required=True, help="Path to a candidate YAML file.")
-    parser.add_argument("--campaign", type=Path, required=True, help="Path to a campaign YAML file.")
+    parser.add_argument(
+        "--candidate", type=Path, required=True, help="Path to a candidate YAML file."
+    )
+    parser.add_argument(
+        "--campaign", type=Path, required=True, help="Path to a campaign YAML file."
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -232,7 +262,9 @@ def command_evaluate(args: argparse.Namespace) -> int:
         print(f"evaluation failed: {exc}", file=_stderr())
         return 1
 
-    summary_path = write_json_artifact(artifact_root / "evaluation-summary.json", summary)
+    summary_path = write_json_artifact(
+        artifact_root / "evaluation-summary.json", summary
+    )
     summary["artifact_refs"] = _collect_artifact_refs(artifact_root)
     summary_path = write_json_artifact(summary_path, summary)
 
@@ -254,7 +286,10 @@ def command_evaluate(args: argparse.Namespace) -> int:
         )
 
     if unsafe:
-        print("evaluation failed: one or more runs produced hard safety failures", file=_stderr())
+        print(
+            "evaluation failed: one or more runs produced hard safety failures",
+            file=_stderr(),
+        )
     return exit_code
 
 
@@ -270,7 +305,9 @@ def command_optimize(args: argparse.Namespace) -> int:
         _require_case_selection("--validation-case-id", args.validation_case_ids)
         _require_disjoint_case_selections(args.train_case_ids, args.validation_case_ids)
         train_cases = _expand_cases(_select_cases(campaign.cases, args.train_case_ids))
-        validation_cases = _expand_cases(_select_cases(campaign.cases, args.validation_case_ids))
+        validation_cases = _expand_cases(
+            _select_cases(campaign.cases, args.validation_case_ids)
+        )
     except (OSError, ValueError) as exc:
         print(f"optimization failed: {exc}", file=_stderr())
         return 2
@@ -308,7 +345,10 @@ def command_aks_check(args: argparse.Namespace) -> int:
 
     serving = campaign.serving
     if not isinstance(serving, AKSPortForwardServing):
-        print("aks-check failed: campaign does not use aks_port_forward serving", file=_stderr())
+        print(
+            "aks-check failed: campaign does not use aks_port_forward serving",
+            file=_stderr(),
+        )
         return 2
 
     try:
@@ -316,6 +356,12 @@ def command_aks_check(args: argparse.Namespace) -> int:
             print(
                 f"aks preflight passed campaign={campaign.campaign_id} model={serving.model} endpoint={forward.base_url}"
             )
+    except AKSMissingToolError as exc:
+        print(f"aks-check failed: {exc}", file=_stderr())
+        return 1
+    except AKSPreflightTransientError as exc:
+        print(f"aks-check failed (transient): {exc}", file=_stderr())
+        return 75
     except AKSPortForwardError as exc:
         print(f"aks-check failed: {exc}", file=_stderr())
         return 1
@@ -329,7 +375,9 @@ def command_publish(args: argparse.Namespace) -> int:
         evaluation_summary = _load_json_file(args.evaluation_summary)
         if not isinstance(model_metadata, dict):
             raise ValueError("model metadata must be a JSON object")  # noqa: TRY004 - preserve validation API
-        _validate_publish_summary(evaluation_summary, candidate, campaign, model_metadata)
+        _validate_publish_summary(
+            evaluation_summary, candidate, campaign, model_metadata
+        )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"publish failed: {exc}", file=_stderr())
         return 2
@@ -374,7 +422,9 @@ def _serving_session(campaign: Campaign, workspace_dir: Path) -> Iterator[str | 
         yield forward.base_url
 
 
-def _load_candidate_campaign(candidate_path: Path, campaign_path: Path) -> tuple[Candidate, Campaign]:
+def _load_candidate_campaign(
+    candidate_path: Path, campaign_path: Path
+) -> tuple[Candidate, Campaign]:
     return load_candidate(candidate_path), load_campaign(campaign_path)
 
 
@@ -382,13 +432,19 @@ def _load_json_file(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _select_cases(cases: Sequence[EvalCase], requested_case_ids: Sequence[str]) -> tuple[EvalCase, ...]:
+def _select_cases(
+    cases: Sequence[EvalCase], requested_case_ids: Sequence[str]
+) -> tuple[EvalCase, ...]:
     if not requested_case_ids:
         return tuple(cases)
 
     requested = list(dict.fromkeys(requested_case_ids))
     selected = [case for case in cases if case.case_id in requested]
-    missing = [case_id for case_id in requested if case_id not in {case.case_id for case in selected}]
+    missing = [
+        case_id
+        for case_id in requested
+        if case_id not in {case.case_id for case in selected}
+    ]
     if missing:
         raise ValueError(f"unknown case_id value(s): {', '.join(missing)}")
     return tuple(selected)
@@ -418,10 +474,14 @@ def _require_case_selection(flag: str, case_ids: Sequence[str]) -> list[str]:
     return selection
 
 
-def _require_disjoint_case_selections(train_case_ids: Sequence[str], validation_case_ids: Sequence[str]) -> None:
+def _require_disjoint_case_selections(
+    train_case_ids: Sequence[str], validation_case_ids: Sequence[str]
+) -> None:
     overlap = sorted(set(train_case_ids) & set(validation_case_ids))
     if overlap:
-        raise ValueError(f"train and validation case sets must be disjoint: {', '.join(overlap)}")
+        raise ValueError(
+            f"train and validation case sets must be disjoint: {', '.join(overlap)}"
+        )
 
 
 def _require_non_negative_seed(seed: int) -> int:
@@ -430,9 +490,13 @@ def _require_non_negative_seed(seed: int) -> int:
     return seed
 
 
-def _resolve_case_sets(args: argparse.Namespace, evaluated_case_ids: Sequence[str]) -> dict[str, list[str]]:
+def _resolve_case_sets(
+    args: argparse.Namespace, evaluated_case_ids: Sequence[str]
+) -> dict[str, list[str]]:
     train_case_ids = _require_case_selection("--train-case-id", args.train_case_ids)
-    validation_case_ids = _require_case_selection("--validation-case-id", args.validation_case_ids)
+    validation_case_ids = _require_case_selection(
+        "--validation-case-id", args.validation_case_ids
+    )
     _require_disjoint_case_selections(train_case_ids, validation_case_ids)
     milestone_case_ids = list(dict.fromkeys(args.milestone_case_ids))
 
@@ -444,7 +508,9 @@ def _resolve_case_sets(args: argparse.Namespace, evaluated_case_ids: Sequence[st
     ):
         missing = [case_id for case_id in case_ids if case_id not in evaluated]
         if missing:
-            raise ValueError(f"{label} case set must be drawn from the evaluated cases: {', '.join(missing)}")
+            raise ValueError(
+                f"{label} case set must be drawn from the evaluated cases: {', '.join(missing)}"
+            )
 
     return {
         "train": train_case_ids,
@@ -474,7 +540,9 @@ def _evaluate_campaign(
     for case in executed_cases:
         for repetition in range(1, campaign.repetitions + 1):
             run_dir = artifact_root / "runs" / _case_run_slug(case, repetition)
-            result = runner.run(candidate, case, run_dir, repetition=repetition, seed=repetition - 1)
+            result = runner.run(
+                candidate, case, run_dir, repetition=repetition, seed=repetition - 1
+            )
             scored = score_result(result)
             run_records.append(
                 {
@@ -487,7 +555,9 @@ def _evaluate_campaign(
                     "score": scored.score,
                     "status": result.status,
                     "execution_mode": result.execution_mode,
-                    "hard_failures": list(result.grade.hard_failures) if result.grade is not None else [],
+                    "hard_failures": list(result.grade.hard_failures)
+                    if result.grade is not None
+                    else [],
                 }
             )
             repetition_outcomes.append(
@@ -499,7 +569,9 @@ def _evaluate_campaign(
                 )
             )
             scores.append(scored.score)
-            hard_safety_failures += len(result.grade.hard_failures) if result.grade is not None else 0
+            hard_safety_failures += (
+                len(result.grade.hard_failures) if result.grade is not None else 0
+            )
 
     campaign_case_ids = [case.case_id for case in campaign.cases]
     evaluated_case_ids = list(dict.fromkeys(case.case_id for case in selected_cases))
@@ -520,7 +592,8 @@ def _evaluate_campaign(
             dict.fromkeys(
                 case_id
                 for case_id, _ in (
-                    _decode_case_model_pair(pair, "campaign_case_model_pairs") for pair in expected_target_pairs
+                    _decode_case_model_pair(pair, "campaign_case_model_pairs")
+                    for pair in expected_target_pairs
                 )
             )
         )
@@ -535,9 +608,13 @@ def _evaluate_campaign(
     requested_milestone_case_ids = list(dict.fromkeys(case_sets.get("milestone", ())))
     if requested_milestone_case_ids:
         milestone_case_ids = requested_milestone_case_ids
-        milestone_covers_required_pack = set(milestone_case_ids) == set(required_milestone_case_ids)
+        milestone_covers_required_pack = set(milestone_case_ids) == set(
+            required_milestone_case_ids
+        )
     else:
-        milestone_case_ids = list(required_milestone_case_ids) if full_milestone_pack_executed else []
+        milestone_case_ids = (
+            list(required_milestone_case_ids) if full_milestone_pack_executed else []
+        )
         milestone_covers_required_pack = full_milestone_pack_executed
     summary: dict[str, Any] = {
         "bundle_kind": bundle_kind,
@@ -561,7 +638,9 @@ def _evaluate_campaign(
         "hard_safety_failures": hard_safety_failures,
         "systemic_failures": 0,
         "milestone_passed": (
-            hard_safety_failures == 0 and full_milestone_pack_executed and milestone_covers_required_pack
+            hard_safety_failures == 0
+            and full_milestone_pack_executed
+            and milestone_covers_required_pack
         ),
         "case_sets": {
             "train": list(case_sets["train"]),
@@ -575,8 +654,12 @@ def _evaluate_campaign(
 
 
 def _case_run_slug(case: EvalCase, repetition: int) -> str:
-    normalized_case_id = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in case.case_id).strip("-")
-    normalized_model = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in case.models[0]).strip("-")
+    normalized_case_id = "".join(
+        ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in case.case_id
+    ).strip("-")
+    normalized_model = "".join(
+        ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in case.models[0]
+    ).strip("-")
     return f"{normalized_case_id or 'case'}-{normalized_model or 'model'}-r{repetition:02d}"
 
 
@@ -664,7 +747,10 @@ def _evaluate_reproduction_command(args: argparse.Namespace) -> list[str]:
 
 
 def _validate_publish_summary(
-    summary: Any, candidate: Candidate, campaign: Campaign, model_metadata: dict[str, Any]
+    summary: Any,
+    candidate: Candidate,
+    campaign: Campaign,
+    model_metadata: dict[str, Any],
 ) -> None:
     if not isinstance(summary, dict):
         raise ValueError("evaluation summary must be a JSON object")  # noqa: TRY004 - preserve validation API
@@ -672,9 +758,15 @@ def _validate_publish_summary(
     candidate_id = _require_string_field(summary, "candidate_id")
     candidate_fingerprint = _require_string_field(summary, "candidate_fingerprint")
     campaign_id = _require_string_field(summary, "campaign_id")
-    campaign_case_ids = _require_unique_string_list(summary.get("campaign_case_ids"), "campaign_case_ids")
-    evaluated_case_ids = _require_unique_string_list(summary.get("evaluated_case_ids"), "evaluated_case_ids")
-    evaluated_models = _require_unique_string_list(summary.get("evaluated_models"), "evaluated_models")
+    campaign_case_ids = _require_unique_string_list(
+        summary.get("campaign_case_ids"), "campaign_case_ids"
+    )
+    evaluated_case_ids = _require_unique_string_list(
+        summary.get("evaluated_case_ids"), "evaluated_case_ids"
+    )
+    evaluated_models = _require_unique_string_list(
+        summary.get("evaluated_models"), "evaluated_models"
+    )
     _require_live_execution_modes(summary)
     campaign_case_model_pairs = _require_unique_string_list(
         summary.get("campaign_case_model_pairs"), "campaign_case_model_pairs"
@@ -691,29 +783,58 @@ def _validate_publish_summary(
     target_model = _require_string_field(model_metadata, "model_family")
 
     if candidate_id != candidate.candidate_id:
-        raise ValueError("evaluation summary candidate_id does not match the candidate file")
+        raise ValueError(
+            "evaluation summary candidate_id does not match the candidate file"
+        )
     if candidate_fingerprint != candidate.fingerprint:
-        raise ValueError("evaluation summary candidate_fingerprint does not match the candidate file")
+        raise ValueError(
+            "evaluation summary candidate_fingerprint does not match the candidate file"
+        )
     if campaign_id != campaign.campaign_id:
-        raise ValueError("evaluation summary campaign_id does not match the campaign file")
+        raise ValueError(
+            "evaluation summary campaign_id does not match the campaign file"
+        )
     if set(campaign_case_ids) != expected_campaign_case_id_set:
-        raise ValueError("evaluation summary campaign_case_ids do not match the campaign file")
+        raise ValueError(
+            "evaluation summary campaign_case_ids do not match the campaign file"
+        )
     if set(campaign_case_model_pairs) != expected_case_model_pair_set:
-        raise ValueError("evaluation summary campaign_case_model_pairs do not match the campaign file")
-    if any(case_id not in expected_campaign_case_id_set for case_id in evaluated_case_ids):
-        raise ValueError("evaluation summary evaluated_case_ids must be drawn from the campaign")
+        raise ValueError(
+            "evaluation summary campaign_case_model_pairs do not match the campaign file"
+        )
+    if any(
+        case_id not in expected_campaign_case_id_set for case_id in evaluated_case_ids
+    ):
+        raise ValueError(
+            "evaluation summary evaluated_case_ids must be drawn from the campaign"
+        )
     if any(model not in expected_models for model in evaluated_models):
-        raise ValueError("evaluation summary evaluated_models must be drawn from the campaign")
+        raise ValueError(
+            "evaluation summary evaluated_models must be drawn from the campaign"
+        )
     if target_model not in expected_models or target_model not in set(evaluated_models):
-        raise ValueError("model metadata model_family must be present in the evaluated campaign models")
-    if any(pair not in expected_case_model_pair_set for pair in evaluated_case_model_pairs):
-        raise ValueError("evaluation summary evaluated_case_model_pairs must be drawn from the campaign")
+        raise ValueError(
+            "model metadata model_family must be present in the evaluated campaign models"
+        )
+    if any(
+        pair not in expected_case_model_pair_set for pair in evaluated_case_model_pairs
+    ):
+        raise ValueError(
+            "evaluation summary evaluated_case_model_pairs must be drawn from the campaign"
+        )
 
-    evaluated_pair_components = [_decode_case_model_pair(pair, "evaluated_case_model_pairs") for pair in evaluated_case_model_pairs]
+    evaluated_pair_components = [
+        _decode_case_model_pair(pair, "evaluated_case_model_pairs")
+        for pair in evaluated_case_model_pairs
+    ]
     if {case_id for case_id, _ in evaluated_pair_components} != set(evaluated_case_ids):
-        raise ValueError("evaluation summary evaluated_case_ids must match evaluated_case_model_pairs")
+        raise ValueError(
+            "evaluation summary evaluated_case_ids must match evaluated_case_model_pairs"
+        )
     if {model for _, model in evaluated_pair_components} != set(evaluated_models):
-        raise ValueError("evaluation summary evaluated_models must match evaluated_case_model_pairs")
+        raise ValueError(
+            "evaluation summary evaluated_models must match evaluated_case_model_pairs"
+        )
 
     bundle_kind = summary.get("bundle_kind")
     if bundle_kind == "common" and (
@@ -721,25 +842,50 @@ def _validate_publish_summary(
         or set(evaluated_models) != expected_models
         or set(evaluated_case_model_pairs) != expected_case_model_pair_set
     ):
-        raise ValueError("common publication requires the full campaign case pack and case-model matrix")
+        raise ValueError(
+            "common publication requires the full campaign case pack and case-model matrix"
+        )
 
     if bundle_kind == "model-specific":
         case_sets = summary.get("case_sets")
         if not isinstance(case_sets, dict):
             raise ValueError("evaluation summary case_sets must be an object")
-        milestone_case_ids = _require_unique_string_list(case_sets.get("milestone"), "case_sets.milestone")
-        expected_target_pairs = [pair for pair in expected_case_model_pairs if _decode_case_model_pair(pair, "campaign_case_model_pairs")[1] == target_model]
-        expected_target_case_ids = list(dict.fromkeys(case_id for case_id, _ in (_decode_case_model_pair(pair, "campaign_case_model_pairs") for pair in expected_target_pairs)))
+        milestone_case_ids = _require_unique_string_list(
+            case_sets.get("milestone"), "case_sets.milestone"
+        )
+        expected_target_pairs = [
+            pair
+            for pair in expected_case_model_pairs
+            if _decode_case_model_pair(pair, "campaign_case_model_pairs")[1]
+            == target_model
+        ]
+        expected_target_case_ids = list(
+            dict.fromkeys(
+                case_id
+                for case_id, _ in (
+                    _decode_case_model_pair(pair, "campaign_case_model_pairs")
+                    for pair in expected_target_pairs
+                )
+            )
+        )
         if not expected_target_pairs:
-            raise ValueError("model-specific publication target model is not present in the campaign")
+            raise ValueError(
+                "model-specific publication target model is not present in the campaign"
+            )
         if set(evaluated_models) != {target_model}:
-            raise ValueError("model-specific publication must be bound to the target model only")
+            raise ValueError(
+                "model-specific publication must be bound to the target model only"
+            )
         if set(milestone_case_ids) != set(expected_target_case_ids):
-            raise ValueError("model-specific publication requires the full milestone case pack")
-        if set(evaluated_case_ids) != set(expected_target_case_ids) or set(evaluated_case_model_pairs) != set(
-            expected_target_pairs
-        ):
-            raise ValueError("model-specific publication requires the full target-model case pack")
+            raise ValueError(
+                "model-specific publication requires the full milestone case pack"
+            )
+        if set(evaluated_case_ids) != set(expected_target_case_ids) or set(
+            evaluated_case_model_pairs
+        ) != set(expected_target_pairs):
+            raise ValueError(
+                "model-specific publication requires the full target-model case pack"
+            )
 
 
 def _require_live_execution_modes(summary: dict[str, Any]) -> list[str]:
@@ -750,7 +896,9 @@ def _require_live_execution_modes(summary: dict[str, Any]) -> list[str]:
     the model never earned, and a mixed summary is no better: part of the evidence
     would still be model-free.
     """
-    modes = _require_unique_string_list(summary.get("execution_modes"), "execution_modes")
+    modes = _require_unique_string_list(
+        summary.get("execution_modes"), "execution_modes"
+    )
     if sorted(modes) != [EXECUTION_MODE_LIVE]:
         raise ValueError(
             "evaluation summary execution_modes must be exactly ['live']; scripted bridge"
@@ -768,14 +916,20 @@ def _require_string_field(summary: dict[str, Any], field_name: str) -> str:
 
 def _require_unique_string_list(value: Any, field_name: str) -> list[str]:
     if not isinstance(value, list) or not value:
-        raise ValueError(f"evaluation summary {field_name} must be a non-empty list of strings")
+        raise ValueError(
+            f"evaluation summary {field_name} must be a non-empty list of strings"
+        )
     normalized: list[str] = []
     seen: set[str] = set()
     for item in value:
         if not isinstance(item, str) or not item.strip():
-            raise ValueError(f"evaluation summary {field_name} must be a non-empty list of strings")
+            raise ValueError(
+                f"evaluation summary {field_name} must be a non-empty list of strings"
+            )
         if item in seen:
-            raise ValueError(f"evaluation summary {field_name} must not contain duplicates")
+            raise ValueError(
+                f"evaluation summary {field_name} must not contain duplicates"
+            )
         normalized.append(item)
         seen.add(item)
     return normalized
@@ -788,7 +942,9 @@ def _encode_case_model_pair(case_id: str, model: str) -> str:
 def _decode_case_model_pair(value: str, field_name: str) -> tuple[str, str]:
     case_id, separator, model = value.partition("::")
     if not separator or not case_id or not model:
-        raise ValueError(f"evaluation summary {field_name} entries must use '<case_id>::<model>'")
+        raise ValueError(
+            f"evaluation summary {field_name} entries must use '<case_id>::<model>'"
+        )
     return case_id, model
 
 

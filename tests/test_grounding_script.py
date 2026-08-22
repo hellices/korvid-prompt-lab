@@ -94,12 +94,16 @@ _FAKE_PARSER_SPEC: dict[str, dict[str, str]] = {
 def recorded_argv(calls: Sequence[str], prefix: str) -> list[str]:
     """Reconstruct the argv the orchestrator passed for one subcommand."""
     counts = [line for line in calls if line.startswith(f"{prefix} argc=")]
-    assert len(counts) == 1, f"expected exactly one {prefix!r} invocation, got {len(counts)}"
+    assert len(counts) == 1, (
+        f"expected exactly one {prefix!r} invocation, got {len(counts)}"
+    )
     expected_argc = int(counts[0].split("=", 1)[1])
 
     marker = f"{prefix} arg="
     argv = [line[len(marker) :] for line in calls if line.startswith(marker)]
-    assert len(argv) == expected_argc, f"{prefix} argc={expected_argc} but recorded {len(argv)} args"
+    assert len(argv) == expected_argc, (
+        f"{prefix} argc={expected_argc} but recorded {len(argv)} args"
+    )
     return argv
 
 
@@ -218,8 +222,14 @@ def _run_script_with_signal(
     # first so bash can deliver the pending signal to its INT trap.
     os.killpg(proc.pid, sig)
     stdout, stderr = proc.communicate(timeout=15)
-    calls = [line for line in calls_file.read_text(encoding="utf-8").splitlines() if line.strip()]
-    return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr), calls
+    calls = [
+        line
+        for line in calls_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    return subprocess.CompletedProcess(
+        proc.args, proc.returncode, stdout, stderr
+    ), calls
 
 
 def _make_fake_bin(
@@ -448,7 +458,11 @@ def run_script(
         env=env,
         timeout=30,
     )
-    calls = [line for line in calls_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    calls = [
+        line
+        for line in calls_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
     return result, calls
 
 
@@ -457,7 +471,9 @@ def run_script(
 # ---------------------------------------------------------------------------
 
 
-def test_round_script_restores_zero_count_after_unsafe_evaluation(tmp_path: Path) -> None:
+def test_round_script_restores_zero_count_after_unsafe_evaluation(
+    tmp_path: Path,
+) -> None:
     """evaluate exit=1 must still run report and restore node-count to 0."""
     result, calls = run_script(tmp_path, original_count=0, evaluation_exit=1)
 
@@ -476,7 +492,9 @@ def test_round_script_never_scales_down_preexisting_capacity(tmp_path: Path) -> 
     assert "scale:0" not in calls
 
 
-def test_round_script_restores_pool_on_signal_or_systemic_failure(tmp_path: Path) -> None:
+def test_round_script_restores_pool_on_signal_or_systemic_failure(
+    tmp_path: Path,
+) -> None:
     """When aks-check (preflight) fails the pool must be restored to 0."""
     result, calls = run_script(tmp_path, original_count=0, preflight_exit=1)
 
@@ -515,7 +533,9 @@ def test_round_script_preserves_evaluate_exit_1_as_final_exit(tmp_path: Path) ->
     assert "report" in calls
 
 
-def test_round_script_optimize_evaluate_runs_optimize_then_evaluate(tmp_path: Path) -> None:
+def test_round_script_optimize_evaluate_runs_optimize_then_evaluate(
+    tmp_path: Path,
+) -> None:
     """optimize-evaluate round must call optimize then evaluate."""
     result, calls = run_script(
         tmp_path,
@@ -530,7 +550,9 @@ def test_round_script_optimize_evaluate_runs_optimize_then_evaluate(tmp_path: Pa
     assert calls.index("optimize") < calls.index("evaluate")
 
 
-def test_round_script_optimize_evaluate_uses_invocation_artifacts_and_preserves_spaced_paths(tmp_path: Path) -> None:
+def test_round_script_optimize_evaluate_uses_invocation_artifacts_and_preserves_spaced_paths(
+    tmp_path: Path,
+) -> None:
     """optimize-evaluate must use the invocation-layout artifacts and keep spaced paths as one argv token."""
     result, calls = run_script(
         tmp_path,
@@ -541,12 +563,20 @@ def test_round_script_optimize_evaluate_uses_invocation_artifacts_and_preserves_
     )
 
     assert result.returncode == 0, result.stderr
-    assert f"evaluate arg={tmp_path / 'artifacts with spaces' / 'optimize' / 'invocations' / 'opt-run-1' / 'best-candidate.yaml'}" in calls
+    assert (
+        f"evaluate arg={tmp_path / 'artifacts with spaces' / 'optimize' / 'invocations' / 'opt-run-1' / 'best-candidate.yaml'}"
+        in calls
+    )
     assert f"report arg={tmp_path / 'artifacts with spaces' / 'evaluate'}" in calls
-    assert f"report arg={tmp_path / 'artifacts with spaces' / 'optimize' / 'invocations' / 'opt-run-1'}" in calls
+    assert (
+        f"report arg={tmp_path / 'artifacts with spaces' / 'optimize' / 'invocations' / 'opt-run-1'}"
+        in calls
+    )
 
 
-def test_round_script_optimize_evaluate_rejects_missing_best_candidate(tmp_path: Path) -> None:
+def test_round_script_optimize_evaluate_rejects_missing_best_candidate(
+    tmp_path: Path,
+) -> None:
     """optimize-evaluate must fail when optimize does not produce exactly one best-candidate file."""
     result, calls = run_script(
         tmp_path,
@@ -562,7 +592,9 @@ def test_round_script_optimize_evaluate_rejects_missing_best_candidate(tmp_path:
     assert "report" not in calls
 
 
-def test_round_script_optimize_evaluate_rejects_ambiguous_best_candidate(tmp_path: Path) -> None:
+def test_round_script_optimize_evaluate_rejects_ambiguous_best_candidate(
+    tmp_path: Path,
+) -> None:
     """optimize-evaluate must fail when optimize leaves multiple invocation best-candidate files."""
     result, calls = run_script(
         tmp_path,
@@ -583,23 +615,37 @@ def test_round_script_optimize_evaluate_rejects_ambiguous_best_candidate(tmp_pat
 # ---------------------------------------------------------------------------
 
 
-def test_round_script_sigint_exits_130_and_scales_down_exactly_once(tmp_path: Path) -> None:
+def test_round_script_sigint_exits_130_and_scales_down_exactly_once(
+    tmp_path: Path,
+) -> None:
     """SIGINT must exit 130 and execute nodepool scale-down exactly once."""
     result, calls = _run_script_with_signal(tmp_path, signal.SIGINT, original_count=0)
 
-    assert result.returncode == 130, f"expected 130, got {result.returncode}\nstderr: {result.stderr}"
-    assert calls.count("scale:0") == 1, f"expected exactly 1 scale:0, got {calls.count('scale:0')}\ncalls: {calls}"
+    assert result.returncode == 130, (
+        f"expected 130, got {result.returncode}\nstderr: {result.stderr}"
+    )
+    assert calls.count("scale:0") == 1, (
+        f"expected exactly 1 scale:0, got {calls.count('scale:0')}\ncalls: {calls}"
+    )
 
 
-def test_round_script_sigterm_exits_143_and_scales_down_exactly_once(tmp_path: Path) -> None:
+def test_round_script_sigterm_exits_143_and_scales_down_exactly_once(
+    tmp_path: Path,
+) -> None:
     """SIGTERM must exit 143 and execute nodepool scale-down exactly once."""
     result, calls = _run_script_with_signal(tmp_path, signal.SIGTERM, original_count=0)
 
-    assert result.returncode == 143, f"expected 143, got {result.returncode}\nstderr: {result.stderr}"
-    assert calls.count("scale:0") == 1, f"expected exactly 1 scale:0, got {calls.count('scale:0')}\ncalls: {calls}"
+    assert result.returncode == 143, (
+        f"expected 143, got {result.returncode}\nstderr: {result.stderr}"
+    )
+    assert calls.count("scale:0") == 1, (
+        f"expected exactly 1 scale:0, got {calls.count('scale:0')}\ncalls: {calls}"
+    )
 
 
-def test_round_script_sigint_no_scale_when_pool_already_had_capacity(tmp_path: Path) -> None:
+def test_round_script_sigint_no_scale_when_pool_already_had_capacity(
+    tmp_path: Path,
+) -> None:
     """SIGINT on a pre-existing pool must not trigger any scale-down."""
     result, calls = _run_script_with_signal(tmp_path, signal.SIGINT, original_count=1)
 
@@ -625,7 +671,11 @@ def test_round_script_optimize_credential_not_in_argv(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "optimize" in calls
     # The credential value must not appear in any recorded argument
-    leaked = [line for line in calls if line.startswith("optimize arg=") and credential in line]
+    leaked = [
+        line
+        for line in calls
+        if line.startswith("optimize arg=") and credential in line
+    ]
     assert not leaked, f"credential leaked into optimize argv: {leaked}"
 
 
@@ -640,7 +690,9 @@ def test_round_script_optimize_credential_not_in_report_args(tmp_path: Path) -> 
     )
 
     assert result.returncode == 0, result.stderr
-    leaked = [line for line in calls if line.startswith("report arg=") and credential in line]
+    leaked = [
+        line for line in calls if line.startswith("report arg=") and credential in line
+    ]
     assert not leaked, f"credential leaked into report argv: {leaked}"
 
 
@@ -678,7 +730,9 @@ def test_round_script_rejects_optimize_without_reflection_credential_before_any_
     assert calls == []
 
 
-def test_round_script_evaluate_round_ignores_absent_reflection_config(tmp_path: Path) -> None:
+def test_round_script_evaluate_round_ignores_absent_reflection_config(
+    tmp_path: Path,
+) -> None:
     """Evaluate-only rounds must run without any reflection credential."""
     result, calls = run_script(
         tmp_path,
@@ -813,10 +867,14 @@ def test_round_script_evaluate_argv_carries_campaign_case_sets(tmp_path: Path) -
     assert option_value(argv, "--train-case-id") == TRAIN_CASE_ID
     assert option_value(argv, "--validation-case-id") == VALIDATION_CASE_ID
     assert option_values(argv, "--milestone-case-id") == MILESTONE_CASE_IDS.split(",")
-    assert option_value(argv, "--artifact-root") == str(tmp_path / "artifacts" / "evaluate")
+    assert option_value(argv, "--artifact-root") == str(
+        tmp_path / "artifacts" / "evaluate"
+    )
 
 
-def test_round_script_optimize_argv_carries_budget_seed_and_splits(tmp_path: Path) -> None:
+def test_round_script_optimize_argv_carries_budget_seed_and_splits(
+    tmp_path: Path,
+) -> None:
     result, calls = run_script(
         tmp_path,
         original_count=0,
@@ -830,7 +888,10 @@ def test_round_script_optimize_argv_carries_budget_seed_and_splits(tmp_path: Pat
     assert option_value(argv, "--campaign") == CAMPAIGN_PATH
     assert option_value(argv, "--max-metric-calls") == MAX_METRIC_CALLS
     assert option_value(argv, "--seed") == SEED
-    assert option_value(argv, "--reflection-model") == _BASE_ENV["GROUNDING_REFLECTION_MODEL"]
+    assert (
+        option_value(argv, "--reflection-model")
+        == _BASE_ENV["GROUNDING_REFLECTION_MODEL"]
+    )
     assert option_value(argv, "--train-case-id") == TRAIN_CASE_ID
     assert option_value(argv, "--validation-case-id") == VALIDATION_CASE_ID
 
@@ -841,7 +902,9 @@ def test_round_script_aks_check_argv_is_campaign_only(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     argv = recorded_argv(calls, "aks-check")
     assert option_value(argv, "--campaign") == CAMPAIGN_PATH
-    assert option_value(argv, "--artifact-root") == str(tmp_path / "artifacts" / "aks-check")
+    assert option_value(argv, "--artifact-root") == str(
+        tmp_path / "artifacts" / "aks-check"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -868,12 +931,31 @@ def test_round_script_aborts_immediately_when_aks_check_reports_a_config_error(
     assert calls[-1] == "scale:0", "the node the round scaled up must still be released"
 
 
-def test_round_script_retries_aks_check_while_the_pool_warms_up(tmp_path: Path) -> None:
-    """exit 1 from aks-check stays retryable until the deadline."""
+def test_round_script_aborts_immediately_when_aks_check_reports_permanent_failure(
+    tmp_path: Path,
+) -> None:
+    """exit 1 from aks-check is a permanent preflight failure, never retried."""
     result, calls = run_script(
         tmp_path,
         original_count=0,
         preflight_exit=1,
+        extra_env={"_AKS_CHECK_DEADLINE_SECONDS": "900"},
+    )
+
+    assert result.returncode == 1, result.stderr
+    assert calls.count("aks-check") == 1, (
+        f"a permanent failure must not be retried; got {calls.count('aks-check')} attempts"
+    )
+    assert "timed out" not in result.stderr
+    assert calls[-1] == "scale:0"
+
+
+def test_round_script_retries_aks_check_while_the_pool_warms_up(tmp_path: Path) -> None:
+    """exit 75 (EX_TEMPFAIL) from aks-check stays retryable until the deadline."""
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        preflight_exit=75,
         preflight_success_after=2,
         evaluation_exit=0,
         extra_env={"_AKS_CHECK_DEADLINE_SECONDS": "60"},
@@ -890,7 +972,9 @@ def test_round_script_retries_aks_check_while_the_pool_warms_up(tmp_path: Path) 
 
 
 def test_round_script_requires_campaign_before_any_cloud_call(tmp_path: Path) -> None:
-    result, calls = run_script(tmp_path, original_count=0, extra_env={"GROUNDING_CAMPAIGN": ""})
+    result, calls = run_script(
+        tmp_path, original_count=0, extra_env={"GROUNDING_CAMPAIGN": ""}
+    )
 
     assert result.returncode != 0
     assert "GROUNDING_CAMPAIGN" in result.stderr
@@ -900,7 +984,9 @@ def test_round_script_requires_campaign_before_any_cloud_call(tmp_path: Path) ->
 def test_round_script_requires_campaign_serving_environment(tmp_path: Path) -> None:
     """The campaign resolves models/namespace/service through env: references."""
     for name in ("KORVID_AKS_MODEL", "KORVID_AKS_NAMESPACE", "KORVID_AKS_SERVICE"):
-        result, calls = run_script(tmp_path / name, original_count=0, extra_env={name: ""})
+        result, calls = run_script(
+            tmp_path / name, original_count=0, extra_env={name: ""}
+        )
 
         assert result.returncode != 0, f"{name} must be required"
         assert name in result.stderr
@@ -927,14 +1013,18 @@ def test_round_script_requires_case_identifiers(tmp_path: Path) -> None:
         "GROUNDING_VALIDATION_CASE_ID",
         "GROUNDING_MILESTONE_CASE_IDS",
     ):
-        result, calls = run_script(tmp_path / name, original_count=0, extra_env={name: ""})
+        result, calls = run_script(
+            tmp_path / name, original_count=0, extra_env={name: ""}
+        )
 
         assert result.returncode != 0, f"{name} must be required"
         assert name in result.stderr
         assert calls == []
 
 
-def test_round_script_requires_disjoint_train_and_validation_cases(tmp_path: Path) -> None:
+def test_round_script_requires_disjoint_train_and_validation_cases(
+    tmp_path: Path,
+) -> None:
     result, calls = run_script(
         tmp_path,
         original_count=0,
@@ -977,7 +1067,9 @@ def test_round_script_requires_a_non_negative_seed(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_round_script_splits_a_single_milestone_id_into_one_argument(tmp_path: Path) -> None:
+def test_round_script_splits_a_single_milestone_id_into_one_argument(
+    tmp_path: Path,
+) -> None:
     result, calls = run_script(
         tmp_path,
         original_count=0,
@@ -1012,13 +1104,17 @@ def test_round_script_rejects_hostile_milestone_case_ids(tmp_path: Path) -> None
             extra_env={"GROUNDING_MILESTONE_CASE_IDS": value},
         )
 
-        assert result.returncode == 2, f"{value!r} must be rejected (got {result.returncode})"
+        assert result.returncode == 2, (
+            f"{value!r} must be rejected (got {result.returncode})"
+        )
         assert calls == [], f"{value!r} must be rejected before any cloud call"
         assert not (tmp_path / f"hostile-{index}" / "pwned").exists()
         assert not Path("pwned").exists()
 
 
-def test_round_script_rejects_hostile_train_and_validation_case_ids(tmp_path: Path) -> None:
+def test_round_script_rejects_hostile_train_and_validation_case_ids(
+    tmp_path: Path,
+) -> None:
     hostile = ("a b", "$(id)", "a,b", "-x", "")
     for index, value in enumerate(hostile):
         for name in ("GROUNDING_TRAIN_CASE_ID", "GROUNDING_VALIDATION_CASE_ID"):
@@ -1033,7 +1129,9 @@ def test_round_script_rejects_hostile_train_and_validation_case_ids(tmp_path: Pa
 
 
 def test_round_script_rejects_a_campaign_outside_the_checkout(tmp_path: Path) -> None:
-    for index, value in enumerate(("/etc/passwd", "../secrets.yaml", "campaign.yaml; touch pwned")):
+    for index, value in enumerate(
+        ("/etc/passwd", "../secrets.yaml", "campaign.yaml; touch pwned")
+    ):
         result, calls = run_script(
             tmp_path / f"campaign-{index}",
             original_count=0,
@@ -1042,3 +1140,70 @@ def test_round_script_rejects_a_campaign_outside_the_checkout(tmp_path: Path) ->
 
         assert result.returncode == 2, f"campaign {value!r} must be rejected"
         assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Task 3: Missing tools prerequisite, wrong service abort without retry
+# ---------------------------------------------------------------------------
+
+
+def test_round_script_exits_1_when_required_tool_missing(tmp_path: Path) -> None:
+    """Missing az/kubectl/kubelogin/uv must exit 1 before any cloud call."""
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    calls_file = tmp_path / "calls.txt"
+    calls_file.touch()
+
+    # Create a fake PATH with only some tools — omit kubectl
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for tool in (
+        "az",
+        "kubelogin",
+        "uv",
+        "korvid-prompt-lab",
+        "korvid-grounding-report",
+    ):
+        p = fake_bin / tool
+        p.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        p.chmod(0o755)
+
+    env = dict(os.environ)
+    env.update(_BASE_ENV)
+    env["GROUNDING_ARTIFACT_ROOT"] = str(artifact_root)
+    env["PATH"] = f"{fake_bin}:/bin:/usr/bin"  # include system bash
+    env["_AKS_CHECK_POLL_INTERVAL"] = "0"
+    env["_AKS_CHECK_DEADLINE_SECONDS"] = "1"
+
+    result = subprocess.run(
+        ["bash", str(_SCRIPT)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+        timeout=15,
+    )
+    calls = [
+        line
+        for line in calls_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert result.returncode == 1
+    assert "required tool not found" in result.stderr
+    # No cloud calls should have been made
+    assert "nodepool-show" not in calls
+
+
+def test_round_script_does_not_retry_permanent_preflight_exit_1(tmp_path: Path) -> None:
+    """Exit 1 from aks-check (permanent: wrong service, missing tool) aborts without retry."""
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        preflight_exit=1,
+        extra_env={"_AKS_CHECK_DEADLINE_SECONDS": "60"},
+    )
+
+    assert result.returncode == 1, result.stderr
+    assert calls.count("aks-check") == 1
+    assert "not retrying" in result.stderr

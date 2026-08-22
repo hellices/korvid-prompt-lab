@@ -307,7 +307,9 @@ Useful flags (all runtime policy, never candidate text):
   can never be graded without a model
 - `--profile` selects the Korvid agent profile (default `small`)
 - `--approval-timeout` sets the approval window (default `5.0`)
-- `--turn-timeout` bounds one turn (default `120.0`, sized for a small live model)
+- `--turn-timeout` bounds one turn (default `120.0`). The AKS example
+  overrides it to `300` because a measured `qwen3:4b` tool-enabled turn took
+  just over two minutes on the shared model pool.
 
 ```bash
 KORVID_SOURCE_ROOT=/path/to/korvid-source-checkout \

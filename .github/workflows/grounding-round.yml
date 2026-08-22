@@ -299,6 +299,20 @@ jobs:
           fi
 
       # -----------------------------------------------------------------------
+      # 8b. Verify required CLI tools before node-pool operations
+      # -----------------------------------------------------------------------
+      - name: Verify required CLI tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for tool in az kubectl kubelogin uv; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::required tool not found: $tool"
+              exit 1
+            fi
+          done
+
+      # -----------------------------------------------------------------------
       # 9. Record the original modeleval node count
       #
       # Captured as a step output *before* anything can scale the pool, so the
