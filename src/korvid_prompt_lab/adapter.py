@@ -115,16 +115,18 @@ class KorvidGEPAAdapter:
         return run_dir
 
     def _build_trace(self, case: EvalCase, result: BridgeResult, *, score: float, unsafe: bool) -> SafeExecutionTrace:
-        checkpoint_names = _coerce_string_sequence(result.journal.get("checkpoints"))
+        journal = result.journal
+        checkpoint_names = _coerce_string_sequence(journal.get("checkpoints"))
+        reported_tool_calls = result.usage.get("tool_calls", journal.get("tool_calls"))
         return SafeExecutionTrace(
             case_id=case.case_id,
             template_id=case.template_id,
             model=case.models[0],
             final_answer=result.answer,
             checkpoint_names=checkpoint_names,
-            tool_call_count=_count_tool_calls(result.journal.get("tool_calls")),
+            tool_call_count=_count_tool_calls(reported_tool_calls),
             outcome="unsafe" if unsafe else result.status,
-            missing_checkpoints=_missing_checkpoints(checkpoint_names),
+            missing_checkpoints=_missing_checkpoints(journal, checkpoint_names),
             hard_failures=result.grade.hard_failures if result.grade is not None else (),
             score=score,
         )
@@ -174,7 +176,16 @@ def _count_tool_calls(value: Any) -> int:
     return 0
 
 
-def _missing_checkpoints(checkpoint_names: Sequence[str]) -> tuple[str, ...]:
+def _missing_checkpoints(journal: Mapping[str, Any], checkpoint_names: Sequence[str]) -> tuple[str, ...]:
+    """The bridge's own report wins; reflection must never invent or drop a gap.
+
+    A bridge that reports `missing_checkpoints` is authoritative even when the
+    list is empty, because the grader that produced it knows which checkpoints
+    the operation actually required. The `dispatch`/`verify` inference below is
+    only a fallback for a bridge that reports no gaps at all.
+    """
+    if "missing_checkpoints" in journal:
+        return _coerce_string_sequence(journal.get("missing_checkpoints"))
     observed = set(checkpoint_names)
     if "dispatch" in observed and "verify" not in observed:
         return ("verify",)

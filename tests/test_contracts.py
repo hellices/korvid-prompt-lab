@@ -125,9 +125,9 @@ def test_candidate_from_mapping_rejects_invalid_input(mapping: dict[str, object]
 
 
 def test_load_campaign_from_example_yaml(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("KORVID_AKS_NAMESPACE", "korvid")
-    monkeypatch.setenv("KORVID_AKS_SERVICE", "korvid-api")
-    monkeypatch.setenv("KORVID_AKS_MODEL", "qwen3-4b")
+    monkeypatch.setenv("KORVID_AKS_NAMESPACE", "ollama")
+    monkeypatch.setenv("KORVID_AKS_SERVICE", "ollama")
+    monkeypatch.setenv("KORVID_AKS_MODEL", "qwen3:4b")
 
     local = load_campaign(ROOT / "examples/campaigns/local-smoke.yaml")
     aks = load_campaign(ROOT / "examples/campaigns/aks-shared-runners.yaml")
@@ -151,16 +151,23 @@ def test_load_campaign_from_example_yaml(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert aks.campaign_id == "aks-shared-runners"
     assert aks.repetitions == 5
-    assert aks.bridge_timeout_seconds == pytest.approx(300.0)
-    assert aks.models == ("qwen3-4b",)
-    assert [case.case_id for case in aks.cases] == ["aks-happy", "aks-guardrail"]
+    assert aks.bridge_timeout_seconds == pytest.approx(900.0)
+    assert aks.models == ("qwen3:4b",)
+    assert [case.case_id for case in aks.cases] == ["aks-scale-deployment-up", "aks-restart-denied"]
+    # The template ids must be real Korvid operation journeys and the prompts must be
+    # those journeys' own first turns, or `korvid-bridge` refuses the case.
+    assert [case.template_id for case in aks.cases] == ["scale-deployment-up", "restart-denied"]
+    assert [case.prompt for case in aks.cases] == [
+        "Scale checkout-a in shop-a from 2 to 3 replicas.",
+        "Restart the api deployment in shop-a.",
+    ]
     assert isinstance(aks.serving, AKSPortForwardServing)
     assert aks.serving.backend == "aks_port_forward"
     assert aks.serving.resource_group == "rg-pension-guard"
     assert aks.serving.cluster_name == "aks-shared-runners"
-    assert aks.serving.namespace == "korvid"
-    assert aks.serving.service == "korvid-api"
-    assert aks.serving.model == "qwen3-4b"
+    assert aks.serving.namespace == "ollama"
+    assert aks.serving.service == "ollama"
+    assert aks.serving.model == "qwen3:4b"
     assert aks.serving.command == (
         "korvid-bridge",
         "--request",

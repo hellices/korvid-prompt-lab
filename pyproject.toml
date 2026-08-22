@@ -11,6 +11,7 @@ dependencies = ["dspy", "gepa", "PyYAML"]
 
 [project.scripts]
 korvid-prompt-lab = "korvid_prompt_lab.cli:main"
+korvid-bridge = "korvid_prompt_lab.bridge:main"
 
 [project.optional-dependencies]
 dev = ["pytest", "mypy", "ruff"]
@@ -23,3 +24,11 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+
+# The bridge worker imports Korvid out of the checkout named by KORVID_SOURCE_ROOT,
+# so those modules are resolvable only in the worker's own uv environment.
+[[tool.mypy.overrides]]
+module = ["korvid.*", "tests.evals.*", "tests.ui.*", "httpx"]
+ignore_missing_imports = true

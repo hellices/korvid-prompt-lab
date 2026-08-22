@@ -174,14 +174,19 @@ inside the request JSON, never on a shared or public address; the runner rejects
 any endpoint that is not a loopback `http://` URL with an explicit port.
 
 ```bash
-export KORVID_AKS_NAMESPACE=korvid
-export KORVID_AKS_SERVICE=korvid-api
-export KORVID_AKS_MODEL=qwen3-4b
+export KORVID_SOURCE_ROOT=/path/to/korvid-source-checkout
+export KORVID_AKS_NAMESPACE=ollama
+export KORVID_AKS_SERVICE=ollama
+export KORVID_AKS_MODEL=qwen3:4b
 
 uv run --python 3.12 korvid-prompt-lab aks-check \
   --campaign examples/campaigns/aks-shared-runners.yaml \
   --artifact-root artifacts/aks-check/shared-runners
 ```
+
+`KORVID_AKS_MODEL` must be the model id the endpoint actually advertises on
+`/v1/models` (Ollama-style tags such as `qwen3:4b`, not `qwen3-4b`); `aks-check`
+fails closed when the probe does not advertise it.
 
 The included AKS example targets the reviewed shared-runner environment:
 
@@ -190,6 +195,105 @@ The included AKS example targets the reviewed shared-runner environment:
 
 Before running it, make sure `az login` is current and your active subscription
 can resolve that exact resource group and AKS cluster.
+
+Its two cases are real, disjoint Korvid operation journeys — an approved scale
+(`scale-deployment-up`) and a denied restart (`restart-denied`) — so training and
+validation never share an operation:
+
+```yaml
+cases:
+  - case_id: aks-scale-deployment-up
+    template_id: scale-deployment-up
+    prompt: Scale checkout-a in shop-a from 2 to 3 replicas.
+  - case_id: aks-restart-denied
+    template_id: restart-denied
+    prompt: Restart the api deployment in shop-a.
+```
+
+Run it once the bridge prerequisites below are in place:
+
+```bash
+uv run --python 3.12 korvid-prompt-lab evaluate \
+  --candidate examples/candidates/shipped-small.yaml \
+  --campaign examples/campaigns/aks-shared-runners.yaml \
+  --artifact-root artifacts/evaluate/aks-shared-runners \
+  --train-case-id aks-scale-deployment-up \
+  --validation-case-id aks-restart-denied \
+  --json
+```
+
+## The `korvid-bridge` entry point
+
+`korvid-bridge` is the real bridge this repository ships. It runs exactly one
+graded Korvid operation journey per invocation and writes the strict response
+`KorvidProcessRunner` expects.
+
+### Prerequisites
+
+1. A Korvid source checkout with its `uv` environment installed (`uv sync` in
+   that checkout). The checkout supplies Korvid, the bundled operation pack, and
+   Textual; this repository never vendors them.
+2. `KORVID_SOURCE_ROOT` pointing at that checkout. It is **runtime policy**: it
+   is read from the environment only, never from candidate text or the request
+   artifact, and the launcher refuses a directory that is not a Korvid checkout.
+3. `uv` on `PATH` (or `KORVID_UV_BIN` set to its absolute path).
+4. For live runs, a reachable loopback model endpoint. `evaluate` and `optimize`
+   provide it automatically for `aks_port_forward` campaigns.
+
+```bash
+export KORVID_SOURCE_ROOT=/path/to/korvid-source-checkout
+korvid-bridge --help
+```
+
+The checkout stays read-only: the worker runs under
+`uv run --project "$KORVID_SOURCE_ROOT" --no-sync` with `PYTHONDONTWRITEBYTECODE=1`,
+so no sync, no lockfile edit, and no bytecode cache is ever written into it. The
+audit log Korvid produces is written into the campaign's own run directory.
+
+### What one invocation does
+
+1. Reads `{request}` and validates it strictly: protocol version, candidate
+   fingerprint, case identity, and a loopback-only `runtime.model_endpoint`.
+2. Loads exactly the `template_id` `OperationJourney` from Korvid's bundled
+   operation pack, and refuses a campaign prompt that is not that journey's own
+   first turn.
+3. Maps candidate components onto Korvid `PromptOverrides` — `system` to the
+   role statement, `append` to its suffix, and each `tool.<name>` to that tool's
+   description. The overrides are bound inside the one-shot worker process only.
+4. Runs Korvid's own `run_operation_journey` with the live OpenAI-compatible
+   provider pointed at `runtime.model_endpoint` + `/v1` and the case model, and
+   grades the run with Korvid's authoritative grader.
+5. Writes `{response}` atomically.
+
+Useful flags (all runtime policy, never candidate text):
+
+- `--scripted` runs Korvid's deterministic operation scripts instead of the model
+  endpoint — the offline self-test path, useful to prove the wiring without AKS
+- `--profile` selects the Korvid agent profile (default `small`)
+- `--approval-timeout` sets the approval window (default `5.0`)
+- `--turn-timeout` bounds one turn (default `120.0`, sized for a small live model)
+
+```bash
+KORVID_SOURCE_ROOT=/path/to/korvid-source-checkout \
+  korvid-bridge --request run/request.json --response run/response.json --scripted
+```
+
+### Grade, status, and reflection safety
+
+- Korvid's boolean `completion` and `verification` signals map to `1.0`/`0.0`;
+  `efficiency` is passed through clamped to `0.0..1.0`; `hard_failures` keeps
+  Korvid's own vocabulary.
+- A graded run always reports `status: "completed"`, even when the operation did
+  not finish — an unfinished operation is a low grade, not a systemic failure.
+- `status: "model_failure"` is used only when Korvid produced no executable
+  result at all (provider error, transport failure, or a turn that never
+  finished), and then `grade` is `null`.
+- System, configuration, import, and protocol failures never produce a graded
+  response: the bridge exits non-zero so the runner reports a systemic failure.
+- The response `journal` is a reflection-safe projection: checkpoint names from
+  Korvid's lifecycle vocabulary plus integer counts. Raw journal payloads, audit
+  records, manifests, credentials, and tool output never leave the worker, and
+  error text is credential-redacted and length-bounded.
 
 ### Publish
 
@@ -235,7 +339,10 @@ bridge_timeout_seconds: 60
 ```
 
 - `bridge_timeout_seconds` is optional and defaults to `300` (five minutes), which
-  is sized for a real Korvid bridge doing a full model-backed operation.
+  is sized for a real Korvid bridge doing a full model-backed operation. Size it
+  above `korvid-bridge`'s own `--turn-timeout` budget: a journey can spend one
+  turn window before its approval dialog and one after, so the AKS example uses
+  `900` for a small live model.
 - It must be a strictly positive, finite number; `0`, negatives, `null`, strings,
   booleans, `.inf`, and `.nan` are rejected at load time.
 - `evaluate` and `optimize` pass it into every `KorvidProcessRunner`, so both the
@@ -303,10 +410,13 @@ The local smoke campaign uses the bundled fake bridge:
 tests/fixtures/fake_korvid_bridge.py
 ```
 
-That lets you verify contracts end-to-end without AKS access. For a real Korvid
-process bridge, replace the `serving.command` list with the reviewed executable
-and preserve the `{request}` / `{response}` placeholders so the runner can pass
-artifact paths explicitly.
+That lets you verify contracts end-to-end without AKS access, and it is the only
+place a synthetic grade is produced.
+
+The real bridge is `korvid-bridge` (see above). Any other bridge may be
+substituted by replacing the `serving.command` list with the reviewed
+executable, preserving the `{request}` / `{response}` placeholders so the runner
+can pass artifact paths explicitly.
 
 For AKS-backed serving, keep the campaign on `backend: aks_port_forward`, declare
 its own `serving.command`, and use `korvid-prompt-lab aks-check` before any live
@@ -370,9 +480,12 @@ Additional CLI publish gates:
 | Model family | Usage | Backend | Notes |
 | --- | --- | --- | --- |
 | `mock-small` | local smoke validation | process | Uses the bundled fake bridge for contract checks. |
-| `qwen3-4b` | AKS discovery / low-cost iteration | aks_port_forward | Suggested first live target. |
-| `qwen3-8b` | broader validation | aks_port_forward | Use for stronger follow-up evaluation. |
-| `qwen3-14b` | milestone / publication gate | aks_port_forward | Use for the final reviewed milestone pack. |
+| `qwen3:4b` | AKS discovery / low-cost iteration | aks_port_forward | Verified advertised id on the shared-runner endpoint. |
+| `qwen3:8b` | broader validation | aks_port_forward | Use for stronger follow-up evaluation. |
+| `qwen3:14b` | milestone / publication gate | aks_port_forward | Use for the final reviewed milestone pack. |
+
+Model ids come from `env:KORVID_AKS_MODEL` and must match what `/v1/models`
+advertises, so they use the serving engine's own tag format.
 
 ## Artifacts
 
