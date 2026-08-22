@@ -12,6 +12,7 @@ dependencies = ["dspy", "gepa", "PyYAML"]
 [project.scripts]
 korvid-prompt-lab = "korvid_prompt_lab.cli:main"
 korvid-bridge = "korvid_prompt_lab.bridge:main"
+korvid-grounding-report = "korvid_prompt_lab.round_cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest", "mypy", "ruff"]
