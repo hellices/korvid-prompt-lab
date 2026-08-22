@@ -426,6 +426,8 @@ def test_grounding_workflow_trust_check_script_is_valid_javascript() -> None:
 REPOSITORY = "hellices/korvid-prompt-lab"
 TRUSTED_SHA = "a" * 40
 OTHER_SHA = "b" * 40
+KORVID_SHA = "c" * 40
+KORVID_REPO_FULL = "hellices/korvid"
 
 
 def run_trust_script(
@@ -440,8 +442,26 @@ def run_trust_script(
     compare: dict[str, Any] | None = None,
     compare_error: str | None = None,
     basehead_compare_available: bool = True,
+    # korvid provenance params; defaults produce a passing korvid check so
+    # existing prompt_lab tests remain green
+    korvid_ref: str = KORVID_SHA,
+    korvid_repo: str = KORVID_REPO_FULL,
+    korvid_compare: dict[str, Any] | None = None,
+    korvid_compare_error: str | None = None,
+    korvid_repo_error: str | None = None,
 ) -> dict[str, Any]:
-    """Execute the workflow's own trust script against a scripted GitHub API."""
+    """Execute the workflow's own trust script against a scripted GitHub API.
+
+    The harness routes compare calls by ``params.repo``:
+    - ``repo == 'korvid'``  →  korvid fixture branch (korvidCompare / korvidCompareError)
+    - any other repo         →  prompt-lab fixture branch (compare / compareError)
+
+    ``repos.get`` is always routed to the korvid fixture
+    (korvidRepoData / korvidRepoError); the default returns ``{ default_branch: 'main' }``
+    so the korvid ancestor check does not fail the existing prompt-lab-only tests.
+    """
+    if korvid_compare is None:
+        korvid_compare = {"status": "ahead"}
     script = str(trust_verification_step(load_workflow())["with"]["script"])
     tmp_path.mkdir(parents=True, exist_ok=True)
 
@@ -456,6 +476,10 @@ def run_trust_script(
                 "compare": compare,
                 "compareError": compare_error,
                 "baseheadCompareAvailable": basehead_compare_available,
+                # korvid-specific fixture fields
+                "korvidCompare": korvid_compare,
+                "korvidCompareError": korvid_compare_error,
+                "korvidRepoError": korvid_repo_error,
             }
         ),
         encoding="utf-8",
@@ -475,8 +499,14 @@ def run_trust_script(
         "  warning: (message) => infos.push(String(message)),\n"
         "};\n"
         "const context = { repo: { owner: fixture.owner, repo: fixture.repo } };\n"
+        # compare routes by params.repo so korvid and prompt-lab calls are separated
         "const compare = (name) => async (params) => {\n"
         "  calls.push({ name, params });\n"
+        "  const isKorvid = params && params.repo === 'korvid';\n"
+        "  if (isKorvid) {\n"
+        "    if (fixture.korvidCompareError) { throw new Error(fixture.korvidCompareError); }\n"
+        "    return { data: fixture.korvidCompare };\n"
+        "  }\n"
         "  if (fixture.compareError) { throw new Error(fixture.compareError); }\n"
         "  return { data: fixture.compare };\n"
         "};\n"
@@ -484,6 +514,11 @@ def run_trust_script(
         "if (fixture.baseheadCompareAvailable) {\n"
         "  repos.compareCommitsWithBasehead = compare('compareCommitsWithBasehead');\n"
         "}\n"
+        "repos.get = async (params) => {\n"
+        "  calls.push({ name: 'repos.get', params });\n"
+        "  if (fixture.korvidRepoError) { throw new Error(fixture.korvidRepoError); }\n"
+        "  return { data: { default_branch: 'main' } };\n"
+        "};\n"
         "const github = { rest: {\n"
         "  pulls: { get: async (params) => {\n"
         "    calls.push({ name: 'pulls.get', params });\n"
@@ -517,6 +552,8 @@ def run_trust_script(
             "PR_NUMBER": pr_number,
             "EXPECTED_REPOSITORY": expected_repository,
             "DEFAULT_BRANCH": default_branch,
+            "KORVID_REF": korvid_ref,
+            "KORVID_REPO": korvid_repo,
         },
     )
     assert result.returncode == 0, f"harness failed:\n{result.stderr}"
@@ -539,10 +576,15 @@ def test_trust_script_accepts_a_same_repository_pull_request_head(
     )
 
     assert outcome["failures"] == [], outcome["failures"]
-    assert [call["name"] for call in outcome["calls"]] == ["pulls.get"]
-    assert outcome["calls"][0]["params"]["pull_number"] == 42
-    assert outcome["calls"][0]["params"]["owner"] == REPOSITORY.split("/")[0]
-    assert outcome["calls"][0]["params"]["repo"] == REPOSITORY.split("/")[1]
+    call_names = [call["name"] for call in outcome["calls"]]
+    # After PR is accepted, korvid provenance is also verified:
+    # pulls.get, repos.get (korvid), compareCommitsWithBasehead (korvid)
+    assert call_names[0] == "pulls.get"
+    assert "repos.get" in call_names
+    pr_call = outcome["calls"][0]
+    assert pr_call["params"]["pull_number"] == 42
+    assert pr_call["params"]["owner"] == REPOSITORY.split("/")[0]
+    assert pr_call["params"]["repo"] == REPOSITORY.split("/")[1]
 
 
 def test_trust_script_rejects_a_fork_pull_request_head(tmp_path: Path) -> None:
@@ -606,9 +648,13 @@ def test_trust_script_accepts_a_default_branch_ancestor(
     )
 
     assert outcome["failures"] == [], outcome["failures"]
-    calls = [call["name"] for call in outcome["calls"]]
-    assert calls == ["compareCommitsWithBasehead"]
-    assert outcome["calls"][0]["params"]["basehead"] == f"{TRUSTED_SHA}...main"
+    # After the prompt_lab check, korvid provenance is also verified; the calls are:
+    # [compareCommitsWithBasehead (prompt_lab), repos.get (korvid), compareCommitsWithBasehead (korvid)]
+    call_names = [call["name"] for call in outcome["calls"]]
+    assert "compareCommitsWithBasehead" in call_names
+    prompt_lab_call = outcome["calls"][0]
+    assert prompt_lab_call["name"] == "compareCommitsWithBasehead"
+    assert prompt_lab_call["params"]["basehead"] == f"{TRUSTED_SHA}...main"
 
 
 @pytest.mark.parametrize("status", ["diverged", "behind"])
@@ -637,9 +683,12 @@ def test_trust_script_still_compares_without_the_basehead_endpoint(
     )
 
     assert outcome["failures"] == [], outcome["failures"]
-    assert [call["name"] for call in outcome["calls"]] == ["compareCommits"]
-    assert outcome["calls"][0]["params"]["base"] == TRUSTED_SHA
-    assert outcome["calls"][0]["params"]["head"] == "main"
+    call_names = [call["name"] for call in outcome["calls"]]
+    # prompt_lab compare, korvid repos.get, korvid compare — all via compareCommits
+    assert call_names == ["compareCommits", "repos.get", "compareCommits"]
+    prompt_lab_call = outcome["calls"][0]
+    assert prompt_lab_call["params"]["base"] == TRUSTED_SHA
+    assert prompt_lab_call["params"]["head"] == "main"
 
 
 def test_trust_script_rejects_a_ref_unknown_to_the_repository(tmp_path: Path) -> None:
@@ -1551,3 +1600,136 @@ def test_grounding_workflow_has_tool_verification_step_before_node_count() -> No
     body = str(tool_step.get("run", ""))
     for tool in ("az", "kubectl", "kubelogin", "uv"):
         assert tool in body, f"tool verification step must check for '{tool}'"
+
+
+# ---------------------------------------------------------------------------
+# Trust boundary: korvid_ref provenance in the authoritative Korvid repository
+#
+# RED tests — every assertion in this section fails before the implementation
+# because the trust step does not yet verify korvid_ref against the Korvid repo.
+# ---------------------------------------------------------------------------
+
+
+def test_grounding_workflow_trust_check_binds_korvid_ref_env() -> None:
+    """``KORVID_REF`` must be env-bound in the pre-credential trust step."""
+    workflow = load_workflow()
+    trust = trust_verification_step(workflow)
+    env = effective_env(workflow, trust)
+    script = str(trust["with"]["script"])
+
+    assert env.get("KORVID_REF") == "${{ inputs.korvid_ref }}", (
+        "korvid_ref must reach the trust script through env:, never interpolated "
+        "into the script body"
+    )
+    assert "process.env.KORVID_REF" in script, (
+        "the trust script must read KORVID_REF from process.env at run time"
+    )
+
+
+def test_grounding_workflow_trust_check_binds_korvid_repo_env() -> None:
+    """``KORVID_REPO`` must be derived from ``github.repository_owner``, not a user input."""
+    workflow = load_workflow()
+    trust = trust_verification_step(workflow)
+    env = effective_env(workflow, trust)
+    script = str(trust["with"]["script"])
+
+    assert env.get("KORVID_REPO") == "${{ github.repository_owner }}/korvid", (
+        "the Korvid repo must be derived from github.repository_owner (not user-supplied) "
+        "so that a dispatcher cannot point the provenance check at an arbitrary repo"
+    )
+    assert "process.env.KORVID_REPO" in script, (
+        "the trust script must read KORVID_REPO from process.env at run time"
+    )
+
+
+def test_grounding_workflow_trust_check_verifies_korvid_provenance_before_app_token() -> None:
+    """Korvid provenance is established in the pre-credential trust step, not after."""
+    workflow = load_workflow()
+    trust = trust_verification_step(workflow)
+    env = effective_env(workflow, trust)
+
+    assert "KORVID_REF" in env, (
+        "korvid_ref provenance must be proven in the pre-credential trust step, "
+        "before the Korvid app token, Azure login, or any checkout"
+    )
+    assert "KORVID_REPO" in env
+
+
+def test_grounding_workflow_trust_check_script_reads_korvid_ref_from_env() -> None:
+    """The trust script must not interpolate korvid inputs: read from ``process.env`` only."""
+    workflow = load_workflow()
+    trust = trust_verification_step(workflow)
+    script = str(trust["with"]["script"])
+
+    # process.env reads
+    assert "process.env.KORVID_REF" in script
+    assert "process.env.KORVID_REPO" in script
+    # no ${{ }} in the script body (already tested globally, repeated here for clarity)
+    assert "${{" not in script
+
+
+# ---------------------------------------------------------------------------
+# Executable korvid provenance: run the trust script against a scripted API
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", ["ahead", "identical"])
+def test_trust_script_korvid_accepts_default_branch_ancestor(
+    tmp_path: Path, status: str
+) -> None:
+    """A korvid_ref that is an ancestor of (or equal to) the default branch is accepted."""
+    outcome = run_trust_script(
+        tmp_path / f"korvid-ancestor-{status}",
+        compare={"status": "ahead"},  # prompt_lab must also pass
+        korvid_compare={"status": status},
+    )
+
+    assert outcome["failures"] == [], outcome["failures"]
+    # The trust script must have made at least one compare call for korvid.
+    korvid_compare_calls = [
+        c
+        for c in outcome["calls"]
+        if c.get("params", {}).get("repo") == "korvid"
+        and c["name"] in ("compareCommitsWithBasehead", "compareCommits")
+    ]
+    assert korvid_compare_calls, (
+        "the trust step must call compareCommitsWithBasehead/compareCommits for the "
+        "authoritative Korvid repo to prove korvid_ref provenance"
+    )
+
+
+@pytest.mark.parametrize("status", ["diverged", "behind"])
+def test_trust_script_korvid_rejects_unmerged_ref(
+    tmp_path: Path, status: str
+) -> None:
+    """A korvid_ref that has diverged from or is not contained in the default branch is rejected."""
+    outcome = run_trust_script(
+        tmp_path / f"korvid-unmerged-{status}",
+        compare={"status": "ahead"},  # prompt_lab passes; korvid should fail
+        korvid_compare={"status": status},
+    )
+
+    assert outcome["failures"], (
+        "a korvid_ref that is not contained in the default branch must be rejected; "
+        "only commits already merged/reachable from the Korvid default branch are accepted"
+    )
+    failure_text = " ".join(outcome["failures"]).lower()
+    assert "korvid" in failure_text or "default branch" in failure_text, (
+        "the rejection message must identify that korvid_ref failed the provenance check"
+    )
+
+
+def test_trust_script_korvid_rejects_api_failure(tmp_path: Path) -> None:
+    """An API failure when verifying korvid_ref must fail the trust check, not silently pass."""
+    outcome = run_trust_script(
+        tmp_path / "korvid-api-failure",
+        compare={"status": "ahead"},  # prompt_lab passes; korvid compare should fail
+        korvid_compare_error="HttpError: Not Found",
+    )
+
+    assert outcome["failures"], (
+        "a korvid_ref that the Korvid repository API cannot resolve must fail the "
+        "trust check; an API outage must close the round, not open it"
+    )
+    failure_text = " ".join(outcome["failures"]).lower()
+    assert "korvid" in failure_text or "default branch" in failure_text

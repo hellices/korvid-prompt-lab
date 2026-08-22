@@ -648,7 +648,7 @@ and fill in:
 | Input | Required | Default | Notes |
 | --- | --- | --- | --- |
 | `prompt_lab_ref` | yes | — | Exact 40-hex SHA of the Prompt Lab commit to evaluate; must be contained in the default branch, or be the head of the same-repository PR named by `pr_number` |
-| `korvid_ref` | yes | pinned SHA | Exact 40-hex SHA of the Korvid commit to use |
+| `korvid_ref` | yes | pinned SHA | Exact 40-hex SHA of the Korvid commit to use; must be an ancestor of (or equal to) the current default branch of `hellices/korvid` — unmerged, diverged, fork, and unknown SHAs are rejected |
 | `model` | yes | `qwen3:1.7b` | Ollama tag from the closed allowlist |
 | `round_type` | yes | `evaluate` | `evaluate` or `optimize-evaluate` |
 | `candidate` | yes | shipped-small | Relative path inside the Prompt Lab checkout |
@@ -683,6 +683,24 @@ read-only `GITHUB_TOKEN` and values bound through `env:`:
 
 Same-repository pull requests stay groundable (a same-repository branch already
 requires write access); fork heads never are.
+
+### Trust boundary for `korvid_ref`
+
+`korvid_ref` must be an exact 40-hex SHA **and** must be proven to be a commit
+already reachable from (merged into or equal to) the current default branch of
+the authoritative repository `hellices/korvid`. The check runs in the same
+pre-credential `actions/github-script` trust step, using only the job's own
+read-only `GITHUB_TOKEN` against the public Korvid repository — before the
+Korvid GitHub App token, Azure login, or any checkout.
+
+| `korvid_ref` | Accepted | Rejected |
+| --- | --- | --- |
+| Any 40-hex SHA | The compare status against the Korvid default branch is `identical` (SHA equals the current tip) or `ahead` (the default branch is ahead — the SHA is an ancestor) | `behind` / `diverged` (unmerged branch or fork divergence), the Korvid API cannot resolve the SHA, or any API failure |
+
+Supplying a SHA from an unmerged branch, a fork, or an arbitrary experiment
+commit fails the round before any code is checked out or any credential is used.
+The Korvid repo identity (`{owner}/korvid`) is derived from
+`github.repository_owner` — it is never user-controlled.
 
 ### Result locations
 

@@ -229,6 +229,8 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           EXPECTED_REPOSITORY: ${{ github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          KORVID_REF: ${{ inputs.korvid_ref }}
+          KORVID_REPO: ${{ github.repository_owner }}/korvid
         with:
           github-token: ${{ github.token }}
           script: |
@@ -290,40 +292,112 @@ jobs:
               }
 
               core.info('prompt_lab_ref is the head of same-repository pull request ' + prNumber);
+            } else {
+              let comparison;
+              try {
+                const response = github.rest.repos.compareCommitsWithBasehead
+                  ? await github.rest.repos.compareCommitsWithBasehead({
+                      owner,
+                      repo,
+                      basehead: ref + '...' + defaultBranch,
+                    })
+                  : await github.rest.repos.compareCommits({
+                      owner,
+                      repo,
+                      base: ref,
+                      head: defaultBranch,
+                    });
+                comparison = response.data;
+              } catch (error) {
+                core.setFailed('prompt_lab_ref is not a commit in ' + expectedRepository);
+                return;
+              }
+
+              const status = (comparison && comparison.status) || '';
+              if (status !== 'identical' && status !== 'ahead') {
+                core.setFailed(
+                  'prompt_lab_ref is neither the tip of ' + defaultBranch +
+                  ' nor an ancestor of it (compare status: ' + (status || 'unknown') +
+                  '); supply pr_number to ground a same-repository pull request head'
+                );
+                return;
+              }
+
+              core.info('prompt_lab_ref is contained in ' + defaultBranch);
+            }
+
+            // ---------------------------------------------------------------
+            // Verify korvid_ref provenance against the authoritative Korvid
+            // repository using the same read-only job token, before any
+            // checkout, app token, or Azure session exists.
+            // ---------------------------------------------------------------
+            const korvidRef = (process.env.KORVID_REF || '').trim();
+            const korvidRepo = (process.env.KORVID_REPO || '').trim();
+
+            if (!/^[0-9a-f]{40}$/.test(korvidRef)) {
+              core.setFailed('korvid_ref must be an exact 40-hex commit SHA, not a branch or tag');
+              return;
+            }
+            if (!korvidRepo) {
+              core.setFailed('the Korvid repository could not be established');
               return;
             }
 
-            let comparison;
+            const korvidParts = korvidRepo.split('/');
+            const korvidOwner = korvidParts[0];
+            const korvidRepoName = korvidParts[1];
+            if (!korvidOwner || !korvidRepoName) {
+              core.setFailed('the Korvid repository identity is malformed: ' + korvidRepo);
+              return;
+            }
+
+            let korvidDefaultBranch;
             try {
-              const response = github.rest.repos.compareCommitsWithBasehead
+              const repoResp = await github.rest.repos.get({ owner: korvidOwner, repo: korvidRepoName });
+              korvidDefaultBranch = (repoResp.data && repoResp.data.default_branch) || '';
+            } catch (error) {
+              core.setFailed('could not reach the authoritative Korvid repository ' + korvidRepo);
+              return;
+            }
+            if (!korvidDefaultBranch) {
+              core.setFailed('could not determine the default branch of ' + korvidRepo);
+              return;
+            }
+
+            let korvidComparison;
+            try {
+              const resp = github.rest.repos.compareCommitsWithBasehead
                 ? await github.rest.repos.compareCommitsWithBasehead({
-                    owner,
-                    repo,
-                    basehead: ref + '...' + defaultBranch,
+                    owner: korvidOwner,
+                    repo: korvidRepoName,
+                    basehead: korvidRef + '...' + korvidDefaultBranch,
                   })
                 : await github.rest.repos.compareCommits({
-                    owner,
-                    repo,
-                    base: ref,
-                    head: defaultBranch,
+                    owner: korvidOwner,
+                    repo: korvidRepoName,
+                    base: korvidRef,
+                    head: korvidDefaultBranch,
                   });
-              comparison = response.data;
+              korvidComparison = resp.data;
             } catch (error) {
-              core.setFailed('prompt_lab_ref is not a commit in ' + expectedRepository);
-              return;
-            }
-
-            const status = (comparison && comparison.status) || '';
-            if (status !== 'identical' && status !== 'ahead') {
               core.setFailed(
-                'prompt_lab_ref is neither the tip of ' + defaultBranch +
-                ' nor an ancestor of it (compare status: ' + (status || 'unknown') +
-                '); supply pr_number to ground a same-repository pull request head'
+                'korvid_ref is not a commit reachable from the default branch of ' + korvidRepo +
+                '; supply a SHA that is already merged/reachable from the Korvid default branch'
               );
               return;
             }
 
-            core.info('prompt_lab_ref is contained in ' + defaultBranch);
+            const korvidStatus = (korvidComparison && korvidComparison.status) || '';
+            if (korvidStatus !== 'identical' && korvidStatus !== 'ahead') {
+              core.setFailed(
+                'korvid_ref is neither the tip of ' + korvidDefaultBranch + ' in ' + korvidRepo +
+                ' nor an ancestor of it (compare status: ' + (korvidStatus || 'unknown') +
+                '); only commits already merged/reachable from the Korvid default branch are accepted'
+              );
+              return;
+            }
+
+            core.info('korvid_ref is contained in ' + korvidDefaultBranch + ' of ' + korvidRepo);
 
       # -----------------------------------------------------------------------
       # 3. Check out the approved Prompt Lab commit (read-only GITHUB_TOKEN)
