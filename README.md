@@ -53,6 +53,12 @@ uv run --python 3.12 korvid-prompt-lab evaluate \
   --json
 ```
 
+The bundled local-smoke bridge is deterministic synthetic evidence. It reports
+`execution_mode: scripted` and is useful for contract diagnostics, optimization
+plumbing, and failure-path tests, but its summary is intentionally rejected by
+`publish`. Generate publishable evidence with a live model-backed campaign such
+as `examples/campaigns/aks-shared-runners.yaml`.
+
 Useful flags:
 
 - `--case-id <id>` to limit evaluation to selected cases
@@ -361,17 +367,20 @@ Minimal model metadata schema:
 }
 ```
 
-Example publish flow:
+Example publish flow using a live AKS evaluation summary:
 
 ```bash
 uv run --python 3.12 korvid-prompt-lab publish \
   --candidate examples/candidates/shipped-small.yaml \
-  --campaign examples/campaigns/local-smoke.yaml \
+  --campaign examples/campaigns/aks-shared-runners.yaml \
   --model-metadata model-metadata.json \
-  --evaluation-summary artifacts/evaluate/local-smoke/evaluation-summary.json \
+  --evaluation-summary artifacts/live/<round>/evaluation-summary.json \
   --registry-root registry \
   --minimum-model-improvement 0.02
 ```
+
+`publish` accepts only summaries whose `execution_modes` is exactly `["live"]`;
+the local-smoke summary above cannot create a registry entry.
 
 ## Campaign runtime policy
 

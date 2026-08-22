@@ -119,3 +119,40 @@ executed the declaration and is **GREEN** with literal AST parsing.
 
 - The live verification above used the macOS system Python 3.9.6 with no
   project environment or third-party packages.
+
+---
+
+# Review Round 3 — Publication Evidence and Score Validation
+
+## Findings
+
+1. The bundled synthetic bridge reported `execution_mode: live` by default, so
+   the documented local-smoke campaign could satisfy the live-only publication
+   gate without contacting a model.
+2. `aggregate_score`, `model_scores`, and existing registry baseline scores
+   accepted non-finite and out-of-range numbers. `NaN` comparisons could bypass
+   the model-improvement gate and persist invalid registry state.
+
+## Fixes
+
+- Synthetic bridge evidence now defaults to `scripted`; tests that exercise the
+  live parsing branch opt in explicitly. The shipped local-smoke evaluate flow
+  remains available for diagnostics, while publication rejects its summary.
+- Publication requires aggregate, per-model, and existing baseline scores to be
+  finite numbers in `[0.0, 1.0]`. The minimum-improvement threshold must also be
+  finite and non-negative.
+- README publication instructions now use a live AKS evaluation summary and
+  explicitly identify local-smoke evidence as non-publishable.
+
+## Verification
+
+| Check | Result |
+|-------|--------|
+| Synthetic local-smoke publish regression | rejected with no registry output |
+| Invalid score RED | 12 failed before validation |
+| Invalid score GREEN | 12 passed |
+| Focused publication/CLI/adapter/runner/contracts | 203 passed |
+| Full suite | 533 passed, 6 skipped |
+| Ruff | passed |
+| mypy | passed for 35 source files |
+| Shell syntax and workflow YAML | passed |

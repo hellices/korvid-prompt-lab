@@ -294,7 +294,9 @@ def test_real_gepa_invokes_the_adapter_proposal_contract_and_can_beat_the_seed(t
 
 
 def test_adapter_records_how_each_grade_was_produced(tmp_path: Path) -> None:
-    live = _case("case[completed]")
+    # The synthetic bridge is scripted unless a contract test explicitly opts one
+    # response into the live branch, which is what this parser assertion needs.
+    live = _case("case[completed,live-mode]")
     adapter = _adapter(tmp_path, [live])
 
     eval_batch = adapter.evaluate([live], _seed_candidate().components, capture_traces=True)
@@ -310,8 +312,8 @@ def test_adapter_records_how_each_grade_was_produced(tmp_path: Path) -> None:
 def test_adapter_refuses_to_mix_scripted_evidence_into_a_live_optimization(tmp_path: Path) -> None:
     # GEPA compares candidates against each other. A run that silently switched to
     # model-free scripted evidence would rank a candidate on a different experiment.
-    live = _case("case[completed]")
-    scripted = _case("case[scripted-mode]")
+    live = _case("case[completed,live-mode]")
+    scripted = _case("case[completed]")
     adapter = _adapter(tmp_path, [live, scripted])
 
     adapter.evaluate([live], _seed_candidate().components, capture_traces=True)
@@ -321,7 +323,7 @@ def test_adapter_refuses_to_mix_scripted_evidence_into_a_live_optimization(tmp_p
 
 
 def test_adapter_allows_a_wholly_scripted_optimization(tmp_path: Path) -> None:
-    scripted = _case("case[scripted-mode]")
+    scripted = _case("case[completed]")
     adapter = _adapter(tmp_path, [scripted])
 
     adapter.evaluate([scripted], _seed_candidate().components, capture_traces=True)

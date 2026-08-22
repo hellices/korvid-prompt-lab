@@ -1,3 +1,12 @@
+"""Synthetic bridge fixture: deterministic responses that never contact a model.
+
+Every grade this fixture produces is invented, so it declares
+``execution_mode: "scripted"`` by default and its evidence is unpublishable by
+construction. Only a case that explicitly opts in with the ``live-mode`` tag
+reports ``live``, and that tag exists solely for runner/adapter/parser contract
+tests that must exercise the live branch — never for a publication path.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -28,6 +37,12 @@ TUNED_MARKER = "korvid-tuned"
 
 #: Protocol 2 added the typed ``execution_mode`` every response must declare.
 PROTOCOL_VERSION = 2
+
+#: This fixture replaces the model entirely, so its grades are model-free evidence.
+DEFAULT_EXECUTION_MODE = "scripted"
+
+#: Case tag a contract test uses to opt one response into the live branch.
+LIVE_MODE_TAG = "live-mode"
 
 
 def _default_grade(candidate: dict[str, object]) -> dict[str, object]:
@@ -393,10 +408,10 @@ def main() -> int:
             payload["execution_mode"] = 7
         elif "unknown-execution-mode" in tags:
             payload["execution_mode"] = "simulated"
-        elif "scripted-mode" in tags:
-            payload["execution_mode"] = "scripted"
-        else:
+        elif LIVE_MODE_TAG in tags:
             payload["execution_mode"] = "live"
+        else:
+            payload["execution_mode"] = DEFAULT_EXECUTION_MODE
         if "identity-mismatch" in tags:
             payload["request_identity"] = {
                 **request_identity,

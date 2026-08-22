@@ -391,8 +391,10 @@ response_path.write_text(
 
 
 def test_runner_reports_the_execution_mode_the_bridge_declared(tmp_path: Path) -> None:
-    live_case = _case("case[completed]")
-    scripted_case = _case("case[scripted-mode]")
+    # ``live-mode`` is the fixture's explicit opt-in; a synthetic response is
+    # scripted evidence unless a parser test deliberately asks for the live branch.
+    live_case = _case("case[completed,live-mode]")
+    scripted_case = _case("case[completed]")
 
     live = _runner(live_case).run(_candidate(), live_case, tmp_path / "live")
     scripted = _runner(scripted_case).run(_candidate(), scripted_case, tmp_path / "scripted")
@@ -404,7 +406,7 @@ def test_runner_reports_the_execution_mode_the_bridge_declared(tmp_path: Path) -
 def test_runner_refuses_scripted_evidence_from_a_live_model_endpoint(tmp_path: Path) -> None:
     # A campaign holding a live model endpoint must never accept a grade produced
     # from Korvid's canned scripts: that evidence is model-free by construction.
-    case = _case("case[scripted-mode]")
+    case = _case("case[completed]")
     runner = _aks_runner(case, model_endpoint="http://127.0.0.1:41001")
 
     with pytest.raises(BridgeExecutionModeError, match="live"):
@@ -412,7 +414,7 @@ def test_runner_refuses_scripted_evidence_from_a_live_model_endpoint(tmp_path: P
 
 
 def test_runner_accepts_live_evidence_from_a_live_model_endpoint(tmp_path: Path) -> None:
-    case = _case("case[completed]")
+    case = _case("case[completed,live-mode]")
     runner = _aks_runner(case, model_endpoint="http://127.0.0.1:41001")
 
     result = runner.run(_candidate(), case, tmp_path / "run")
@@ -495,7 +497,7 @@ def _aks_runner(
 
 
 def test_runner_supplies_the_loopback_endpoint_to_aks_bridge_requests(tmp_path: Path) -> None:
-    case = _case("case[completed]")
+    case = _case("case[completed,live-mode]")
     runner = _aks_runner(case, model_endpoint="http://127.0.0.1:41001")
 
     result = runner.run(_candidate(), case, tmp_path / "run")

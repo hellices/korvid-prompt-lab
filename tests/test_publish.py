@@ -569,6 +569,70 @@ def test_publish_bundle_rejects_pass_hat_k_outside_the_unit_interval(tmp_path: P
         )
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        json.loads('{"score": NaN}')["score"],
+        float("inf"),
+        float("-inf"),
+        -0.1,
+        1.1,
+    ],
+)
+def test_publish_bundle_rejects_invalid_aggregate_scores(tmp_path: Path, value: float) -> None:
+    with pytest.raises(ValueError, match="aggregate_score"):
+        publish_bundle(
+            candidate=_candidate(),
+            campaign=_campaign(),
+            model_metadata=_model_metadata(),
+            evaluation_summary=_evaluation_summary(
+                aggregate_score=value,
+                model_scores={"mock-small": 0.9},
+            ),
+            registry_root=tmp_path / "registry",
+        )
+
+    assert not (tmp_path / "registry").exists()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        json.loads('{"score": NaN}')["score"],
+        float("inf"),
+        float("-inf"),
+        -0.1,
+        1.1,
+    ],
+)
+def test_publish_bundle_rejects_invalid_model_scores(tmp_path: Path, value: float) -> None:
+    with pytest.raises(ValueError, match="model_scores"):
+        publish_bundle(
+            candidate=_candidate(),
+            campaign=_campaign(),
+            model_metadata=_model_metadata(),
+            evaluation_summary=_evaluation_summary(
+                aggregate_score=0.9,
+                model_scores={"mock-small": value},
+            ),
+            registry_root=tmp_path / "registry",
+        )
+
+    assert not (tmp_path / "registry").exists()
+
+
+def test_publish_bundle_rejects_non_finite_minimum_improvement(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="minimum_model_improvement"):
+        publish_bundle(
+            candidate=_candidate(),
+            campaign=_campaign(),
+            model_metadata=_model_metadata(),
+            evaluation_summary=_evaluation_summary(),
+            registry_root=tmp_path / "registry",
+            minimum_model_improvement=float("nan"),
+        )
+
+
 def test_publish_bundle_rejects_overlapping_train_and_validation_case_sets(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="case_sets train and validation must be disjoint"):
         publish_bundle(
@@ -681,6 +745,29 @@ def test_publish_bundle_defaults_to_a_non_zero_minimum_model_improvement(tmp_pat
     assert marginal.published is False
     assert "improvement" in marginal.reason
     assert clear_win.published is True
+
+
+def test_publish_bundle_rejects_a_non_finite_existing_baseline(tmp_path: Path) -> None:
+    registry_root = tmp_path / "registry"
+    common = _publish_common(registry_root, 0.5)
+    assert common.published is True
+
+    index_path = registry_root / "index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["bundles"][0]["effective_score"] = float("nan")
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="effective_score"):
+        publish_bundle(
+            candidate=_candidate(candidate_id="candidate-specific"),
+            campaign=_campaign(),
+            model_metadata=_model_metadata(),
+            evaluation_summary=_evaluation_summary(
+                bundle_kind="model-specific",
+                aggregate_score=0.9,
+            ),
+            registry_root=registry_root,
+        )
 
 
 def test_publish_refuses_evidence_that_was_not_produced_live(tmp_path: Path) -> None:

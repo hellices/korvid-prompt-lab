@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -59,7 +60,10 @@ def publish_bundle(
 ) -> PromotionDecision:
     if isinstance(minimum_model_improvement, bool) or not isinstance(minimum_model_improvement, (int, float)):
         raise ValueError("minimum_model_improvement must be numeric")  # noqa: TRY004 - preserve validation API
-    if float(minimum_model_improvement) < 0.0:
+    normalized_minimum_improvement = float(minimum_model_improvement)
+    if not math.isfinite(normalized_minimum_improvement):
+        raise ValueError("minimum_model_improvement must be finite")
+    if normalized_minimum_improvement < 0.0:
         raise ValueError("minimum_model_improvement must be non-negative")
 
     model = _normalize_model_metadata(model_metadata)
@@ -105,7 +109,7 @@ def publish_bundle(
                 bundle=None,
             )
         improvement = effective_score - float(baseline_entry["effective_score"])
-        if improvement <= float(minimum_model_improvement):
+        if improvement <= normalized_minimum_improvement:
             return PromotionDecision(
                 published=False,
                 reason=(
@@ -317,7 +321,7 @@ def _normalize_evaluation_summary(value: Mapping[str, Any]) -> dict[str, Any]:
     if bundle_kind not in {"common", "model-specific"}:
         raise ValueError("bundle_kind must be common or model-specific")
 
-    aggregate_score = _require_float(summary.get("aggregate_score"), "aggregate_score")
+    aggregate_score = _require_unit_interval(summary.get("aggregate_score"), "aggregate_score")
     pass_at_3 = _require_pass_hat_k(summary.get("pass_at_3"), "pass_at_3", 3)
     pass_at_5 = _require_pass_hat_k(summary.get("pass_at_5"), "pass_at_5", 5)
     hard_safety_failures = _require_non_negative_int(summary.get("hard_safety_failures"), "hard_safety_failures")
@@ -408,7 +412,9 @@ def _normalize_model_scores(value: Any) -> dict[str, float]:
     mapping = _require_mapping(value, "model_scores")
     normalized: dict[str, float] = {}
     for model_name, score in sorted(mapping.items()):
-        normalized[_require_string(model_name, "model_scores key")] = _require_float(score, "model_scores value")
+        normalized[_require_string(model_name, "model_scores key")] = _require_unit_interval(
+            score, "model_scores value"
+        )
     if not normalized:
         raise ValueError("model_scores must not be empty")
     return normalized
@@ -420,16 +426,20 @@ def _require_float(value: Any, context: str) -> float:
     return float(value)
 
 
+def _require_unit_interval(value: Any, context: str) -> float:
+    score = _require_float(value, context)
+    if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+        raise ValueError(f"{context} must be finite and between 0.0 and 1.0")
+    return score
+
+
 def _require_pass_hat_k(value: Any, context: str, k: int) -> float:
     """Reject publication evidence that never observed k repetitions per case."""
     if value is None:
         raise ValueError(
             f"{context} requires {k} recorded repetitions per case before publication"
         )
-    score = _require_float(value, context)
-    if not 0.0 <= score <= 1.0:
-        raise ValueError(f"{context} must be between 0.0 and 1.0")
-    return score
+    return _require_unit_interval(value, context)
 
 
 def _require_non_negative_int(value: Any, context: str) -> int:
@@ -465,7 +475,13 @@ def _find_common_baseline(
     ]
     if not matches:
         return None
-    return max(matches, key=lambda entry: (float(entry["effective_score"]), str(entry["version"])))
+    return max(
+        matches,
+        key=lambda entry: (
+            _require_unit_interval(entry.get("effective_score"), "registry bundle entry effective_score"),
+            str(entry["version"]),
+        ),
+    )
 
 
 def _bundle_index_entry(

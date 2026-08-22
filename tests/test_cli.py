@@ -246,11 +246,13 @@ def test_evaluate_runs_fake_bridge_and_emits_json_summary(tmp_path: Path) -> Non
 def test_evaluate_summary_records_how_every_run_produced_its_grade(
     tmp_path: Path,
 ) -> None:
+    # The synthetic bridge is scripted evidence by default; ``live-mode`` is the
+    # explicit opt-in a mode-aggregation test needs to see both modes at once.
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
         _process_campaign_payload(
-            "smoke-happy", extra_case_ids=("smoke-scripted[scripted-mode]",)
+            "smoke-live[live-mode]", extra_case_ids=("smoke-scripted",)
         ),
     )
 
@@ -264,9 +266,9 @@ def test_evaluate_summary_records_how_every_run_produced_its_grade(
             "--artifact-root",
             str(tmp_path / "artifacts"),
             "--train-case-id",
-            "smoke-happy",
+            "smoke-live[live-mode]",
             "--validation-case-id",
-            "smoke-scripted[scripted-mode]",
+            "smoke-scripted",
             "--json",
         ]
     )
@@ -275,8 +277,8 @@ def test_evaluate_summary_records_how_every_run_produced_its_grade(
     summary = json.loads(stdout)
     assert summary["execution_modes"] == ["live", "scripted"]
     assert summary["run_execution_modes"] == {
-        "smoke-happy::mock-small": "live",
-        "smoke-scripted[scripted-mode]::mock-small": "scripted",
+        "smoke-live[live-mode]::mock-small": "live",
+        "smoke-scripted::mock-small": "scripted",
     }
 
 
@@ -286,7 +288,9 @@ def test_evaluate_summary_of_a_wholly_live_campaign_declares_live_only(
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
-        _process_campaign_payload("smoke-happy", extra_case_ids=("smoke-guardrail",)),
+        _process_campaign_payload(
+            "smoke-happy[live-mode]", extra_case_ids=("smoke-guardrail[live-mode]",)
+        ),
     )
 
     exit_code, stdout, _ = _run_cli(
@@ -299,9 +303,9 @@ def test_evaluate_summary_of_a_wholly_live_campaign_declares_live_only(
             "--artifact-root",
             str(tmp_path / "artifacts"),
             "--train-case-id",
-            "smoke-happy",
+            "smoke-happy[live-mode]",
             "--validation-case-id",
-            "smoke-guardrail",
+            "smoke-guardrail[live-mode]",
             "--json",
         ]
     )
@@ -2819,3 +2823,67 @@ def test_publish_accepts_a_summary_whose_runs_were_all_live(tmp_path: Path) -> N
     assert exit_code == 0
     assert stderr == ""
     assert "published" in stdout
+
+
+def test_shipped_smoke_evidence_can_never_be_published_as_live(tmp_path: Path) -> None:
+    """The documented local smoke path must not be able to mint publishable evidence.
+
+    ``examples/campaigns/local-smoke.yaml`` runs the bundled synthetic bridge, which
+    never contacts a model. If that run can produce a summary publication accepts, a
+    perfect 0.91 / pass^k 1.0 bundle can be minted with no model in the loop at all.
+    """
+    artifact_root = tmp_path / "artifacts"
+    evaluate_code, _stdout, evaluate_stderr = _run_cli(
+        [
+            "evaluate",
+            "--candidate",
+            str(ROOT / "examples" / "candidates" / "shipped-small.yaml"),
+            "--campaign",
+            str(ROOT / "examples" / "campaigns" / "local-smoke.yaml"),
+            "--artifact-root",
+            str(artifact_root),
+            "--train-case-id",
+            "smoke-happy",
+            "--validation-case-id",
+            "smoke-guardrail",
+        ]
+    )
+
+    assert evaluate_code == 0, evaluate_stderr
+    summary_path = artifact_root / "evaluation-summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["execution_modes"] == ["scripted"]
+
+    model_metadata_path = _write_json(
+        tmp_path / "model-metadata.json",
+        {
+            "model_family": "mock-small",
+            "model_name": "mock-small@2026-08-21",
+            "model_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "quantization": "fp16",
+            "context_length": 8192,
+            "serving_engine": "korvid-process",
+        },
+    )
+    registry_root = tmp_path / "registry"
+
+    publish_code, publish_stdout, publish_stderr = _run_cli(
+        [
+            "publish",
+            "--candidate",
+            str(ROOT / "examples" / "candidates" / "shipped-small.yaml"),
+            "--campaign",
+            str(ROOT / "examples" / "campaigns" / "local-smoke.yaml"),
+            "--model-metadata",
+            str(model_metadata_path),
+            "--evaluation-summary",
+            str(summary_path),
+            "--registry-root",
+            str(registry_root),
+        ]
+    )
+
+    assert publish_code == 2
+    assert publish_stdout == ""
+    assert "execution_modes" in publish_stderr
+    assert not registry_root.exists()
