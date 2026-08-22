@@ -308,8 +308,12 @@ Useful flags (all runtime policy, never candidate text):
 - `--profile` selects the Korvid agent profile (default `small`)
 - `--approval-timeout` sets the approval window (default `5.0`)
 - `--turn-timeout` bounds one turn (default `120.0`). The AKS example
-  overrides it to `300` because a measured `qwen3:4b` tool-enabled turn took
-  just over two minutes on the shared model pool.
+  overrides it to `300` for the initial `qwen3:0.6b` grounding rounds.
+  `qwen3:4b` tool-enabled requests were observed still running at 5m20s and
+  10m40s and timed out without completing at both the 300 s and 600 s budgets,
+  because Ollama's reasoning generation is unbounded by default. Larger models
+  require a separate bounded-serving policy (for example `num_predict` or a
+  vLLM `max_tokens` guard) before they can be selected as a grounding target.
 
 ```bash
 KORVID_SOURCE_ROOT=/path/to/korvid-source-checkout \
@@ -557,8 +561,9 @@ Additional CLI publish gates:
 | Model family | Usage | Backend | Notes |
 | --- | --- | --- | --- |
 | `mock-small` | local smoke validation | process | Uses the bundled fake bridge for contract checks. |
-| `qwen3:4b` | AKS discovery / low-cost iteration | aks_port_forward | Verified advertised id on the shared-runner endpoint. |
-| `qwen3:8b` | broader validation | aks_port_forward | Use for stronger follow-up evaluation. |
+| `qwen3:0.6b` | initial remote grounding baseline | aks_port_forward | 10 live runs, aggregate 0.01, pass^3/5 0, 14 hard failures; see baseline below. |
+| `qwen3:4b` | future grounding — requires bounded serving policy | aks_port_forward | Observed still running at 5m20s and 10m40s; timed out at 300/600s. Not a valid comparison point until Ollama `num_predict` or equivalent guard is in place. |
+| `qwen3:8b` | broader validation | aks_port_forward | Use for stronger follow-up evaluation once bounded serving is in place. |
 | `qwen3:14b` | milestone / publication gate | aks_port_forward | Use for the final reviewed milestone pack. |
 
 Model ids come from `env:KORVID_AKS_MODEL` and must match what `/v1/models`
@@ -579,7 +584,185 @@ Typical outputs:
 - `registry/bundles/<model-family>/<version>/prompt-bundle.yaml`
 - `registry/bundles/<model-family>/<version>/evaluation-summary.json`
 
-## Non-goals
+## GitHub Actions Grounding Rounds
+
+Grounding rounds run as a manually dispatched `workflow_dispatch` workflow on
+the repository default branch. Each round uses the protected `aks-grounding`
+GitHub Environment — environment approval is the explicit authorization to
+consume model-compute before the `modeleval` node pool is touched.
+
+### Required GitHub configuration
+
+#### Environment
+
+Create a repository Environment named **`aks-grounding`** and require at least
+one manual reviewer before the job may run.
+
+#### Repository variables (`vars.*`)
+
+| Variable | Description |
+| --- | --- |
+| `AZURE_CLIENT_ID` | Azure app registration client id (OIDC, no secret) |
+| `AZURE_TENANT_ID` | Azure tenant id |
+| `AZURE_SUBSCRIPTION_ID` | Azure subscription id |
+| `KORVID_AKS_NAMESPACE` | Kubernetes namespace where Ollama runs (e.g. `ollama`) |
+| `KORVID_AKS_SERVICE` | Kubernetes Service name for the Ollama endpoint |
+| `KORVID_APP_ID` | GitHub App id used to check out `hellices/korvid` read-only |
+| `GROUNDING_REFLECTION_MODEL` | *(Environment-scoped, `aks-grounding` only)* LiteLLM model string for the reflection optimizer; absent for evaluate-only rounds |
+
+Variables are never printed by workflow steps. They reach scripts through
+`env:` references and are read at runtime.
+
+#### Repository secrets (`secrets.*`)
+
+| Secret | Description |
+| --- | --- |
+| `KORVID_APP_PRIVATE_KEY` | RSA private key for the GitHub App (PEM, newlines intact) |
+| `GROUNDING_REFLECTION_CREDENTIAL` | *(Environment-scoped, `aks-grounding` only)* API key for the reflection model; present only for `optimize-evaluate` rounds |
+
+#### GitHub App — read-only Korvid checkout
+
+The workflow checks out `hellices/korvid` at an exact pinned SHA using a
+GitHub App installation token. The App needs:
+
+- **Repository: `hellices/korvid`** — `contents: read` only.
+
+The App id goes in `vars.KORVID_APP_ID`; the private key goes in
+`secrets.KORVID_APP_PRIVATE_KEY`.
+
+A fine-grained read-only PAT is an acceptable bootstrap fallback, but a GitHub
+App is the documented target: PATs have a per-user rate limit, rotate manually,
+and are harder to scope to a single repository.
+
+#### ARC runner label
+
+The job runs on `runs-on: korvid-runners`. This is the existing Actions Runner
+Controller scale set in `aks-shared-runners`. No changes to the scale set
+are needed; the label must match the ARC `runnerGroupName` exactly.
+
+### Dispatching a grounding round
+
+Navigate to **Actions → Grounding Round → Run workflow** (default branch only)
+and fill in:
+
+| Input | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `prompt_lab_ref` | yes | — | Exact 40-hex SHA of the Prompt Lab commit to evaluate |
+| `korvid_ref` | yes | pinned SHA | Exact 40-hex SHA of the Korvid commit to use |
+| `model` | yes | `qwen3:1.7b` | Ollama tag from the closed allowlist |
+| `round_type` | yes | `evaluate` | `evaluate` or `optimize-evaluate` |
+| `candidate` | yes | shipped-small | Relative path inside the Prompt Lab checkout |
+| `campaign` | yes | aks-shared-runners | Relative YAML path inside the Prompt Lab checkout |
+| `train_case_id` | yes | `aks-scale-deployment-up` | Case id forming the train split |
+| `validation_case_id` | yes | `aks-restart-denied` | Case id forming the validation split (must differ from train) |
+| `milestone_case_ids` | yes | both cases | Comma-separated case ids forming the milestone pack |
+| `max_metric_calls` | yes | `12` | GEPA budget for `optimize-evaluate` rounds |
+| `seed` | yes | `0` | GEPA search seed |
+| `pr_number` | no | blank | Pull request to update with a sticky comment |
+
+The workflow validates every input before any credential is used. A
+non-default-branch dispatch, a non-SHA ref, a path with `..`, or a duplicate
+train/validation case id fails immediately.
+
+### Result locations
+
+| Surface | Contents |
+| --- | --- |
+| **Job Summary** | Round identity, model, aggregate score, pass^3/5, status/safety counts, per-case completion/verification/efficiency, promotion eligibility, artifact names and reproduction command |
+| **Artifact** (`grounding-round-<run-id>`) | `round-summary.json`, `round-summary.md`, `evaluation-summary.json`, `optimization-summary.json` (when present), `best-candidate.yaml` (when present), bridge `response.json` files |
+| **PR comment** (when `pr_number` is set) | Compact score/safety table, link to Actions run and artifact; sticky per model+candidate; replaces itself on rerun |
+
+The summary and artifact never contain raw answers, request JSON, audit JSONL,
+Kubernetes manifests, credentials, kubeconfigs, unrestricted tool output,
+process logs, or GEPA internal state.
+
+### Cleanup and rerun semantics
+
+The workflow records the `modeleval` node pool count **before** any scaling and
+restores that exact count in an `if: always()` step that runs after summary,
+artifact upload, and PR comment. This covers cancelled, evicted, and timed-out
+runners — all of which would receive SIGKILL before the orchestrator's own
+shell trap could finish a `nodepool scale`.
+
+If the original count was `0` and the workflow scaled to `1`, cleanup scales
+back to `0`. If the count was already `>0`, cleanup leaves it unchanged.
+
+The concurrency group `aks-grounding-<repo>` serializes rounds;
+`cancel-in-progress: false` ensures in-progress cleanup is never skipped by a
+later dispatch.
+
+To rerun after a failure: fix the root cause first (a failed cleanup stays
+visible as a failing step), then dispatch again with the same or updated
+inputs. Each dispatch is independent; there is no resume or accumulated state
+outside the uploaded artifact.
+
+### Local diagnostic vs. remote normal path
+
+**Remote (normal):** Dispatch the workflow from the GitHub UI. The protected
+Environment gate, OIDC login, ARC runner, and `if: always()` cleanup are all
+active.
+
+**Local (diagnostic):** Run the CLI directly for quick iteration or incident
+diagnosis. Local runs are not covered by the Environment gate, do not upload
+evidence, and do not post PR comments. You are responsible for cleanup if
+`az aks nodepool scale` was run manually.
+
+```bash
+export KORVID_SOURCE_ROOT=/path/to/korvid-source-checkout
+export KORVID_AKS_NAMESPACE=ollama
+export KORVID_AKS_SERVICE=ollama
+export KORVID_AKS_MODEL=qwen3:0.6b
+
+uv run --python 3.12 korvid-prompt-lab aks-check \
+  --campaign examples/campaigns/aks-shared-runners.yaml \
+  --artifact-root artifacts/aks-check/shared-runners
+
+uv run --python 3.12 korvid-prompt-lab evaluate \
+  --candidate examples/candidates/shipped-small.yaml \
+  --campaign examples/campaigns/aks-shared-runners.yaml \
+  --artifact-root artifacts/evaluate/aks-shared-runners \
+  --train-case-id aks-scale-deployment-up \
+  --validation-case-id aks-restart-denied \
+  --json
+```
+
+Local runs use the same `--turn-timeout 300` declared in the campaign. The
+300 s worker timeout is sized for `qwen3:0.6b` initial rounds only; larger
+models with unbounded generation will exhaust this budget and must be served
+with a bounded policy before selection.
+
+## Measured baseline — qwen3:0.6b
+
+These figures are aggregate observations from 10 live runs against the
+`aks-shared-runners` cluster on 2026-08-22. They are baseline evidence, not
+publishable Prompt Bundles.
+
+```text
+model:               qwen3:0.6b / shipped-small
+campaign:            aks-shared-runners (5 repetitions × 2 cases)
+live runs completed: 10
+aggregate score:     0.01
+pass^3:              0.0
+pass^5:              0.0
+hard safety failures: 14
+systemic failures:   0
+```
+
+Every run completed without systemic failure, meaning the bridge, AKS
+port-forward, and harness wiring all worked end-to-end. The low aggregate and
+zero pass^k are model-capability observations at this prompt candidate and model
+size.
+
+`qwen3:4b` serving was reachable but its unbounded reasoning generation
+exceeded both the 300 s and 600 s turn budgets (requests observed still
+running at 5m20s and 10m40s). It is not a valid comparison point until bounded
+serving is in place.
+
+Subsequent rounds should target prompt changes, a larger capable model with
+bounded generation, or both. The Actions workflow makes each such change
+reviewable as an explicit dispatched round.
+
+
 
 Korvid Prompt Lab does **not**:
 
