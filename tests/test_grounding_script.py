@@ -9,9 +9,11 @@ real script as a subprocess.  Call records are captured via a shared
 from __future__ import annotations
 
 import os
+import signal
 import stat
 import subprocess
 import textwrap
+import time
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -32,6 +34,116 @@ _BASE_ENV: dict[str, str] = {
     "GROUNDING_REFLECTION_MODEL": "qwen3:0.6b",
     "GROUNDING_REFLECTION_CREDENTIAL": "fake-token",
 }
+
+
+def _make_fake_bin_blocking(
+    fake_bin_dir: Path,
+    *,
+    node_count: int,
+    calls_file: Path,
+    ready_file: Path,
+) -> None:
+    """Write shim executables where aks-check blocks until killed."""
+    fake_bin_dir.mkdir(parents=True, exist_ok=True)
+
+    def _write(name: str, body: str) -> None:
+        p = fake_bin_dir / name
+        p.write_text("#!/usr/bin/env bash\n" + textwrap.dedent(body), encoding="utf-8")
+        p.chmod(p.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    _write(
+        "az",
+        f"""\
+        CALLS="{calls_file}"
+        if [[ "$*" == *"nodepool show"* ]]; then
+            echo {node_count}
+        elif [[ "$*" == *"nodepool scale"*"--node-count 1"* ]]; then
+            echo "scale:1" >> "$CALLS"
+        elif [[ "$*" == *"nodepool scale"*"--node-count 0"* ]]; then
+            echo "scale:0" >> "$CALLS"
+        fi
+        """,
+    )
+
+    _write("kubectl", ": # no-op kubectl shim\n")
+
+    _write(
+        "korvid-prompt-lab",
+        f"""\
+        CALLS="{calls_file}"
+        if [[ "$1" == "aks-check" ]]; then
+            echo "aks-check" >> "$CALLS"
+            # Signal readiness then block until killed
+            touch "{ready_file}"
+            sleep 60
+        fi
+        """,
+    )
+
+    _write(
+        "korvid-grounding-report",
+        f"""\
+        CALLS="{calls_file}"
+        echo "report" >> "$CALLS"
+        exit 0
+        """,
+    )
+
+
+def _run_script_with_signal(
+    tmp_path: Path,
+    sig: signal.Signals,
+    *,
+    original_count: int = 0,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """Run script, wait for aks-check to start, then send *sig* to the script."""
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    calls_file = tmp_path / "calls.txt"
+    calls_file.touch()
+    ready_file = tmp_path / "ready"
+
+    fake_bin = tmp_path / "bin"
+    _make_fake_bin_blocking(
+        fake_bin,
+        node_count=original_count,
+        calls_file=calls_file,
+        ready_file=ready_file,
+    )
+
+    env = dict(os.environ)
+    env.update(_BASE_ENV)
+    env["GROUNDING_ARTIFACT_ROOT"] = str(artifact_root)
+    env["GROUNDING_ROUND_TYPE"] = "evaluate"
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["_AKS_CHECK_POLL_INTERVAL"] = "0"
+    env["_AKS_CHECK_DEADLINE_SECONDS"] = "120"
+
+    proc = subprocess.Popen(
+        ["bash", str(_SCRIPT)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        preexec_fn=os.setpgrp,  # isolate in a new process group so the signal
+        # reaches bash and all its children (e.g. the blocking sleep) without
+        # propagating back to the pytest runner
+    )
+    # Wait for aks-check shim to signal readiness (up to 10 s)
+    deadline = time.monotonic() + 10
+    while not ready_file.exists():
+        if time.monotonic() > deadline:
+            proc.kill()
+            proc.wait()
+            raise TimeoutError("aks-check shim never wrote ready_file")
+        time.sleep(0.05)
+
+    # Kill the entire process group: this lets the blocking child (sleep) die
+    # first so bash can deliver the pending signal to its INT trap.
+    os.killpg(proc.pid, sig)
+    stdout, stderr = proc.communicate(timeout=15)
+    calls = [line for line in calls_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr), calls
 
 
 def _make_fake_bin(
@@ -308,3 +420,69 @@ def test_round_script_optimize_evaluate_rejects_ambiguous_best_candidate(tmp_pat
     assert "did not produce exactly one regular best-candidate.yaml" in result.stderr
     assert "evaluate" not in calls
     assert "report" not in calls
+
+
+# ---------------------------------------------------------------------------
+# Issue 1: Signal cancellation — exactly one cleanup and conventional exit code
+# ---------------------------------------------------------------------------
+
+
+def test_round_script_sigint_exits_130_and_scales_down_exactly_once(tmp_path: Path) -> None:
+    """SIGINT must exit 130 and execute nodepool scale-down exactly once."""
+    result, calls = _run_script_with_signal(tmp_path, signal.SIGINT, original_count=0)
+
+    assert result.returncode == 130, f"expected 130, got {result.returncode}\nstderr: {result.stderr}"
+    assert calls.count("scale:0") == 1, f"expected exactly 1 scale:0, got {calls.count('scale:0')}\ncalls: {calls}"
+
+
+def test_round_script_sigterm_exits_143_and_scales_down_exactly_once(tmp_path: Path) -> None:
+    """SIGTERM must exit 143 and execute nodepool scale-down exactly once."""
+    result, calls = _run_script_with_signal(tmp_path, signal.SIGTERM, original_count=0)
+
+    assert result.returncode == 143, f"expected 143, got {result.returncode}\nstderr: {result.stderr}"
+    assert calls.count("scale:0") == 1, f"expected exactly 1 scale:0, got {calls.count('scale:0')}\ncalls: {calls}"
+
+
+def test_round_script_sigint_no_scale_when_pool_already_had_capacity(tmp_path: Path) -> None:
+    """SIGINT on a pre-existing pool must not trigger any scale-down."""
+    result, calls = _run_script_with_signal(tmp_path, signal.SIGINT, original_count=1)
+
+    assert result.returncode == 130
+    assert "scale:0" not in calls
+
+
+# ---------------------------------------------------------------------------
+# Issue 2: Reflection credential must never appear in optimize argv
+# ---------------------------------------------------------------------------
+
+
+def test_round_script_optimize_credential_not_in_argv(tmp_path: Path) -> None:
+    """GROUNDING_REFLECTION_CREDENTIAL must not be passed as a CLI arg to optimize."""
+    credential = _BASE_ENV["GROUNDING_REFLECTION_CREDENTIAL"]
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        evaluation_exit=0,
+        round_type="optimize-evaluate",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "optimize" in calls
+    # The credential value must not appear in any recorded argument
+    leaked = [line for line in calls if line.startswith("optimize arg=") and credential in line]
+    assert not leaked, f"credential leaked into optimize argv: {leaked}"
+
+
+def test_round_script_optimize_credential_not_in_report_args(tmp_path: Path) -> None:
+    """GROUNDING_REFLECTION_CREDENTIAL must not appear in report args either."""
+    credential = _BASE_ENV["GROUNDING_REFLECTION_CREDENTIAL"]
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        evaluation_exit=0,
+        round_type="optimize-evaluate",
+    )
+
+    assert result.returncode == 0, result.stderr
+    leaked = [line for line in calls if line.startswith("report arg=") and credential in line]
+    assert not leaked, f"credential leaked into report argv: {leaked}"

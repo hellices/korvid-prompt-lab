@@ -59,6 +59,7 @@ case "$original_count" in
 esac
 
 scaled_by_round=false
+_cleanup_ran=false
 
 resolve_optimize_best_candidate() {
   local artifact_root="$1"
@@ -90,6 +91,8 @@ resolve_optimize_best_candidate() {
 }
 
 cleanup() {
+  if [[ "$_cleanup_ran" == true ]]; then return; fi
+  _cleanup_ran=true
   if [[ "$scaled_by_round" == true ]]; then
     az aks nodepool scale \
       --resource-group rg-pension-guard \
@@ -98,7 +101,9 @@ cleanup() {
       --node-count 0
   fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------------------------------------------------------------------------
 # Scale up when the pool is empty
@@ -143,19 +148,33 @@ if [[ "$GROUNDING_ROUND_TYPE" == "optimize-evaluate" ]]; then
   : "${GROUNDING_REFLECTION_MODEL:?GROUNDING_REFLECTION_MODEL is required for optimize-evaluate}"
   : "${GROUNDING_REFLECTION_CREDENTIAL:?GROUNDING_REFLECTION_CREDENTIAL is required for optimize-evaluate}"
 
+  # Map the credential to the provider-standard environment variable so that
+  # dspy.LM picks it up from the environment — never pass secrets in argv.
+  _reflection_provider="${GROUNDING_REFLECTION_MODEL%%/*}"
+  if [[ "$_reflection_provider" == "$GROUNDING_REFLECTION_MODEL" ]]; then
+    _reflection_provider="openai"
+  fi
+  _reflection_provider_lc="$(printf '%s' "$_reflection_provider" | tr '[:upper:]' '[:lower:]')"
+  case "$_reflection_provider_lc" in
+    openai)         _reflection_cred_var="OPENAI_API_KEY" ;;
+    anthropic)      _reflection_cred_var="ANTHROPIC_API_KEY" ;;
+    cohere)         _reflection_cred_var="COHERE_API_KEY" ;;
+    gemini|google)  _reflection_cred_var="GEMINI_API_KEY" ;;
+    *)              _reflection_cred_var="OPENAI_API_KEY" ;;
+  esac
+
   _opt_artifact_root="${GROUNDING_ARTIFACT_ROOT}/optimize"
   mkdir -p "$_opt_artifact_root"
   _optimize_args=(
     optimize
     --candidate "$_candidate"
     --reflection-model "$GROUNDING_REFLECTION_MODEL"
-    --reflection-credential "$GROUNDING_REFLECTION_CREDENTIAL"
     --korvid-source-root "$KORVID_SOURCE_ROOT"
     --artifact-root "$_opt_artifact_root"
   )
 
-  # optimize — never fall back to seed on failure
-  korvid-prompt-lab "${_optimize_args[@]}"
+  # optimize — never fall back to seed on failure; credential scoped to subprocess only
+  env "${_reflection_cred_var}=${GROUNDING_REFLECTION_CREDENTIAL}" korvid-prompt-lab "${_optimize_args[@]}"
 
   # Resolve exactly one new best-candidate.yaml
   if ! _best_candidate="$(resolve_optimize_best_candidate "$_opt_artifact_root")"; then
