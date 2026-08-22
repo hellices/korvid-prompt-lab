@@ -1,0 +1,189 @@
+name: Grounding Round
+
+"on":
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Ollama model tag to evaluate"
+        type: choice
+        options:
+          - "qwen3:0.6b"
+          - "qwen3:1.7b"
+          - "qwen3:4b"
+          - "qwen3:8b"
+          - "qwen3:14b"
+        default: "qwen3:1.7b"
+      round_type:
+        description: "Round type"
+        type: choice
+        options:
+          - "evaluate"
+          - "optimize-evaluate"
+        default: "evaluate"
+      korvid_ref:
+        description: "Korvid commit SHA to check out"
+        required: true
+        default: "fc7eece2adb66a5b2a18d378bdfd7503ddbdd2ca"
+      candidate:
+        description: "Path to candidate YAML (relative to prompt-lab root)"
+        required: true
+        default: "examples/candidates/shipped-small.yaml"
+      pr_number:
+        description: "PR number for sticky comment (leave blank to skip)"
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+concurrency:
+  group: aks-grounding-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  grounding:
+    name: Grounding round – ${{ inputs.model }}
+    runs-on: korvid-runners
+    environment: aks-grounding
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Check out this Prompt Lab revision (read-only GITHUB_TOKEN)
+      # -----------------------------------------------------------------------
+      - name: Checkout Prompt Lab
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          path: prompt-lab
+
+      # -----------------------------------------------------------------------
+      # 2. Obtain a Korvid app token (read-only scoped to the Korvid repo)
+      # -----------------------------------------------------------------------
+      - name: Get Korvid app token
+        id: korvid-token
+        uses: actions/create-github-app-token@df432ceedc7162793a195dd1713ff69aefc7379e  # v2.0.6
+        with:
+          app-id: ${{ vars.KORVID_APP_ID }}
+          private-key: ${{ secrets.KORVID_APP_PRIVATE_KEY }}
+          repositories: korvid
+
+      # -----------------------------------------------------------------------
+      # 3. Check out the pinned Korvid revision
+      # -----------------------------------------------------------------------
+      - name: Checkout Korvid at pinned ref
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: ${{ github.repository_owner }}/korvid
+          ref: ${{ inputs.korvid_ref }}
+          token: ${{ steps.korvid-token.outputs.token }}
+          path: korvid
+
+      # -----------------------------------------------------------------------
+      # 4. Azure OIDC login (no client secret)
+      # -----------------------------------------------------------------------
+      - name: Azure login (OIDC)
+        uses: azure/login@a65d910e8af852a8061c627c456678983e180302  # v2.2.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # -----------------------------------------------------------------------
+      # 5. Python toolchain
+      # -----------------------------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@e92bbb3fae93b8849e240bc4d60b18d70eb2f9a7  # v6.4.3
+        with:
+          version: "latest"
+
+      # -----------------------------------------------------------------------
+      # 6. Install Prompt Lab
+      # -----------------------------------------------------------------------
+      - name: Install Prompt Lab
+        working-directory: prompt-lab
+        run: uv sync --python 3.12
+
+      # -----------------------------------------------------------------------
+      # 7. Run the grounding orchestrator
+      # -----------------------------------------------------------------------
+      - name: Run grounding round
+        working-directory: prompt-lab
+        env:
+          GROUNDING_MODEL: ${{ inputs.model }}
+          GROUNDING_CANDIDATE: ${{ inputs.candidate }}
+          GROUNDING_ROUND_TYPE: ${{ inputs.round_type }}
+          KORVID_SOURCE_ROOT: ${{ github.workspace }}/korvid
+          PROMPT_LAB_REVISION: ${{ github.sha }}
+          KORVID_REVISION: ${{ inputs.korvid_ref }}
+          WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash scripts/run-grounding-round.sh
+
+      # -----------------------------------------------------------------------
+      # 8. Append safe round summary to Job Summary (always, if file exists)
+      # -----------------------------------------------------------------------
+      - name: Append round summary to Job Summary
+        if: always() && hashFiles('prompt-lab/safe-evidence/round-summary.md') != ''
+        run: cat prompt-lab/safe-evidence/round-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      # -----------------------------------------------------------------------
+      # 9. Upload only safe-evidence (never raw live artifacts)
+      # -----------------------------------------------------------------------
+      - name: Upload safe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: safe-evidence
+          path: prompt-lab/safe-evidence/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      # -----------------------------------------------------------------------
+      # 10. Sticky PR comment (optional, only when pr_number is provided)
+      # -----------------------------------------------------------------------
+      - name: Update sticky PR comment
+        if: always() && inputs.pr_number != ''
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            const model = '${{ inputs.model }}';
+            const candidate = '${{ inputs.candidate }}';
+            const marker = `<!-- korvid-grounding:${model}:${candidate} -->`;
+            const runUrl = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}';
+
+            let summaryBody = '';
+            const summaryPath = 'prompt-lab/safe-evidence/round-summary.md';
+            if (fs.existsSync(summaryPath)) {
+              summaryBody = fs.readFileSync(summaryPath, 'utf8');
+            }
+
+            const body = `${marker}\n\n${summaryBody}\n\n---\n[View workflow run](${runUrl})`;
+
+            const prNumber = parseInt('${{ inputs.pr_number }}', 10);
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+            });
+
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body,
+              });
+            }
