@@ -41,6 +41,7 @@ def _make_fake_bin(
     evaluation_exit: int,
     preflight_exit: int,
     calls_file: Path,
+    optimize_mode: str = "actual-layout",
 ) -> None:
     """Write shim executables into *fake_bin_dir*."""
     fake_bin_dir.mkdir(parents=True, exist_ok=True)
@@ -75,16 +76,47 @@ def _make_fake_bin(
         "korvid-prompt-lab",
         f"""\
         CALLS="{calls_file}"
+        _record_args() {{
+            local prefix="$1"
+            shift
+            printf '%s argc=%s\\n' "$prefix" "$#" >> "$CALLS"
+            for arg in "$@"; do
+                printf '%s arg=%s\\n' "$prefix" "$arg" >> "$CALLS"
+            done
+        }}
         if [[ "$1" == "aks-check" ]]; then
             echo "aks-check" >> "$CALLS"
             exit {preflight_exit}
         elif [[ "$1" == "evaluate" ]]; then
             echo "evaluate" >> "$CALLS"
+            _record_args "evaluate" "$@"
             exit {evaluation_exit}
         elif [[ "$1" == "optimize" ]]; then
             echo "optimize" >> "$CALLS"
-            mkdir -p "${{GROUNDING_ARTIFACT_ROOT}}/optimize"
-            echo "candidate: optimized" > "${{GROUNDING_ARTIFACT_ROOT}}/optimize/best-candidate.yaml"
+            _record_args "optimize" "$@"
+            case "{optimize_mode}" in
+                actual-layout)
+                    mkdir -p "${{GROUNDING_ARTIFACT_ROOT}}/optimize/invocations/opt-run-1"
+                    echo "candidate: optimized" > "${{GROUNDING_ARTIFACT_ROOT}}/optimize/invocations/opt-run-1/best-candidate.yaml"
+                    echo "{{}}" > "${{GROUNDING_ARTIFACT_ROOT}}/optimize/invocations/opt-run-1/optimization-summary.json"
+                    ;;
+                missing-best-candidate)
+                    mkdir -p "${{GROUNDING_ARTIFACT_ROOT}}/optimize/invocations/opt-run-1"
+                    echo "{{}}" > "${{GROUNDING_ARTIFACT_ROOT}}/optimize/invocations/opt-run-1/optimization-summary.json"
+                    ;;
+                ambiguous-best-candidate)
+                    mkdir -p "${{GROUNDING_ARTIFACT_ROOT}}/optimize/invocations/opt-run-1"
+                    mkdir -p "${{GROUNDING_ARTIFACT_ROOT}}/optimize/invocations/opt-run-2"
+                    echo "candidate: optimized-1" > "${{GROUNDING_ARTIFACT_ROOT}}/optimize/invocations/opt-run-1/best-candidate.yaml"
+                    echo "{{}}" > "${{GROUNDING_ARTIFACT_ROOT}}/optimize/invocations/opt-run-1/optimization-summary.json"
+                    echo "candidate: optimized-2" > "${{GROUNDING_ARTIFACT_ROOT}}/optimize/invocations/opt-run-2/best-candidate.yaml"
+                    echo "{{}}" > "${{GROUNDING_ARTIFACT_ROOT}}/optimize/invocations/opt-run-2/optimization-summary.json"
+                    ;;
+                *)
+                    echo "unexpected optimize mode: {optimize_mode}" >&2
+                    exit 97
+                    ;;
+            esac
             exit 0
         fi
         """,
@@ -95,6 +127,10 @@ def _make_fake_bin(
         f"""\
         CALLS="{calls_file}"
         echo "report" >> "$CALLS"
+        printf 'report argc=%s\\n' "$#" >> "$CALLS"
+        for arg in "$@"; do
+            printf 'report arg=%s\\n' "$arg" >> "$CALLS"
+        done
         exit 0
         """,
     )
@@ -108,8 +144,10 @@ def run_script(
     preflight_exit: int = 0,
     round_type: str = "evaluate",
     extra_env: dict[str, str] | None = None,
+    optimize_mode: str = "actual-layout",
+    artifact_root_name: str = "artifacts",
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
-    artifact_root = tmp_path / "artifacts"
+    artifact_root = tmp_path / artifact_root_name
     artifact_root.mkdir()
     calls_file = tmp_path / "calls.txt"
     calls_file.touch()
@@ -121,6 +159,7 @@ def run_script(
         evaluation_exit=evaluation_exit,
         preflight_exit=preflight_exit,
         calls_file=calls_file,
+        optimize_mode=optimize_mode,
     )
 
     env = dict(os.environ)
@@ -221,3 +260,51 @@ def test_round_script_optimize_evaluate_runs_optimize_then_evaluate(tmp_path: Pa
     assert "optimize" in calls
     assert "evaluate" in calls
     assert calls.index("optimize") < calls.index("evaluate")
+
+
+def test_round_script_optimize_evaluate_uses_invocation_artifacts_and_preserves_spaced_paths(tmp_path: Path) -> None:
+    """optimize-evaluate must use the invocation-layout artifacts and keep spaced paths as one argv token."""
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        evaluation_exit=0,
+        round_type="optimize-evaluate",
+        artifact_root_name="artifacts with spaces",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"evaluate arg={tmp_path / 'artifacts with spaces' / 'optimize' / 'invocations' / 'opt-run-1' / 'best-candidate.yaml'}" in calls
+    assert f"report arg={tmp_path / 'artifacts with spaces' / 'evaluate'}" in calls
+    assert f"report arg={tmp_path / 'artifacts with spaces' / 'optimize' / 'invocations' / 'opt-run-1'}" in calls
+
+
+def test_round_script_optimize_evaluate_rejects_missing_best_candidate(tmp_path: Path) -> None:
+    """optimize-evaluate must fail when optimize does not produce exactly one best-candidate file."""
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        evaluation_exit=0,
+        round_type="optimize-evaluate",
+        optimize_mode="missing-best-candidate",
+    )
+
+    assert result.returncode == 1
+    assert "did not produce exactly one regular best-candidate.yaml" in result.stderr
+    assert "evaluate" not in calls
+    assert "report" not in calls
+
+
+def test_round_script_optimize_evaluate_rejects_ambiguous_best_candidate(tmp_path: Path) -> None:
+    """optimize-evaluate must fail when optimize leaves multiple invocation best-candidate files."""
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        evaluation_exit=0,
+        round_type="optimize-evaluate",
+        optimize_mode="ambiguous-best-candidate",
+    )
+
+    assert result.returncode == 1
+    assert "did not produce exactly one regular best-candidate.yaml" in result.stderr
+    assert "evaluate" not in calls
+    assert "report" not in calls

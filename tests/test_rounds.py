@@ -175,6 +175,81 @@ def test_round_cli_writes_safe_package_and_prints_markdown_path_only(tmp_path: P
     assert "raw answer" not in (safe_output / "round-summary.md").read_text(encoding="utf-8")
 
 
+def test_round_cli_accepts_a_separate_optimize_artifact_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    evaluation_root = write_live_fixture(tmp_path)
+    optimize_root = tmp_path / "optimize" / "invocations" / "opt-run-1"
+    optimize_root.mkdir(parents=True, exist_ok=True)
+    (optimize_root / "optimization-summary.json").write_text(
+        json.dumps(
+            {
+                "run_id": "opt-run-1",
+                "seed": 0,
+                "run_identity": {
+                    "schema_version": 1,
+                    "campaign_id": "campaign-2026-08-22",
+                    "candidate_id": "candidate-alpha",
+                    "seed_candidate_fingerprint": FINGERPRINT,
+                    "train_case_ids": ["case-a"],
+                    "validation_case_ids": ["case-a"],
+                    "max_metric_calls": 1,
+                    "seed": 0,
+                    "proposal_source": "none",
+                },
+                "invocation_dir": str(optimize_root),
+                "best_idx": 0,
+                "best_validation_score": 1.0,
+                "best_candidate_fingerprint": FINGERPRINT,
+                "seed_candidate_fingerprint": FINGERPRINT,
+                "best_candidate_differs_from_seed": False,
+                "execution_modes": ["live"],
+                "train_case_ids": ["case-a"],
+                "validation_case_ids": ["case-a"],
+                "num_candidates": 1,
+                "total_metric_calls": 1,
+                "num_full_val_evals": 1,
+                "run_dir": str(optimize_root / "gepa"),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (optimize_root / "best-candidate.yaml").write_text(
+        yaml.safe_dump(DEFAULT_BEST_CANDIDATE, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+    safe_output = tmp_path / "safe-evidence"
+    exit_code = main(
+        [
+            "--artifact-root",
+            str(evaluation_root),
+            "--optimize-artifact-root",
+            str(optimize_root),
+            "--safe-output",
+            str(safe_output),
+            "--prompt-lab-revision",
+            "1234567",
+            "--korvid-revision",
+            "89abcde",
+            "--workflow-run-url",
+            "https://github.example/actions/runs/42",
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert captured.err == ""
+    assert captured.out == f"{safe_output / 'round-summary.md'}\n"
+    assert (safe_output / "optimization-summary.json").is_file()
+    assert (safe_output / "best-candidate.yaml").is_file()
+
+
 def response(
     status: str,
     *,

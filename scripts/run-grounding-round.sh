@@ -60,6 +60,35 @@ esac
 
 scaled_by_round=false
 
+resolve_optimize_best_candidate() {
+  local artifact_root="$1"
+  local invocations_root="${artifact_root}/invocations"
+  local -a matches=()
+  local match
+
+  if [[ ! -d "$invocations_root" || -L "$invocations_root" ]]; then
+    return 1
+  fi
+
+  while IFS= read -r -d '' match; do
+    matches+=("$match")
+  done < <(find -P "$invocations_root" -mindepth 2 -maxdepth 2 -type f -name 'best-candidate.yaml' -print0)
+
+  if (( ${#matches[@]} != 1 )); then
+    return 1
+  fi
+
+  if [[ -L "${matches[0]}" ]]; then
+    return 1
+  fi
+
+  if [[ "$(dirname "$(dirname "${matches[0]}")")" != "$invocations_root" ]]; then
+    return 1
+  fi
+
+  printf '%s\n' "${matches[0]}"
+}
+
 cleanup() {
   if [[ "$scaled_by_round" == true ]]; then
     az aks nodepool scale \
@@ -116,22 +145,25 @@ if [[ "$GROUNDING_ROUND_TYPE" == "optimize-evaluate" ]]; then
 
   _opt_artifact_root="${GROUNDING_ARTIFACT_ROOT}/optimize"
   mkdir -p "$_opt_artifact_root"
+  _optimize_args=(
+    optimize
+    --candidate "$_candidate"
+    --reflection-model "$GROUNDING_REFLECTION_MODEL"
+    --reflection-credential "$GROUNDING_REFLECTION_CREDENTIAL"
+    --korvid-source-root "$KORVID_SOURCE_ROOT"
+    --artifact-root "$_opt_artifact_root"
+  )
 
   # optimize — never fall back to seed on failure
-  korvid-prompt-lab optimize \
-    --candidate "$_candidate" \
-    --reflection-model "$GROUNDING_REFLECTION_MODEL" \
-    --reflection-credential "$GROUNDING_REFLECTION_CREDENTIAL" \
-    --korvid-source-root "$KORVID_SOURCE_ROOT" \
-    --artifact-root "$_opt_artifact_root"
+  korvid-prompt-lab "${_optimize_args[@]}"
 
   # Resolve exactly one new best-candidate.yaml
-  _best_candidate="${_opt_artifact_root}/best-candidate.yaml"
-  if [[ ! -f "$_best_candidate" ]]; then
-    echo "optimize did not produce best-candidate.yaml — aborting" >&2
+  if ! _best_candidate="$(resolve_optimize_best_candidate "$_opt_artifact_root")"; then
+    echo "optimize did not produce exactly one regular best-candidate.yaml under ${_opt_artifact_root}/invocations — aborting" >&2
     exit 1
   fi
   _candidate="$_best_candidate"
+  _opt_report_root="$(dirname "$_best_candidate")"
 fi
 
 # ---------------------------------------------------------------------------
@@ -140,13 +172,16 @@ fi
 
 _eval_artifact_root="${GROUNDING_ARTIFACT_ROOT}/evaluate"
 mkdir -p "$_eval_artifact_root"
+_evaluate_args=(
+  evaluate
+  --candidate "$_candidate"
+  --model "$GROUNDING_MODEL"
+  --korvid-source-root "$KORVID_SOURCE_ROOT"
+  --artifact-root "$_eval_artifact_root"
+)
 
 evaluate_exit=0
-korvid-prompt-lab evaluate \
-  --candidate "$_candidate" \
-  --model "$GROUNDING_MODEL" \
-  --korvid-source-root "$KORVID_SOURCE_ROOT" \
-  --artifact-root "$_eval_artifact_root" || evaluate_exit=$?
+korvid-prompt-lab "${_evaluate_args[@]}" || evaluate_exit=$?
 
 # exit 1 is an expected safety signal; any other non-zero exit is systemic
 if (( evaluate_exit != 0 && evaluate_exit != 1 )); then
@@ -158,18 +193,17 @@ fi
 # Report (runs even when evaluate exits 1)
 # ---------------------------------------------------------------------------
 
-_report_opt_root_arg=""
-if [[ -n "$_opt_artifact_root" ]]; then
-  _report_opt_root_arg="--optimize-artifact-root $_opt_artifact_root"
+_report_args=(
+  --artifact-root "$_eval_artifact_root"
+  --safe-output "${GROUNDING_ARTIFACT_ROOT}/safe-evidence"
+  --prompt-lab-revision "$PROMPT_LAB_REVISION"
+  --korvid-revision "$KORVID_REVISION"
+  --workflow-run-url "$WORKFLOW_RUN_URL"
+)
+if [[ -n "${_opt_report_root:-}" ]]; then
+  _report_args+=(--optimize-artifact-root "$_opt_report_root")
 fi
 
-# shellcheck disable=SC2086
-korvid-grounding-report \
-  --artifact-root "$_eval_artifact_root" \
-  --safe-output "${GROUNDING_ARTIFACT_ROOT}/safe-evidence" \
-  --prompt-lab-revision "$PROMPT_LAB_REVISION" \
-  --korvid-revision "$KORVID_REVISION" \
-  --workflow-run-url "$WORKFLOW_RUN_URL" \
-  ${_report_opt_root_arg}
+korvid-grounding-report "${_report_args[@]}"
 
 exit "$evaluate_exit"

@@ -265,15 +265,25 @@ def write_safe_evidence(
     artifact_root: Path | str,
     safe_output: Path | str,
     *,
+    optimize_artifact_root: Path | str | None = None,
     prompt_lab_revision: str | None = None,
     korvid_revision: str | None = None,
     workflow_run_url: str | None = None,
 ) -> Path:
     artifact_root_path = _resolve_existing_directory(artifact_root, "artifact_root")
+    optimize_artifact_root_path = (
+        artifact_root_path
+        if optimize_artifact_root is None
+        else _resolve_existing_directory(optimize_artifact_root, "optimize_artifact_root")
+    )
     evaluation_summary_path = _resolve_source_path(artifact_root_path, artifact_root_path / "evaluation-summary.json")
     evaluation_summary = _normalize_evaluation_summary(_load_json_mapping(evaluation_summary_path))
-    optimization_summary = _load_optional_optimization_summary(artifact_root_path)
-    best_candidate_yaml = _load_optional_best_candidate(artifact_root_path, evaluation_summary, optimization_summary)
+    optimization_summary = _load_optional_optimization_summary(optimize_artifact_root_path)
+    best_candidate_yaml = _load_optional_best_candidate(
+        optimize_artifact_root_path,
+        evaluation_summary,
+        optimization_summary,
+    )
     safe_output_path = Path(safe_output).expanduser().resolve(strict=False)
     if safe_output_path.exists():
         raise FileExistsError(f"safe output already exists: {safe_output_path}")
@@ -295,7 +305,8 @@ def write_safe_evidence(
     safe_evaluation_summary = _safe_evaluation_summary_payload(evaluation_summary)
     safe_evaluation_summary["artifact_refs"] = [
         "evaluation-summary.json",
-        *([name for name in ("optimization-summary.json", "best-candidate.yaml") if (artifact_root_path / name).is_file()]),
+        *(["optimization-summary.json"] if optimization_summary is not None else []),
+        *(["best-candidate.yaml"] if best_candidate_yaml is not None else []),
         *safe_response_paths,
         "round-summary.json",
         "round-summary.md",
