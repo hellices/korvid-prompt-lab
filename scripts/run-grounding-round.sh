@@ -40,6 +40,29 @@ case "$GROUNDING_ROUND_TYPE" in
   *) echo "unsupported round type: $GROUNDING_ROUND_TYPE" >&2; exit 2 ;;
 esac
 
+# Optimization credentials are validated here — before the pool is read, scaled,
+# or waited on — so a misconfigured round never costs cluster time.
+_reflection_cred_var=""
+if [[ "$GROUNDING_ROUND_TYPE" == "optimize-evaluate" ]]; then
+  : "${GROUNDING_REFLECTION_MODEL:?GROUNDING_REFLECTION_MODEL is required for optimize-evaluate}"
+  : "${GROUNDING_REFLECTION_CREDENTIAL:?GROUNDING_REFLECTION_CREDENTIAL is required for optimize-evaluate}"
+
+  # Map the credential to the provider-standard environment variable so that
+  # dspy.LM picks it up from the environment — never pass secrets in argv.
+  _reflection_provider="${GROUNDING_REFLECTION_MODEL%%/*}"
+  if [[ "$_reflection_provider" == "$GROUNDING_REFLECTION_MODEL" ]]; then
+    _reflection_provider="openai"
+  fi
+  _reflection_provider_lc="$(printf '%s' "$_reflection_provider" | tr '[:upper:]' '[:lower:]')"
+  case "$_reflection_provider_lc" in
+    openai)         _reflection_cred_var="OPENAI_API_KEY" ;;
+    anthropic)      _reflection_cred_var="ANTHROPIC_API_KEY" ;;
+    cohere)         _reflection_cred_var="COHERE_API_KEY" ;;
+    gemini|google)  _reflection_cred_var="GEMINI_API_KEY" ;;
+    *)              _reflection_cred_var="OPENAI_API_KEY" ;;
+  esac
+fi
+
 # ---------------------------------------------------------------------------
 # Node-count snapshot and conditional cleanup trap
 # ---------------------------------------------------------------------------
@@ -91,7 +114,8 @@ resolve_optimize_best_candidate() {
 }
 
 cleanup() {
-  if [[ "$_cleanup_ran" == true ]]; then return; fi
+  local _status=$?
+  if [[ "$_cleanup_ran" == true ]]; then exit "$_status"; fi
   _cleanup_ran=true
   if [[ "$scaled_by_round" == true ]]; then
     az aks nodepool scale \
@@ -100,6 +124,9 @@ cleanup() {
       --name modeleval \
       --node-count 0
   fi
+  # Restore the status the shell was exiting with: some bash versions otherwise
+  # replace it with the trap's own status, turning a failure into a green run.
+  exit "$_status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -145,24 +172,6 @@ _candidate="$GROUNDING_CANDIDATE"
 _opt_artifact_root=""
 
 if [[ "$GROUNDING_ROUND_TYPE" == "optimize-evaluate" ]]; then
-  : "${GROUNDING_REFLECTION_MODEL:?GROUNDING_REFLECTION_MODEL is required for optimize-evaluate}"
-  : "${GROUNDING_REFLECTION_CREDENTIAL:?GROUNDING_REFLECTION_CREDENTIAL is required for optimize-evaluate}"
-
-  # Map the credential to the provider-standard environment variable so that
-  # dspy.LM picks it up from the environment — never pass secrets in argv.
-  _reflection_provider="${GROUNDING_REFLECTION_MODEL%%/*}"
-  if [[ "$_reflection_provider" == "$GROUNDING_REFLECTION_MODEL" ]]; then
-    _reflection_provider="openai"
-  fi
-  _reflection_provider_lc="$(printf '%s' "$_reflection_provider" | tr '[:upper:]' '[:lower:]')"
-  case "$_reflection_provider_lc" in
-    openai)         _reflection_cred_var="OPENAI_API_KEY" ;;
-    anthropic)      _reflection_cred_var="ANTHROPIC_API_KEY" ;;
-    cohere)         _reflection_cred_var="COHERE_API_KEY" ;;
-    gemini|google)  _reflection_cred_var="GEMINI_API_KEY" ;;
-    *)              _reflection_cred_var="OPENAI_API_KEY" ;;
-  esac
-
   _opt_artifact_root="${GROUNDING_ARTIFACT_ROOT}/optimize"
   mkdir -p "$_opt_artifact_root"
   _optimize_args=(

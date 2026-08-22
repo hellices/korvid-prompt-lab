@@ -1,7 +1,10 @@
-"""Contract tests for .github/workflows/grounding-round.yml.
+"""Contract tests for ``.github/workflows/grounding-round.yml``.
 
-These tests run entirely offline – they parse the workflow YAML and inspect its
-structure.  No live GitHub connection is needed.
+These tests run entirely offline: they parse the workflow YAML and assert on its
+*structure*, not on substrings that happen to appear somewhere in the file.  The
+workflow is the trust boundary between a manual dispatch and live Azure/AKS
+credentials on a self-hosted runner, so every binding constraint from the design
+is asserted here as an executable invariant.
 
 NOTE: YAML 1.1 treats the bare key ``on`` as the boolean ``True``.  PyYAML
 (which implements YAML 1.1) will therefore parse
@@ -16,160 +19,579 @@ quotes the key.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
 import yaml  # type: ignore[import-untyped]
 
-WORKFLOW_PATH = (
-    Path(__file__).resolve().parents[1]
-    / ".github"
-    / "workflows"
-    / "grounding-round.yml"
-)
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+WORKFLOW_PATH = _REPO_ROOT / ".github" / "workflows" / "grounding-round.yml"
+ORCHESTRATOR_PATH = _REPO_ROOT / "scripts" / "run-grounding-round.sh"
+
+#: Workspace-relative artifact root the orchestrator writes into.  ``artifacts/``
+#: is gitignored, so live evidence never lands in a tracked path.
+ARTIFACT_ROOT_RELPATH = "prompt-lab/artifacts/grounding-round"
+SAFE_EVIDENCE_RELPATH = f"{ARTIFACT_ROOT_RELPATH}/safe-evidence"
+WORKSPACE_EXPR = "${{ github.workspace }}"
+
+#: Every action this workflow is allowed to use, pinned to the *real* commit the
+#: named tag points at (annotated tags dereferenced to their commit).  Verified
+#: against the upstream repositories; a fabricated near-miss SHA fails here.
+KNOWN_ACTION_PINS: dict[str, tuple[str, str]] = {
+    "actions/checkout": ("11bd71901bbe5b1630ceea73d27597364c9af683", "v4.2.2"),
+    "actions/create-github-app-token": ("df432ceedc7162793a195dd1713ff69aefc7379e", "v2.0.6"),
+    "azure/login": ("a65d910e8af852a8061c627c456678983e180302", "v2.2.0"),
+    "actions/setup-python": ("a26af69be951a213d495a4c3e4e4022e16d87065", "v5.6.0"),
+    "astral-sh/setup-uv": ("e92bafb6253dcd438e0484186d7669ea7a8ca1cc", "v6.4.3"),
+    "actions/upload-artifact": ("ea165f8d65b6e75b540449e92b4886f43607fa02", "v4.6.2"),
+    "actions/github-script": ("60a0d83039c74a4aee543508d2ffcb1c3799cdea", "v7.0.1"),
+}
+
+_SHA_PIN_RE = re.compile(r"^(?P<action>[^@]+)@(?P<sha>[0-9a-f]{40})$")
+_EXACT_SHA_RE = r"^[0-9a-f]{40}$"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def load_workflow() -> dict[str, Any]:
     raw = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
     # YAML 1.1: bare `on` key is parsed as boolean True by PyYAML.
-    # Normalise to string key so callers can always use workflow["on"].
     if True in raw and "on" not in raw:
         raw["on"] = raw.pop(True)
     return raw
 
 
+def workflow_text() -> str:
+    return WORKFLOW_PATH.read_text(encoding="utf-8")
+
+
 def _on_triggers(workflow: dict[str, Any]) -> dict[str, Any]:
-    """Return the mapping under the ``on:`` key (normalised)."""
     return workflow["on"]
 
 
-def upload_artifact_path(workflow: dict[str, Any]) -> str:
-    """Return the ``path`` value from the upload-artifact step, if present."""
-    for job in workflow.get("jobs", {}).values():
-        for step in job.get("steps", []):
-            uses = step.get("uses", "")
-            if "upload-artifact" in uses:
-                return step.get("with", {}).get("path", "")
-    return ""
+def grounding_job(workflow: dict[str, Any]) -> dict[str, Any]:
+    return workflow["jobs"]["grounding"]
+
+
+def job_env(workflow: dict[str, Any]) -> dict[str, str]:
+    return dict(grounding_job(workflow).get("env", {}))
+
+
+def steps(workflow: dict[str, Any]) -> list[dict[str, Any]]:
+    return list(grounding_job(workflow).get("steps", []))
+
+
+def step_index(workflow: dict[str, Any], predicate_substring: str, *, key: str = "uses") -> int:
+    for index, step in enumerate(steps(workflow)):
+        if predicate_substring in str(step.get(key, "")):
+            return index
+    raise AssertionError(f"no step with {key} containing {predicate_substring!r}")
+
+
+def step_with_uses(workflow: dict[str, Any], needle: str) -> dict[str, Any]:
+    matches = [s for s in steps(workflow) if needle in str(s.get("uses", ""))]
+    assert matches, f"workflow must contain a step using {needle!r}"
+    return matches[0]
+
+
+def steps_with_uses(workflow: dict[str, Any], needle: str) -> list[dict[str, Any]]:
+    return [s for s in steps(workflow) if needle in str(s.get("uses", ""))]
+
+
+def orchestrator_step(workflow: dict[str, Any]) -> dict[str, Any]:
+    matches = [
+        s for s in steps(workflow) if "run-grounding-round.sh" in str(s.get("run", ""))
+    ]
+    assert len(matches) == 1, "workflow must invoke run-grounding-round.sh exactly once"
+    return matches[0]
+
+
+def expand_env_expressions(value: str, env: dict[str, str]) -> str:
+    """Resolve ``${{ env.NAME }}`` references against the job-level env block."""
+
+    def _replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        assert name in env, f"${{{{ env.{name} }}}} used but not defined at job level"
+        return env[name]
+
+    return re.sub(r"\$\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}", _replace, value)
+
+
+def effective_env(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str, str]:
+    """Job-level env overlaid with the step's own env, with env refs resolved."""
+    merged = job_env(workflow)
+    merged.update({k: str(v) for k, v in dict(step.get("env", {})).items()})
+    return {k: expand_env_expressions(v, job_env(workflow)) for k, v in merged.items()}
+
+
+def script_bodies(workflow: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return ``(step name, body)`` for every shell ``run`` and github-script body."""
+    bodies: list[tuple[str, str]] = []
+    for step in steps(workflow):
+        name = str(step.get("name", step.get("uses", "<unnamed>")))
+        if "run" in step:
+            bodies.append((name, str(step["run"])))
+        script = dict(step.get("with", {})).get("script")
+        if script is not None:
+            bodies.append((name, str(script)))
+    return bodies
+
+
+def required_orchestrator_env_vars() -> set[str]:
+    """Every ``: "${VAR:?...}"`` guard enforced by the orchestrator script."""
+    text = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+    return set(re.findall(r':\s*"\$\{([A-Z_][A-Z0-9_]*):\?', text))
 
 
 # ---------------------------------------------------------------------------
-# Contract tests
+# Trigger, runner, environment, and concurrency contract
 # ---------------------------------------------------------------------------
 
 
 def test_grounding_workflow_has_protected_manual_arc_contract() -> None:
     workflow = load_workflow()
     triggers = _on_triggers(workflow)
-    assert "workflow_dispatch" in triggers, "workflow must be triggered only by workflow_dispatch"
-    job = workflow["jobs"]["grounding"]
-    assert job["runs-on"] == "korvid-runners", "job must run on korvid-runners"
-    assert job["environment"] == "aks-grounding", "job must use aks-grounding environment"
-    assert workflow["concurrency"]["cancel-in-progress"] is False, (
-        "concurrency must not cancel in-progress runs"
-    )
-    assert workflow["permissions"]["id-token"] == "write", (
-        "id-token permission must be write for OIDC"
-    )
-    assert "pull_request_target" not in triggers, (
-        "pull_request_target must not be a trigger (security)"
+
+    assert set(triggers) == {"workflow_dispatch"}, (
+        "workflow_dispatch must be the ONLY trigger; any automatic trigger would run "
+        f"near Azure credentials on a self-hosted runner (found: {sorted(triggers)})"
     )
 
-
-def test_grounding_workflow_always_uploads_only_safe_evidence_and_cleans_up() -> None:
-    text = WORKFLOW_PATH.read_text(encoding="utf-8")
-    workflow = load_workflow()
-
-    assert "if: always()" in text, "workflow must have always() guard steps"
-    assert "safe-evidence" in text, "workflow must reference safe-evidence directory"
-    artifact_path = upload_artifact_path(workflow)
-    assert "artifacts/live" not in artifact_path, (
-        "upload-artifact must NOT include raw live artifacts"
-    )
-    assert "AZURE_CLIENT_SECRET" not in text, (
-        "workflow must not reference AZURE_CLIENT_SECRET (use OIDC)"
-    )
-
-
-def test_grounding_workflow_uses_oidc_not_client_secret() -> None:
-    text = WORKFLOW_PATH.read_text(encoding="utf-8")
-    assert "azure/login" in text, "workflow must use azure/login action for OIDC auth"
-    assert "client-id" in text or "creds" in text, (
-        "workflow must provide OIDC credentials to azure/login"
-    )
-    assert "AZURE_CLIENT_SECRET" not in text, "workflow must not use client secret"
-
-
-def test_grounding_workflow_uses_pinned_official_actions() -> None:
-    workflow = load_workflow()
-    actions_used: list[str] = []
-    for job in workflow.get("jobs", {}).values():
-        for step in job.get("steps", []):
-            uses = step.get("uses", "")
-            if uses:
-                actions_used.append(uses)
-
-    assert actions_used, "workflow must use at least one action"
-    for action in actions_used:
-        # Every action ref must be pinned to a SHA or a tag (contain @)
-        assert "@" in action, f"action '{action}' must be pinned with @<sha|tag>"
-
-
-def test_grounding_workflow_has_sticky_pr_comment_with_safe_content() -> None:
-    text = WORKFLOW_PATH.read_text(encoding="utf-8")
-    # Marker comment must be present for sticky-comment deduplication
-    assert "korvid-grounding:" in text, (
-        "workflow must embed <!-- korvid-grounding:... --> marker for sticky PR comments"
-    )
-    # PR comment step must also be conditional
-    assert "github-script" in text, "workflow must use actions/github-script for PR comment"
-
-
-def test_grounding_workflow_step_summary_is_safe_and_conditional() -> None:
-    text = WORKFLOW_PATH.read_text(encoding="utf-8")
-    assert "GITHUB_STEP_SUMMARY" in text, "workflow must append to GITHUB_STEP_SUMMARY"
-    assert "hashFiles(" in text or "hashFiles(" in text, (
-        "summary step must guard with hashFiles() to skip if file absent"
-    )
-    assert "round-summary.md" in text, "workflow must append round-summary.md to step summary"
-
-
-def test_grounding_workflow_failure_semantics_preserved_after_always_steps() -> None:
-    """Steps that run with always() must not suppress prior failures."""
-    workflow = load_workflow()
-    job = workflow["jobs"]["grounding"]
-    steps = job.get("steps", [])
-
-    always_steps: list[dict] = [
-        s for s in steps if s.get("if", "") == "always()"
-        or "always()" in str(s.get("if", ""))
-    ]
-    # Must have at least one always() step (summary + upload)
-    assert len(always_steps) >= 1, "workflow must have always() steps for cleanup/publish"
-
-    # The last step that is NOT always() should be the orchestrator invocation
-    non_always = [s for s in steps if "always()" not in str(s.get("if", ""))]
-    # Ensure there are substantive steps beyond setup
-    assert len(non_always) >= 3, (
-        "workflow must have substantive non-always steps (setup, login, orchestrator)"
-    )
-
-
-def test_grounding_workflow_checkout_uses_read_only_token() -> None:
-    workflow = load_workflow()
-    job = workflow["jobs"]["grounding"]
-    steps = job.get("steps", [])
-    checkout_steps = [s for s in steps if "actions/checkout" in s.get("uses", "")]
-    assert checkout_steps, "workflow must have at least one checkout step"
-    # Checkout of Prompt Lab repo should use GITHUB_TOKEN (read-only via permissions)
-    # Korvid checkout should use the app token; neither should use a PAT secret
-    text = WORKFLOW_PATH.read_text(encoding="utf-8")
-    assert "KORVID_PAT" not in text, "workflow must not use a PAT; use app token instead"
+    job = grounding_job(workflow)
+    assert job["runs-on"] == "korvid-runners"
+    assert job["environment"] == "aks-grounding"
+    assert workflow["concurrency"]["cancel-in-progress"] is False
+    assert workflow["permissions"] == {
+        "contents": "read",
+        "id-token": "write",
+        "pull-requests": "write",
+    }, "workflow permissions must be exactly the least-privilege set"
 
 
 def test_grounding_workflow_no_pull_request_target() -> None:
-    """Explicit test that pull_request_target is absent (TOCTOU attack surface)."""
-    text = WORKFLOW_PATH.read_text(encoding="utf-8")
-    assert "pull_request_target" not in text, (
+    workflow = load_workflow()
+    assert "pull_request_target" not in _on_triggers(workflow)
+    assert "pull_request_target" not in workflow_text(), (
         "pull_request_target must never appear in this workflow"
+    )
+
+
+def test_grounding_workflow_declares_typed_inputs() -> None:
+    workflow = load_workflow()
+    inputs = _on_triggers(workflow)["workflow_dispatch"]["inputs"]
+
+    for name, spec in inputs.items():
+        assert "type" in spec, f"input {name!r} must declare an explicit type"
+
+    assert inputs["model"]["type"] == "choice"
+    assert inputs["round_type"]["type"] == "choice"
+    assert set(inputs["round_type"]["options"]) == {"evaluate", "optimize-evaluate"}
+    assert inputs["pr_number"]["type"] == "number", (
+        "pr_number must be typed so a free-form string can never reach the API call"
+    )
+    assert inputs["pr_number"].get("required", False) is False
+
+
+# ---------------------------------------------------------------------------
+# Trust boundary: approved Prompt Lab commit, dispatched from the default branch
+# ---------------------------------------------------------------------------
+
+
+def test_grounding_workflow_checks_out_an_exact_prompt_lab_commit() -> None:
+    workflow = load_workflow()
+    inputs = _on_triggers(workflow)["workflow_dispatch"]["inputs"]
+
+    assert "prompt_lab_ref" in inputs, (
+        "the workflow definition runs from the default branch, so the reviewed "
+        "Prompt Lab commit must be an explicit input"
+    )
+    assert inputs["prompt_lab_ref"]["required"] is True
+    assert inputs["korvid_ref"]["required"] is True
+
+    prompt_lab_checkout = steps_with_uses(workflow, "actions/checkout")[0]
+    assert prompt_lab_checkout["with"]["ref"] == "${{ inputs.prompt_lab_ref }}", (
+        "Prompt Lab must be checked out at the approved commit, not at the "
+        "default-branch workflow revision"
+    )
+    assert prompt_lab_checkout["with"]["path"] == "prompt-lab"
+
+
+def test_grounding_workflow_validates_refs_before_azure_login() -> None:
+    workflow = load_workflow()
+    all_steps = steps(workflow)
+
+    validation_steps = [
+        (index, step)
+        for index, step in enumerate(all_steps)
+        if _EXACT_SHA_RE in str(step.get("run", ""))
+    ]
+    assert validation_steps, (
+        "a validation step must reject any prompt_lab_ref/korvid_ref that is not an "
+        f"exact 40-hex commit SHA (regex {_EXACT_SHA_RE})"
+    )
+    validation_index, validation_step = validation_steps[0]
+
+    assert validation_index == 0, "input validation must be the first step in the job"
+
+    login_index = step_index(workflow, "azure/login")
+    assert validation_index < login_index, "refs must be validated before Azure login"
+
+    checkout_indexes = [
+        index
+        for index, step in enumerate(all_steps)
+        if "actions/checkout" in str(step.get("uses", ""))
+    ]
+    assert all(validation_index < index for index in checkout_indexes), (
+        "refs must be validated before any checkout"
+    )
+
+    validation_env = effective_env(workflow, validation_step)
+    assert validation_env.get("PROMPT_LAB_REF") == "${{ inputs.prompt_lab_ref }}"
+    assert validation_env.get("KORVID_REF") == "${{ inputs.korvid_ref }}"
+    assert validation_env.get("PR_NUMBER") == "${{ inputs.pr_number }}"
+    assert validation_env.get("CANDIDATE") == "${{ inputs.candidate }}"
+
+
+def test_grounding_workflow_requires_dispatch_from_default_branch() -> None:
+    workflow = load_workflow()
+    validation_step = steps(workflow)[0]
+    validation_env = effective_env(workflow, validation_step)
+
+    assert "${{ github.event.repository.default_branch }}" in validation_env.values(), (
+        "the workflow definition must execute from the default branch; the job must "
+        "reject dispatches from other refs"
+    )
+    body = str(validation_step["run"])
+    assert "DEFAULT_BRANCH" in body and "WORKFLOW_REF_NAME" in body
+
+
+def test_grounding_workflow_records_the_checked_out_prompt_lab_revision() -> None:
+    workflow = load_workflow()
+    env = effective_env(workflow, orchestrator_step(workflow))
+    assert env["PROMPT_LAB_REVISION"] == "${{ inputs.prompt_lab_ref }}", (
+        "the report must record the commit that actually ran, not the workflow revision"
+    )
+    assert env["KORVID_REVISION"] == "${{ inputs.korvid_ref }}"
+
+
+# ---------------------------------------------------------------------------
+# Supply chain: every action pinned to a real, known commit
+# ---------------------------------------------------------------------------
+
+
+def test_grounding_workflow_pins_every_action_to_a_known_full_sha() -> None:
+    workflow = load_workflow()
+    uses_values = [str(s["uses"]) for s in steps(workflow) if s.get("uses")]
+    assert uses_values, "workflow must use at least one action"
+
+    text = workflow_text()
+    for uses in uses_values:
+        match = _SHA_PIN_RE.match(uses)
+        assert match, f"action {uses!r} must be pinned to a full 40-hex commit SHA"
+        action, sha = match.group("action"), match.group("sha")
+
+        assert action in KNOWN_ACTION_PINS, f"action {action!r} is not on the allowlist"
+        expected_sha, expected_tag = KNOWN_ACTION_PINS[action]
+        assert sha == expected_sha, (
+            f"{action} is pinned to {sha}, which is not the commit for {expected_tag} "
+            f"({expected_sha})"
+        )
+        assert f"{action}@{sha}  # {expected_tag}" in text, (
+            f"{action}@{sha} must carry the '# {expected_tag}' provenance comment"
+        )
+
+
+def test_grounding_workflow_never_pins_a_mutable_ref() -> None:
+    workflow = load_workflow()
+    for step in steps(workflow):
+        uses = str(step.get("uses", ""))
+        if not uses:
+            continue
+        ref = uses.split("@", 1)[1] if "@" in uses else ""
+        assert not ref.startswith("v"), f"{uses!r} must not use a mutable tag ref"
+        assert ref not in {"main", "master", "HEAD"}, f"{uses!r} must not use a branch"
+
+
+# ---------------------------------------------------------------------------
+# Credentials
+# ---------------------------------------------------------------------------
+
+
+def test_grounding_workflow_uses_oidc_not_client_secret() -> None:
+    workflow = load_workflow()
+    text = workflow_text()
+    login = step_with_uses(workflow, "azure/login")
+
+    assert "client-id" in login["with"]
+    assert "tenant-id" in login["with"]
+    assert "subscription-id" in login["with"]
+    assert "creds" not in login["with"], "azure/login must use OIDC, not a creds blob"
+    assert "AZURE_CLIENT_SECRET" not in text
+    assert "client-secret" not in text
+
+
+def test_grounding_workflow_korvid_token_is_downscoped_read_only() -> None:
+    workflow = load_workflow()
+    token_step = step_with_uses(workflow, "create-github-app-token")
+    with_block = dict(token_step["with"])
+
+    assert with_block.get("permission-contents") == "read", (
+        "the Korvid installation token must be explicitly downscoped to read-only; "
+        "without permission-* inputs it inherits every installed permission"
+    )
+    for key, value in with_block.items():
+        if key.startswith("permission-"):
+            assert value == "read", f"{key} must not grant write ({value!r})"
+    assert with_block.get("repositories") == "korvid"
+
+
+def test_grounding_workflow_checkouts_use_read_only_tokens() -> None:
+    workflow = load_workflow()
+    text = workflow_text()
+    checkouts = steps_with_uses(workflow, "actions/checkout")
+    assert len(checkouts) == 2, "workflow must check out Prompt Lab and Korvid"
+
+    prompt_lab, korvid = checkouts
+    assert "token" not in prompt_lab["with"], (
+        "Prompt Lab checkout must use the job's read-only GITHUB_TOKEN"
+    )
+    assert korvid["with"]["token"] == "${{ steps.korvid-token.outputs.token }}"
+    assert korvid["with"]["repository"].endswith("/korvid")
+
+    for checkout in checkouts:
+        assert checkout["with"].get("persist-credentials") is False, (
+            "credentials must not be left in .git/config on a self-hosted runner"
+        )
+
+    assert "KORVID_PAT" not in text, "workflow must not use a PAT; use the app token"
+
+
+def test_grounding_workflow_scopes_reflection_credentials_to_optimize_rounds() -> None:
+    workflow = load_workflow()
+    env = effective_env(workflow, orchestrator_step(workflow))
+
+    model_expr = env["GROUNDING_REFLECTION_MODEL"]
+    credential_expr = env["GROUNDING_REFLECTION_CREDENTIAL"]
+
+    assert "vars.GROUNDING_REFLECTION_MODEL" in model_expr, (
+        "the reflection model must come from Environment/repository configuration"
+    )
+    assert "secrets.GROUNDING_REFLECTION_CREDENTIAL" in credential_expr, (
+        "the reflection credential must come from the protected Environment secrets"
+    )
+    for expr in (model_expr, credential_expr):
+        assert "inputs.round_type == 'optimize-evaluate'" in expr, (
+            "reflection credentials must not be materialised for evaluate-only rounds"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Injection surface
+# ---------------------------------------------------------------------------
+
+
+def test_grounding_workflow_scripts_never_interpolate_expressions() -> None:
+    workflow = load_workflow()
+    for name, body in script_bodies(workflow):
+        assert "${{" not in body, (
+            f"step {name!r} interpolates a ${{{{ }}}} expression into script source "
+            "text; every value must be passed through env: and read at runtime"
+        )
+
+
+def test_grounding_workflow_pr_comment_reads_validated_input_from_env() -> None:
+    workflow = load_workflow()
+    comment_step = step_with_uses(workflow, "github-script")
+    script = str(comment_step["with"]["script"])
+    env = effective_env(workflow, comment_step)
+
+    assert env.get("GROUNDING_PR_NUMBER") == "${{ inputs.pr_number }}"
+    assert env.get("GROUNDING_MODEL") == "${{ inputs.model }}"
+    assert env.get("GROUNDING_CANDIDATE") == "${{ inputs.candidate }}"
+
+    for name in ("GROUNDING_PR_NUMBER", "GROUNDING_MODEL", "GROUNDING_CANDIDATE"):
+        assert f"process.env.{name}" in script, f"{name} must be read from process.env"
+
+    assert re.search(r"\^\[1-9\]\[0-9\]\{?", script), (
+        "the script must re-validate pr_number as a positive integer"
+    )
+    assert "pulls.get" in script, (
+        "the script must confirm the number is a pull request in this repository "
+        "before commenting, so an arbitrary issue can never be targeted"
+    )
+    assert "issues.createComment" in script and "issues.updateComment" in script
+    assert "korvid-grounding:" in script, "sticky marker must be embedded in the body"
+
+
+def test_grounding_workflow_pr_comment_step_is_optional_and_guarded() -> None:
+    workflow = load_workflow()
+    comment_step = step_with_uses(workflow, "github-script")
+    condition = str(comment_step["if"])
+    assert "always()" in condition
+    assert "inputs.pr_number != ''" in condition
+
+
+# ---------------------------------------------------------------------------
+# Evidence: one artifact root, one safe-evidence path, no silent no-op
+# ---------------------------------------------------------------------------
+
+
+def test_grounding_workflow_defines_one_artifact_root_and_safe_evidence_path() -> None:
+    workflow = load_workflow()
+    env = job_env(workflow)
+
+    assert env["GROUNDING_ARTIFACT_ROOT"] == f"{WORKSPACE_EXPR}/{ARTIFACT_ROOT_RELPATH}"
+    assert env["GROUNDING_SAFE_EVIDENCE_DIR"] == f"{WORKSPACE_EXPR}/{SAFE_EVIDENCE_RELPATH}"
+    assert env["GROUNDING_SAFE_EVIDENCE_DIR"] == f"{env['GROUNDING_ARTIFACT_ROOT']}/safe-evidence", (
+        "the safe-evidence directory must be derived from the single artifact root "
+        "the orchestrator actually writes to"
+    )
+
+
+def test_grounding_workflow_uploads_exactly_the_safe_evidence_directory() -> None:
+    workflow = load_workflow()
+    upload = step_with_uses(workflow, "upload-artifact")
+    with_block = dict(upload["with"])
+
+    assert with_block["path"].rstrip("/") == SAFE_EVIDENCE_RELPATH, (
+        "upload path must be the same safe-evidence directory the orchestrator writes"
+    )
+    assert with_block["if-no-files-found"] == "error", (
+        "missing evidence must fail the job instead of producing a green empty run"
+    )
+    assert with_block["retention-days"] == 30
+    assert str(upload["if"]).strip() == "always()"
+
+    for forbidden in ("artifacts/live", "runs/", "audit", "request.json", ".kubeconfig"):
+        assert forbidden not in with_block["path"]
+
+
+def test_grounding_workflow_step_summary_uses_the_same_safe_path() -> None:
+    workflow = load_workflow()
+    summary_steps = [s for s in steps(workflow) if "GITHUB_STEP_SUMMARY" in str(s.get("run", ""))]
+    assert len(summary_steps) == 1, "workflow must append the round summary exactly once"
+    summary_step = summary_steps[0]
+
+    condition = str(summary_step["if"])
+    assert "always()" in condition
+    hashed = re.search(r"hashFiles\(\s*'([^']+)'\s*\)", condition)
+    assert hashed, "summary step must guard with hashFiles() so an absent file skips"
+    assert hashed.group(1) == f"{SAFE_EVIDENCE_RELPATH}/round-summary.md"
+
+    body = str(summary_step["run"])
+    assert "GROUNDING_SAFE_EVIDENCE_DIR" in body, (
+        "the summary must be read from the single safe-evidence env value"
+    )
+    assert "round-summary.md" in body
+
+
+def test_grounding_workflow_pr_comment_reads_the_same_safe_path() -> None:
+    workflow = load_workflow()
+    comment_step = step_with_uses(workflow, "github-script")
+    env = effective_env(workflow, comment_step)
+    summary_path = env["GROUNDING_SUMMARY_PATH"]
+
+    assert summary_path == f"{WORKSPACE_EXPR}/{SAFE_EVIDENCE_RELPATH}/round-summary.md", (
+        "the PR comment must read the same file the orchestrator writes"
+    )
+    assert "process.env.GROUNDING_SUMMARY_PATH" in str(comment_step["with"]["script"])
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator invocation contract
+# ---------------------------------------------------------------------------
+
+
+def test_grounding_workflow_supplies_every_required_orchestrator_variable() -> None:
+    workflow = load_workflow()
+    provided = set(effective_env(workflow, orchestrator_step(workflow)))
+    required = required_orchestrator_env_vars()
+
+    assert required, "orchestrator script must guard its inputs with ${VAR:?...}"
+    missing = sorted(required - provided)
+    assert not missing, (
+        f"run-grounding-round.sh aborts under set -u without: {missing}"
+    )
+
+
+def test_grounding_workflow_never_suppresses_failures() -> None:
+    workflow = load_workflow()
+    job = grounding_job(workflow)
+
+    assert "continue-on-error" not in job
+    for step in steps(workflow):
+        assert "continue-on-error" not in step, (
+            f"step {step.get('name', step.get('uses'))!r} must not suppress its failure"
+        )
+
+    orchestrator = orchestrator_step(workflow)
+    assert "if" not in orchestrator, (
+        "the orchestrator step must run unconditionally so its exit status is the job's"
+    )
+
+    always_steps = [s for s in steps(workflow) if "always()" in str(s.get("if", ""))]
+    assert len(always_steps) >= 2, "summary and upload must run with always()"
+
+    orchestrator_index = steps(workflow).index(orchestrator)
+    for step in steps(workflow)[:orchestrator_index]:
+        assert "always()" not in str(step.get("if", "")), (
+            "setup steps must not run with always()"
+        )
+
+
+def test_grounding_workflow_provisions_korvid_env_out_of_tree() -> None:
+    workflow = load_workflow()
+    provisioning = [
+        s
+        for s in steps(workflow)
+        if s.get("working-directory") == "korvid" and "uv sync" in str(s.get("run", ""))
+    ]
+    assert provisioning, (
+        "the bridge runs `uv run --project <korvid> --no-sync`, which needs a "
+        "pre-existing environment for that checkout"
+    )
+    step = provisioning[0]
+    env = effective_env(workflow, step)
+    project_env = env.get("UV_PROJECT_ENVIRONMENT", "")
+
+    assert project_env.startswith("${{ runner.temp }}/"), (
+        "the Korvid environment must live outside the read-only checkout, under an "
+        f"absolute runner.temp path (got {project_env!r})"
+    )
+    assert "korvid/" not in project_env.removeprefix("${{ runner.temp }}/")
+
+    body = str(step["run"])
+    assert "--frozen" in body, "the checkout's uv.lock must never be rewritten"
+    assert "git status --porcelain" in body, (
+        "provisioning must prove the Korvid checkout is still unmodified"
+    )
+
+    orchestrator_env = effective_env(workflow, orchestrator_step(workflow))
+    assert orchestrator_env.get("UV_PROJECT_ENVIRONMENT") == project_env, (
+        "`uv run --no-sync` in the bridge must resolve the same out-of-tree env"
+    )
+    assert orchestrator_env["KORVID_SOURCE_ROOT"] == f"{WORKSPACE_EXPR}/korvid"
+
+
+def test_grounding_workflow_installs_prompt_lab_on_path() -> None:
+    workflow = load_workflow()
+    install = [
+        s
+        for s in steps(workflow)
+        if s.get("working-directory") == "prompt-lab" and "GITHUB_PATH" in str(s.get("run", ""))
+    ]
+    assert install, (
+        "the orchestrator calls korvid-prompt-lab/korvid-grounding-report directly, so "
+        "the installed environment's bin directory must be added to PATH"
+    )
+    env = effective_env(workflow, install[0])
+    assert env.get("UV_PROJECT_ENVIRONMENT", "").startswith("${{ runner.temp }}/")
+    assert env["UV_PROJECT_ENVIRONMENT"] != effective_env(
+        workflow, orchestrator_step(workflow)
+    ).get("UV_PROJECT_ENVIRONMENT"), (
+        "Prompt Lab and Korvid must not share one uv environment"
     )

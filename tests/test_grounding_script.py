@@ -125,9 +125,9 @@ def _run_script_with_signal(
         stderr=subprocess.PIPE,
         text=True,
         env=env,
-        preexec_fn=os.setpgrp,  # isolate in a new process group so the signal
-        # reaches bash and all its children (e.g. the blocking sleep) without
-        # propagating back to the pytest runner
+        start_new_session=True,  # isolate in a new session/process group so the
+        # signal reaches bash and all its children (e.g. the blocking sleep)
+        # without propagating back to the pytest runner
     )
     # Wait for aks-check shim to signal readiness (up to 10 s)
     deadline = time.monotonic() + 10
@@ -168,6 +168,7 @@ def _make_fake_bin(
         f"""\
         CALLS="{calls_file}"
         if [[ "$*" == *"nodepool show"* ]]; then
+            echo "nodepool-show" >> "$CALLS"
             echo {node_count}
         elif [[ "$*" == *"nodepool scale"*"--node-count 1"* ]]; then
             echo "scale:1" >> "$CALLS"
@@ -486,3 +487,54 @@ def test_round_script_optimize_credential_not_in_report_args(tmp_path: Path) -> 
     assert result.returncode == 0, result.stderr
     leaked = [line for line in calls if line.startswith("report arg=") and credential in line]
     assert not leaked, f"credential leaked into report argv: {leaked}"
+
+
+def test_round_script_rejects_optimize_without_reflection_model_before_any_cloud_call(
+    tmp_path: Path,
+) -> None:
+    """Missing reflection config must fail before the pool is read or scaled up."""
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        round_type="optimize-evaluate",
+        extra_env={"GROUNDING_REFLECTION_MODEL": ""},
+    )
+
+    assert result.returncode != 0
+    assert "GROUNDING_REFLECTION_MODEL" in result.stderr
+    assert calls == [], (
+        "misconfiguration must not read, scale, or wait on the modeleval pool"
+    )
+
+
+def test_round_script_rejects_optimize_without_reflection_credential_before_any_cloud_call(
+    tmp_path: Path,
+) -> None:
+    """A missing reflection credential must not cost a GPU node or a 15-minute wait."""
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        round_type="optimize-evaluate",
+        extra_env={"GROUNDING_REFLECTION_CREDENTIAL": ""},
+    )
+
+    assert result.returncode != 0
+    assert "GROUNDING_REFLECTION_CREDENTIAL" in result.stderr
+    assert calls == []
+
+
+def test_round_script_evaluate_round_ignores_absent_reflection_config(tmp_path: Path) -> None:
+    """Evaluate-only rounds must run without any reflection credential."""
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        evaluation_exit=0,
+        extra_env={
+            "GROUNDING_REFLECTION_MODEL": "",
+            "GROUNDING_REFLECTION_CREDENTIAL": "",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "evaluate" in calls
+    assert "optimize" not in calls
