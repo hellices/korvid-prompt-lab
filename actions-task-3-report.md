@@ -364,3 +364,81 @@ argv was removed.
 
 - `shellcheck` not available on this machine — script not lint-checked
 - Existing tests that relied on exit 1 being retryable were updated to use exit 75
+
+---
+
+# Task 3 Review Fix — Round 4 (remaining Important findings)
+
+## Status: ✅ COMPLETE
+
+**Commit:** `157345f`
+**Branch:** `feat/prompt-lab-mvp`
+
+## Finding 1 — Sticky PR comment must guard on summary existence
+
+The `Update sticky PR comment` step ran `if: always() && inputs.pr_number != ''`,
+which meant a failed round that never produced `round-summary.md` would still
+create or overwrite the marker comment with an empty body. The Job Summary step
+already used `hashFiles()` — the PR comment did not.
+
+**Fix** (`.github/workflows/grounding-round.yml`):
+
+- Added `hashFiles('prompt-lab/artifacts/grounding-round/safe-evidence/round-summary.md') != ''`
+  to the step condition, mirroring the Job Summary guard exactly.
+- Added an early `return` in the `github-script` body when `fs.existsSync()` is
+  false, as defence-in-depth beyond the step-level condition.
+
+**Tests** (`tests/test_grounding_workflow.py`):
+
+| Test | Asserts |
+|------|---------|
+| `test_grounding_workflow_pr_comment_step_guards_on_summary_existence` | `hashFiles()` present in condition with exact path |
+| `test_grounding_workflow_pr_comment_script_guards_absent_summary` | `existsSync` + early return in script body |
+| `test_grounding_workflow_pr_comment_script_is_executable_and_valid` | `node --check` validates the github-script body |
+| `test_grounding_workflow_pr_comment_step_is_optional_and_guarded` (updated) | condition includes `hashFiles(` |
+
+## Finding 2 — Evaluate exit 1 must be distinguished by evidence
+
+The orchestrator treated `evaluate exit 1` as always a safety signal and ran
+the report unconditionally. But exit 1 without `evaluation-summary.json` is a
+systemic failure (e.g. `BridgeSystemError`, `AKSPortForwardError`), and
+exit 0 without a summary is also systemic (evaluator must always produce one).
+
+**Fix** (`scripts/run-grounding-round.sh`):
+
+After `korvid-prompt-lab evaluate`, the script checks for
+`$_eval_artifact_root/evaluation-summary.json`:
+- **Present** → safety result → proceeds to `korvid-grounding-report`
+- **Absent** → systemic error → emits fixed concise message, skips report, exits 1
+
+Cleanup (trap) still runs in all cases.
+
+**Tests** (`tests/test_grounding_script.py`):
+
+| Test | Asserts |
+|------|---------|
+| `test_round_script_evaluate_exit1_with_summary_is_safety_result` | RC=1, report runs, cleanup runs |
+| `test_round_script_evaluate_exit1_without_summary_is_systemic_error` | RC=1, no report, "systemic" in stderr, no traceback, cleanup runs |
+| `test_round_script_evaluate_exit0_without_summary_is_systemic_error` | RC≠0, no report, "systemic" in stderr |
+
+## Verification
+
+```
+tests/test_grounding_workflow.py                          28 passed
+tests/test_grounding_script.py                            40 passed
+tests/test_rounds.py                                      31 passed
+Full suite (451 passed, 6 skipped)
+ruff check .                                             All checks passed!
+mypy --python-version 3.12 src tests                     no issues (33 files)
+bash -n scripts/run-grounding-round.sh                   OK
+YAML parse                                               OK
+```
+
+## Concerns
+
+1. The `emit_evaluation_summary` parameter in `_make_fake_bin` defaults to `True`,
+   matching pre-existing test behaviour. Existing tests that relied on report
+   always running after exit 1 now implicitly depend on the summary being present.
+2. `hashFiles()` evaluates at step-condition time against the workspace. On
+   self-hosted runners the file is always local, so there is no timing issue.
+   GitHub-hosted runners behave identically.

@@ -353,6 +353,14 @@ if (( evaluate_exit != 0 && evaluate_exit != 1 )); then
   exit "$evaluate_exit"
 fi
 
+# Distinguish safety exit 1 (summary present) from systemic exit 1 (no summary).
+# Exit 0 without a summary is also systemic — the evaluator must always produce one.
+_eval_summary="${_eval_artifact_root}/evaluation-summary.json"
+if [[ ! -f "$_eval_summary" ]]; then
+  echo "evaluate did not produce evaluation-summary.json (systemic error)" >&2
+  exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # Report (runs even when evaluate exits 1)
 # ---------------------------------------------------------------------------

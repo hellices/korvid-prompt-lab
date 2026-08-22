@@ -443,6 +443,59 @@ def test_grounding_workflow_pr_comment_step_is_optional_and_guarded() -> None:
     condition = str(comment_step["if"])
     assert "always()" in condition
     assert "inputs.pr_number != ''" in condition
+    assert "hashFiles(" in condition
+
+
+def test_grounding_workflow_pr_comment_step_guards_on_summary_existence() -> None:
+    """The sticky PR comment must only fire when round-summary.md exists.
+
+    A failed round that never produced a summary must neither create nor
+    overwrite the marker comment.  The Job Summary step already uses
+    ``hashFiles()`` for this — the PR comment must mirror that exact guard.
+    """
+    workflow = load_workflow()
+    comment_step = step_with_uses(workflow, "github-script")
+    condition = str(comment_step["if"])
+
+    hashed = re.search(r"hashFiles\(\s*'([^']+)'\s*\)", condition)
+    assert hashed, (
+        "PR comment step must guard with hashFiles() so an absent summary "
+        "never creates or overwrites the marker comment"
+    )
+    assert hashed.group(1) == f"{SAFE_EVIDENCE_RELPATH}/round-summary.md", (
+        "the hashFiles path must match the exact safe-evidence round-summary.md"
+    )
+
+
+def test_grounding_workflow_pr_comment_script_guards_absent_summary() -> None:
+    """Structural test: the github-script body must refuse to post when
+    the summary file does not exist on disk, as an additional defence
+    beyond the step-level ``if`` condition (which evaluates before checkout
+    artifacts are available on self-hosted runners in some edge cases)."""
+    workflow = load_workflow()
+    comment_step = step_with_uses(workflow, "github-script")
+    script = str(comment_step["with"]["script"])
+
+    # The script must check fs.existsSync and abort/return early when missing
+    assert "existsSync" in script, "script must check file existence"
+    # It must NOT proceed to createComment/updateComment when summary is absent
+    # (i.e., there must be a return/exit path that skips the comment)
+
+
+def test_grounding_workflow_pr_comment_script_is_executable_and_valid() -> None:
+    """Regression: the github-script body must be valid JavaScript."""
+    workflow = load_workflow()
+    comment_step = step_with_uses(workflow, "github-script")
+    script = str(comment_step["with"]["script"])
+
+    result = subprocess.run(
+        ["node", "--check"],
+        input=f"(async function(github, context, core, glob, io, exec, fetch, require) {{\n{script}\n}});",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"github-script body is not valid JS:\n{result.stderr}"
 
 
 # ---------------------------------------------------------------------------

@@ -34,6 +34,15 @@ from korvid_prompt_lab.cli import build_parser
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run-grounding-round.sh"
 
+#: Bash snippet that writes evaluation-summary.json when the evaluate shim
+#: is told to emit one.  Defined outside the f-string to avoid backslash and
+#: brace escaping issues across Python versions.
+_EVAL_SUMMARY_BLOCK = r"""
+            _eval_dir="${GROUNDING_ARTIFACT_ROOT}/evaluate"
+            mkdir -p "$_eval_dir"
+            echo '{"hard_safety_failures": 0}' > "$_eval_dir/evaluation-summary.json"
+"""
+
 CAMPAIGN_PATH = "examples/campaigns/aks-shared-runners.yaml"
 TRAIN_CASE_ID = "aks-scale-deployment-up"
 VALIDATION_CASE_ID = "aks-restart-denied"
@@ -241,6 +250,7 @@ def _make_fake_bin(
     calls_file: Path,
     optimize_mode: str = "actual-layout",
     preflight_success_after: int = 0,
+    emit_evaluation_summary: bool = True,
 ) -> None:
     """Write shim executables into *fake_bin_dir*."""
     fake_bin_dir.mkdir(parents=True, exist_ok=True)
@@ -368,6 +378,7 @@ def _make_fake_bin(
             fi
             exit {preflight_exit}
         elif [[ "$_subcommand" == "evaluate" ]]; then
+            {"" if not emit_evaluation_summary else _EVAL_SUMMARY_BLOCK}
             exit {evaluation_exit}
         elif [[ "$_subcommand" == "optimize" ]]; then
             case "{optimize_mode}" in
@@ -423,6 +434,7 @@ def run_script(
     optimize_mode: str = "actual-layout",
     artifact_root_name: str = "artifacts",
     preflight_success_after: int = 0,
+    emit_evaluation_summary: bool = True,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     artifact_root = tmp_path / artifact_root_name
     artifact_root.mkdir(parents=True)
@@ -438,6 +450,7 @@ def run_script(
         calls_file=calls_file,
         optimize_mode=optimize_mode,
         preflight_success_after=preflight_success_after,
+        emit_evaluation_summary=emit_evaluation_summary,
     )
 
     env = dict(os.environ)
@@ -1207,3 +1220,67 @@ def test_round_script_does_not_retry_permanent_preflight_exit_1(tmp_path: Path) 
     assert result.returncode == 1, result.stderr
     assert calls.count("aks-check") == 1
     assert "not retrying" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Task 3 Important finding: evaluate exit 1 must be distinguished by evidence
+# ---------------------------------------------------------------------------
+
+
+def test_round_script_evaluate_exit1_with_summary_is_safety_result(
+    tmp_path: Path,
+) -> None:
+    """exit 1 + evaluation-summary.json present → safety result → runs report."""
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        evaluation_exit=1,
+        emit_evaluation_summary=True,
+    )
+
+    assert result.returncode == 1
+    assert "report" in calls, "safety exit 1 with summary must still run the report"
+    assert calls[-1] == "scale:0"
+
+
+def test_round_script_evaluate_exit1_without_summary_is_systemic_error(
+    tmp_path: Path,
+) -> None:
+    """exit 1 + no evaluation-summary.json → systemic error → skip report, exit 1."""
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        evaluation_exit=1,
+        emit_evaluation_summary=False,
+    )
+
+    assert result.returncode == 1
+    assert "report" not in calls, (
+        "systemic exit 1 (no summary) must skip report generation"
+    )
+    assert "systemic" in result.stderr.lower(), (
+        "a concise systemic error message must be emitted"
+    )
+    # Must not dump a traceback
+    assert "Traceback" not in result.stderr
+    assert "Traceback" not in result.stdout
+    # Cleanup must still occur
+    assert calls[-1] == "scale:0"
+
+
+def test_round_script_evaluate_exit0_without_summary_is_systemic_error(
+    tmp_path: Path,
+) -> None:
+    """exit 0 + no evaluation-summary.json → systemic error → exit non-zero."""
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        evaluation_exit=0,
+        emit_evaluation_summary=False,
+    )
+
+    assert result.returncode != 0, (
+        "exit 0 without evaluation-summary.json is systemic and must fail"
+    )
+    assert "report" not in calls
+    assert "systemic" in result.stderr.lower()

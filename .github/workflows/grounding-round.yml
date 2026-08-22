@@ -398,7 +398,7 @@ jobs:
       # 13. Sticky PR comment (optional, only when pr_number is provided)
       # -----------------------------------------------------------------------
       - name: Update sticky PR comment
-        if: always() && inputs.pr_number != ''
+        if: always() && inputs.pr_number != '' && hashFiles('prompt-lab/artifacts/grounding-round/safe-evidence/round-summary.md') != ''
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
         env:
           GROUNDING_MODEL: ${{ inputs.model }}
@@ -440,6 +440,9 @@ jobs:
             let summaryBody = '';
             if (summaryPath && fs.existsSync(summaryPath)) {
               summaryBody = fs.readFileSync(summaryPath, 'utf8');
+            } else {
+              core.info('round-summary.md not found; skipping PR comment');
+              return;
             }
 
             const body = [
