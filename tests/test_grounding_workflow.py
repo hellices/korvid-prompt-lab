@@ -19,6 +19,8 @@ quotes the key.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -117,6 +119,35 @@ def orchestrator_step(workflow: dict[str, Any]) -> dict[str, Any]:
         s for s in steps(workflow) if "run-grounding-round.sh" in str(s.get("run", ""))
     ]
     assert len(matches) == 1, "workflow must invoke run-grounding-round.sh exactly once"
+    return matches[0]
+
+
+def github_script_steps(workflow: dict[str, Any]) -> list[dict[str, Any]]:
+    return steps_with_uses(workflow, "github-script")
+
+
+def trust_verification_step(workflow: dict[str, Any]) -> dict[str, Any]:
+    """The github-script step that proves ``prompt_lab_ref`` is trusted code."""
+    matches = [
+        s
+        for s in github_script_steps(workflow)
+        if "PROMPT_LAB_REF" in dict(s.get("env", {}))
+    ]
+    assert len(matches) == 1, (
+        "exactly one github-script step must verify the requested Prompt Lab commit "
+        "against the repository before anything is checked out"
+    )
+    return matches[0]
+
+
+def pr_comment_step(workflow: dict[str, Any]) -> dict[str, Any]:
+    """The github-script step that publishes the sticky PR comment."""
+    matches = [
+        s
+        for s in github_script_steps(workflow)
+        if "GROUNDING_SUMMARY_PATH" in dict(s.get("env", {}))
+    ]
+    assert len(matches) == 1, "exactly one github-script step must post the PR comment"
     return matches[0]
 
 
@@ -289,6 +320,352 @@ def test_grounding_workflow_records_the_checked_out_prompt_lab_revision() -> Non
 
 
 # ---------------------------------------------------------------------------
+# Trust boundary: the requested commit must be repository code, proven before
+# any checkout, app token, or Azure login exists
+# ---------------------------------------------------------------------------
+
+
+def test_grounding_workflow_proves_ref_provenance_before_checkout_and_credentials() -> (
+    None
+):
+    """A 40-hex SHA is not provenance.
+
+    ``actions/checkout`` can fetch any commit the repository can reach, including
+    the head of a *fork* pull request through ``refs/pull/<n>/head``.  Checking
+    such a commit out would run unreviewed third-party code beside the Korvid app
+    token and the Azure OIDC session, so the commit's provenance must be proven
+    before the first checkout and before any credential is minted.
+    """
+    workflow = load_workflow()
+    all_steps = steps(workflow)
+    trust = trust_verification_step(workflow)
+    trust_index = all_steps.index(trust)
+
+    checkout_indexes = [
+        index
+        for index, step in enumerate(all_steps)
+        if "actions/checkout" in str(step.get("uses", ""))
+    ]
+    assert checkout_indexes, "workflow must check something out"
+    assert all(trust_index < index for index in checkout_indexes), (
+        "the requested commit must be proven trusted before it is checked out"
+    )
+    assert trust_index < step_index(workflow, "create-github-app-token"), (
+        "provenance must be proven before the Korvid app token exists"
+    )
+    assert trust_index < step_index(workflow, "azure/login"), (
+        "provenance must be proven before an Azure session exists"
+    )
+
+    assert "if" not in trust, "the trust check must never be skipped"
+    assert "continue-on-error" not in trust, "a failed trust check must fail the job"
+
+
+def test_grounding_workflow_trust_check_binds_only_env_values() -> None:
+    workflow = load_workflow()
+    trust = trust_verification_step(workflow)
+    env = effective_env(workflow, trust)
+    script = str(trust["with"]["script"])
+
+    assert env.get("PROMPT_LAB_REF") == "${{ inputs.prompt_lab_ref }}"
+    assert env.get("PR_NUMBER") == "${{ inputs.pr_number }}"
+    assert env.get("EXPECTED_REPOSITORY") == "${{ github.repository }}"
+    assert env.get("DEFAULT_BRANCH") == "${{ github.event.repository.default_branch }}"
+
+    assert "${{" not in script, (
+        "no dispatch value may be interpolated into the script source text"
+    )
+    for name in ("PROMPT_LAB_REF", "PR_NUMBER", "EXPECTED_REPOSITORY", "DEFAULT_BRANCH"):
+        assert f"process.env.{name}" in script, (
+            f"{name} must be read from process.env at run time"
+        )
+
+    assert re.search(r"\^\[0-9a-f\]\{40\}\$", script), (
+        "the trust check must re-validate the ref as an exact 40-hex commit SHA"
+    )
+    assert "pulls.get" in script, (
+        "a supplied pr_number must be resolved against this repository's pull requests"
+    )
+    assert "compareCommits" in script, (
+        "without a pr_number the ref must be proven contained in the default branch"
+    )
+
+
+def test_grounding_workflow_trust_check_uses_the_jobs_own_read_only_token() -> None:
+    workflow = load_workflow()
+    trust = trust_verification_step(workflow)
+    with_block = dict(trust["with"])
+
+    assert with_block.get("github-token") == "${{ github.token }}", (
+        "provenance must be established with the job's own read-only token, never "
+        "with the Korvid app token or any elevated credential"
+    )
+
+
+def test_grounding_workflow_trust_check_script_is_valid_javascript() -> None:
+    workflow = load_workflow()
+    script = str(trust_verification_step(workflow)["with"]["script"])
+
+    result = subprocess.run(
+        ["node", "--check"],
+        input=(
+            "(async function(github, context, core, glob, io, exec, fetch, require) {\n"
+            f"{script}\n}});"
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"trust script is not valid JS:\n{result.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# Executable trust logic: run the workflow's own script against a fake API
+# ---------------------------------------------------------------------------
+
+REPOSITORY = "hellices/korvid-prompt-lab"
+TRUSTED_SHA = "a" * 40
+OTHER_SHA = "b" * 40
+
+
+def run_trust_script(
+    tmp_path: Path,
+    *,
+    prompt_lab_ref: str = TRUSTED_SHA,
+    pr_number: str = "",
+    expected_repository: str = REPOSITORY,
+    default_branch: str = "main",
+    pull: dict[str, Any] | None = None,
+    pull_error: str | None = None,
+    compare: dict[str, Any] | None = None,
+    compare_error: str | None = None,
+    basehead_compare_available: bool = True,
+) -> dict[str, Any]:
+    """Execute the workflow's own trust script against a scripted GitHub API."""
+    script = str(trust_verification_step(load_workflow())["with"]["script"])
+    tmp_path.mkdir(parents=True, exist_ok=True)
+
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(
+        json.dumps(
+            {
+                "owner": REPOSITORY.split("/")[0],
+                "repo": REPOSITORY.split("/")[1],
+                "pull": pull,
+                "pullError": pull_error,
+                "compare": compare,
+                "compareError": compare_error,
+                "baseheadCompareAvailable": basehead_compare_available,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    harness_path = tmp_path / "harness.js"
+    harness_path.write_text(
+        "const fs = require('fs');\n"
+        "const fixture = JSON.parse(fs.readFileSync(process.env.TRUST_FIXTURE, 'utf8'));\n"
+        "const calls = [];\n"
+        "const failures = [];\n"
+        "const infos = [];\n"
+        "const core = {\n"
+        "  setFailed: (message) => failures.push(String(message)),\n"
+        "  info: (message) => infos.push(String(message)),\n"
+        "  notice: (message) => infos.push(String(message)),\n"
+        "  warning: (message) => infos.push(String(message)),\n"
+        "};\n"
+        "const context = { repo: { owner: fixture.owner, repo: fixture.repo } };\n"
+        "const compare = (name) => async (params) => {\n"
+        "  calls.push({ name, params });\n"
+        "  if (fixture.compareError) { throw new Error(fixture.compareError); }\n"
+        "  return { data: fixture.compare };\n"
+        "};\n"
+        "const repos = { compareCommits: compare('compareCommits') };\n"
+        "if (fixture.baseheadCompareAvailable) {\n"
+        "  repos.compareCommitsWithBasehead = compare('compareCommitsWithBasehead');\n"
+        "}\n"
+        "const github = { rest: {\n"
+        "  pulls: { get: async (params) => {\n"
+        "    calls.push({ name: 'pulls.get', params });\n"
+        "    if (fixture.pullError) { throw new Error(fixture.pullError); }\n"
+        "    return { data: fixture.pull };\n"
+        "  } },\n"
+        "  repos,\n"
+        "} };\n"
+        "const step = async function (github, context, core, require) {\n"
+        f"{script}\n"
+        "};\n"
+        "step(github, context, core, require)\n"
+        "  .then(() => console.log(JSON.stringify({ failures, infos, calls })))\n"
+        "  .catch((error) => console.log(JSON.stringify({\n"
+        "    failures: failures.concat(['threw: ' + error.message]),\n"
+        "    infos, calls, threw: true,\n"
+        "  })));\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["node", str(harness_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "TRUST_FIXTURE": str(fixture_path),
+            "PROMPT_LAB_REF": prompt_lab_ref,
+            "PR_NUMBER": pr_number,
+            "EXPECTED_REPOSITORY": expected_repository,
+            "DEFAULT_BRANCH": default_branch,
+        },
+    )
+    assert result.returncode == 0, f"harness failed:\n{result.stderr}"
+    outcome: dict[str, Any] = json.loads(result.stdout)
+    assert not outcome.get("threw"), f"trust script threw: {outcome['failures']}"
+    return outcome
+
+
+def same_repo_pull(sha: str = TRUSTED_SHA) -> dict[str, Any]:
+    return {"number": 42, "head": {"sha": sha, "repo": {"full_name": REPOSITORY}}}
+
+
+def test_trust_script_accepts_a_same_repository_pull_request_head(
+    tmp_path: Path,
+) -> None:
+    outcome = run_trust_script(
+        tmp_path / "same-repo-pr",
+        pr_number="42",
+        pull=same_repo_pull(),
+    )
+
+    assert outcome["failures"] == [], outcome["failures"]
+    assert [call["name"] for call in outcome["calls"]] == ["pulls.get"]
+    assert outcome["calls"][0]["params"]["pull_number"] == 42
+    assert outcome["calls"][0]["params"]["owner"] == REPOSITORY.split("/")[0]
+    assert outcome["calls"][0]["params"]["repo"] == REPOSITORY.split("/")[1]
+
+
+def test_trust_script_rejects_a_fork_pull_request_head(tmp_path: Path) -> None:
+    outcome = run_trust_script(
+        tmp_path / "fork-pr",
+        pr_number="42",
+        pull={
+            "number": 42,
+            "head": {"sha": TRUSTED_SHA, "repo": {"full_name": "attacker/fork"}},
+        },
+    )
+
+    assert outcome["failures"], "a fork head commit must never be grounded"
+    assert "fork" in outcome["failures"][0].lower()
+
+
+def test_trust_script_rejects_a_deleted_fork_pull_request_head(tmp_path: Path) -> None:
+    """A deleted fork leaves ``head.repo`` null; that must not read as same-repo."""
+    outcome = run_trust_script(
+        tmp_path / "deleted-fork-pr",
+        pr_number="42",
+        pull={"number": 42, "head": {"sha": TRUSTED_SHA, "repo": None}},
+    )
+
+    assert outcome["failures"], "an unresolvable head repository must be rejected"
+
+
+def test_trust_script_rejects_a_ref_that_is_not_the_pull_request_head(
+    tmp_path: Path,
+) -> None:
+    outcome = run_trust_script(
+        tmp_path / "sha-mismatch",
+        prompt_lab_ref=OTHER_SHA,
+        pr_number="42",
+        pull=same_repo_pull(TRUSTED_SHA),
+    )
+
+    assert outcome["failures"], "a ref other than the PR head must be rejected"
+    assert "head" in outcome["failures"][0].lower()
+
+
+def test_trust_script_rejects_a_pr_number_that_is_not_a_pull_request(
+    tmp_path: Path,
+) -> None:
+    outcome = run_trust_script(
+        tmp_path / "not-a-pr",
+        pr_number="4242",
+        pull_error="HttpError: Not Found",
+    )
+
+    assert outcome["failures"], "a number that is not a PR in this repo must fail"
+
+
+@pytest.mark.parametrize("status", ["ahead", "identical"])
+def test_trust_script_accepts_a_default_branch_ancestor(
+    tmp_path: Path, status: str
+) -> None:
+    outcome = run_trust_script(
+        tmp_path / f"ancestor-{status}",
+        compare={"status": status},
+    )
+
+    assert outcome["failures"] == [], outcome["failures"]
+    calls = [call["name"] for call in outcome["calls"]]
+    assert calls == ["compareCommitsWithBasehead"]
+    assert outcome["calls"][0]["params"]["basehead"] == f"{TRUSTED_SHA}...main"
+
+
+@pytest.mark.parametrize("status", ["diverged", "behind"])
+def test_trust_script_rejects_an_unmerged_ref_without_a_pull_request(
+    tmp_path: Path, status: str
+) -> None:
+    outcome = run_trust_script(
+        tmp_path / f"unmerged-{status}",
+        compare={"status": status},
+    )
+
+    assert outcome["failures"], (
+        "a commit that is not contained in the default branch must be rejected "
+        "when no same-repository pull request vouches for it"
+    )
+
+
+def test_trust_script_still_compares_without_the_basehead_endpoint(
+    tmp_path: Path,
+) -> None:
+    """Older octokit builds expose only ``compareCommits``; containment still holds."""
+    outcome = run_trust_script(
+        tmp_path / "legacy-compare",
+        compare={"status": "ahead"},
+        basehead_compare_available=False,
+    )
+
+    assert outcome["failures"] == [], outcome["failures"]
+    assert [call["name"] for call in outcome["calls"]] == ["compareCommits"]
+    assert outcome["calls"][0]["params"]["base"] == TRUSTED_SHA
+    assert outcome["calls"][0]["params"]["head"] == "main"
+
+
+def test_trust_script_rejects_a_ref_unknown_to_the_repository(tmp_path: Path) -> None:
+    outcome = run_trust_script(
+        tmp_path / "unknown-commit",
+        compare_error="HttpError: Not Found",
+    )
+
+    assert outcome["failures"], "a commit this repository cannot resolve must fail"
+
+
+def test_trust_script_rejects_a_non_sha_ref(tmp_path: Path) -> None:
+    outcome = run_trust_script(tmp_path / "branch-ref", prompt_lab_ref="main")
+
+    assert outcome["failures"], "a branch name must never reach checkout"
+    assert outcome["calls"] == [], "a malformed ref must not even be queried"
+
+
+def test_trust_script_rejects_a_malformed_pr_number(tmp_path: Path) -> None:
+    outcome = run_trust_script(tmp_path / "bad-pr", pr_number="0; rm -rf /")
+
+    assert outcome["failures"], "a malformed pr_number must be rejected"
+    assert outcome["calls"] == []
+
+
+# ---------------------------------------------------------------------------
 # Supply chain: every action pinned to a real, known commit
 # ---------------------------------------------------------------------------
 
@@ -415,7 +792,7 @@ def test_grounding_workflow_scripts_never_interpolate_expressions() -> None:
 
 def test_grounding_workflow_pr_comment_reads_validated_input_from_env() -> None:
     workflow = load_workflow()
-    comment_step = step_with_uses(workflow, "github-script")
+    comment_step = pr_comment_step(workflow)
     script = str(comment_step["with"]["script"])
     env = effective_env(workflow, comment_step)
 
@@ -439,7 +816,7 @@ def test_grounding_workflow_pr_comment_reads_validated_input_from_env() -> None:
 
 def test_grounding_workflow_pr_comment_step_is_optional_and_guarded() -> None:
     workflow = load_workflow()
-    comment_step = step_with_uses(workflow, "github-script")
+    comment_step = pr_comment_step(workflow)
     condition = str(comment_step["if"])
     assert "always()" in condition
     assert "inputs.pr_number != ''" in condition
@@ -454,7 +831,7 @@ def test_grounding_workflow_pr_comment_step_guards_on_summary_existence() -> Non
     ``hashFiles()`` for this — the PR comment must mirror that exact guard.
     """
     workflow = load_workflow()
-    comment_step = step_with_uses(workflow, "github-script")
+    comment_step = pr_comment_step(workflow)
     condition = str(comment_step["if"])
 
     hashed = re.search(r"hashFiles\(\s*'([^']+)'\s*\)", condition)
@@ -473,7 +850,7 @@ def test_grounding_workflow_pr_comment_script_guards_absent_summary() -> None:
     beyond the step-level ``if`` condition (which evaluates before checkout
     artifacts are available on self-hosted runners in some edge cases)."""
     workflow = load_workflow()
-    comment_step = step_with_uses(workflow, "github-script")
+    comment_step = pr_comment_step(workflow)
     script = str(comment_step["with"]["script"])
 
     # The script must check fs.existsSync and abort/return early when missing
@@ -485,7 +862,7 @@ def test_grounding_workflow_pr_comment_script_guards_absent_summary() -> None:
 def test_grounding_workflow_pr_comment_script_is_executable_and_valid() -> None:
     """Regression: the github-script body must be valid JavaScript."""
     workflow = load_workflow()
-    comment_step = step_with_uses(workflow, "github-script")
+    comment_step = pr_comment_step(workflow)
     script = str(comment_step["with"]["script"])
 
     result = subprocess.run(
@@ -570,7 +947,7 @@ def test_grounding_workflow_step_summary_uses_the_same_safe_path() -> None:
 
 def test_grounding_workflow_pr_comment_reads_the_same_safe_path() -> None:
     workflow = load_workflow()
-    comment_step = step_with_uses(workflow, "github-script")
+    comment_step = pr_comment_step(workflow)
     env = effective_env(workflow, comment_step)
     summary_path = env["GROUNDING_SUMMARY_PATH"]
 
@@ -867,10 +1244,12 @@ def test_grounding_workflow_restores_the_recorded_node_count_with_always() -> No
 
     restore_index = all_steps.index(restore)
     assert restore_index == len(all_steps) - 1, "cleanup must be the final step"
-    for needle in ("upload-artifact", "github-script"):
-        assert step_index(workflow, needle) < restore_index, (
-            f"{needle} must run before cleanup so evidence survives a cleanup failure"
-        )
+    assert step_index(workflow, "upload-artifact") < restore_index, (
+        "upload-artifact must run before cleanup so evidence survives a cleanup failure"
+    )
+    assert all_steps.index(pr_comment_step(workflow)) < restore_index, (
+        "the PR comment must run before cleanup so evidence survives a cleanup failure"
+    )
     summary_index = next(
         index
         for index, step in enumerate(all_steps)

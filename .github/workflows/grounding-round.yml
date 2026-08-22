@@ -4,10 +4,14 @@ name: Grounding Round
 # --------------
 # This definition executes from the repository default branch only.  The Prompt
 # Lab revision that actually runs is the reviewed commit named by the required
-# `prompt_lab_ref` input, which must be an exact 40-hex commit SHA.  Dispatch
-# inputs are validated before any credential is used, and no input is ever
-# interpolated into shell or JavaScript source text: values reach scripts only
-# through `env:` and are read at runtime.
+# `prompt_lab_ref` input, which must be an exact 40-hex commit SHA *and* must be
+# proven to be repository code before anything is checked out: either the head
+# commit of a same-repository pull request named by `pr_number`, or a commit the
+# trusted default branch contains.  Fork pull request heads are refused.
+# Dispatch inputs are validated and the ref's provenance is established before
+# any credential is used, and no input is ever interpolated into shell or
+# JavaScript source text: values reach scripts only through `env:` and are read
+# at runtime.
 
 "on":
   workflow_dispatch:
@@ -201,7 +205,128 @@ jobs:
           fi
 
       # -----------------------------------------------------------------------
-      # 2. Check out the approved Prompt Lab commit (read-only GITHUB_TOKEN)
+      # 2. Prove the requested Prompt Lab commit is trusted repository code
+      #
+      # A 40-hex SHA is a *shape*, not provenance: `actions/checkout` can fetch
+      # any commit this repository can reach, including the head of a fork pull
+      # request through `refs/pull/<n>/head`.  Checking such a commit out would
+      # execute unreviewed third-party code beside the Korvid app token and the
+      # Azure OIDC session, so provenance is proven here — before the first
+      # checkout and before any credential exists — using only the job's own
+      # read-only GITHUB_TOKEN.  Every value reaches the script through `env:`.
+      #
+      # Accepted: the head commit of a pull request whose head repository is
+      # this repository (a same-repository branch already requires write
+      # access), or a commit contained in the trusted default branch.
+      # Rejected: fork heads, a ref that is not the named pull request's head,
+      # and any commit that the default branch does not contain.
+      # -----------------------------------------------------------------------
+      - name: Verify the Prompt Lab commit is trusted
+        id: trust
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        env:
+          PROMPT_LAB_REF: ${{ inputs.prompt_lab_ref }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const ref = (process.env.PROMPT_LAB_REF || '').trim();
+            const rawPrNumber = (process.env.PR_NUMBER || '').trim();
+            const expectedRepository = (process.env.EXPECTED_REPOSITORY || '').trim();
+            const defaultBranch = (process.env.DEFAULT_BRANCH || '').trim();
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            if (!/^[0-9a-f]{40}$/.test(ref)) {
+              core.setFailed('prompt_lab_ref must be an exact 40-hex commit SHA, not a branch or tag');
+              return;
+            }
+            if (expectedRepository.toLowerCase() !== (owner + '/' + repo).toLowerCase()) {
+              core.setFailed('the workflow repository could not be established');
+              return;
+            }
+            if (!defaultBranch) {
+              core.setFailed('the repository default branch could not be established');
+              return;
+            }
+
+            if (rawPrNumber) {
+              if (!/^[1-9][0-9]{0,9}$/.test(rawPrNumber)) {
+                core.setFailed('pr_number must be a positive integer or blank');
+                return;
+              }
+              const prNumber = Number(rawPrNumber);
+
+              let pull;
+              try {
+                const response = await github.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: prNumber,
+                });
+                pull = response.data;
+              } catch (error) {
+                core.setFailed('pr_number ' + prNumber + ' is not a pull request in ' + expectedRepository);
+                return;
+              }
+
+              const head = (pull && pull.head) || {};
+              const headRepository = (head.repo && head.repo.full_name) || '';
+              if (headRepository.toLowerCase() !== expectedRepository.toLowerCase()) {
+                core.setFailed(
+                  'pull request ' + prNumber + ' has head repository ' +
+                  (headRepository || 'unknown') + '; only ' + expectedRepository +
+                  ' commits are grounded, so fork pull requests are refused'
+                );
+                return;
+              }
+              if (head.sha !== ref) {
+                core.setFailed(
+                  'prompt_lab_ref is not the head commit of pull request ' + prNumber
+                );
+                return;
+              }
+
+              core.info('prompt_lab_ref is the head of same-repository pull request ' + prNumber);
+              return;
+            }
+
+            let comparison;
+            try {
+              const response = github.rest.repos.compareCommitsWithBasehead
+                ? await github.rest.repos.compareCommitsWithBasehead({
+                    owner,
+                    repo,
+                    basehead: ref + '...' + defaultBranch,
+                  })
+                : await github.rest.repos.compareCommits({
+                    owner,
+                    repo,
+                    base: ref,
+                    head: defaultBranch,
+                  });
+              comparison = response.data;
+            } catch (error) {
+              core.setFailed('prompt_lab_ref is not a commit in ' + expectedRepository);
+              return;
+            }
+
+            const status = (comparison && comparison.status) || '';
+            if (status !== 'identical' && status !== 'ahead') {
+              core.setFailed(
+                'prompt_lab_ref is neither the tip of ' + defaultBranch +
+                ' nor an ancestor of it (compare status: ' + (status || 'unknown') +
+                '); supply pr_number to ground a same-repository pull request head'
+              );
+              return;
+            }
+
+            core.info('prompt_lab_ref is contained in ' + defaultBranch);
+
+      # -----------------------------------------------------------------------
+      # 3. Check out the approved Prompt Lab commit (read-only GITHUB_TOKEN)
       # -----------------------------------------------------------------------
       - name: Checkout Prompt Lab
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
@@ -211,7 +336,7 @@ jobs:
           persist-credentials: false
 
       # -----------------------------------------------------------------------
-      # 3. Obtain a Korvid app token downscoped to read-only contents
+      # 4. Obtain a Korvid app token downscoped to read-only contents
       # -----------------------------------------------------------------------
       - name: Get Korvid app token
         id: korvid-token
@@ -223,7 +348,7 @@ jobs:
           permission-contents: read
 
       # -----------------------------------------------------------------------
-      # 4. Check out the pinned Korvid revision
+      # 5. Check out the pinned Korvid revision
       # -----------------------------------------------------------------------
       - name: Checkout Korvid at pinned ref
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
@@ -235,7 +360,7 @@ jobs:
           persist-credentials: false
 
       # -----------------------------------------------------------------------
-      # 5. Azure OIDC login (no client secret)
+      # 6. Azure OIDC login (no client secret)
       # -----------------------------------------------------------------------
       - name: Azure login (OIDC)
         uses: azure/login@a65d910e8af852a8061c627c456678983e180302  # v2.2.0
@@ -245,7 +370,7 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       # -----------------------------------------------------------------------
-      # 6. Python toolchain
+      # 7. Python toolchain
       # -----------------------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
@@ -258,7 +383,7 @@ jobs:
           version: "latest"
 
       # -----------------------------------------------------------------------
-      # 7. Install Prompt Lab into an environment outside both checkouts
+      # 8. Install Prompt Lab into an environment outside both checkouts
       # -----------------------------------------------------------------------
       - name: Install Prompt Lab
         working-directory: prompt-lab
@@ -274,7 +399,7 @@ jobs:
           printf '%s\n' "$UV_PROJECT_ENVIRONMENT/bin" >> "$GITHUB_PATH"
 
       # -----------------------------------------------------------------------
-      # 8. Provision the Korvid uv environment out of tree
+      # 9. Provision the Korvid uv environment out of tree
       #
       # The bridge launches its worker with `uv run --project <korvid> --no-sync`,
       # which needs a complete environment for that checkout.  The checkout stays
@@ -299,7 +424,7 @@ jobs:
           fi
 
       # -----------------------------------------------------------------------
-      # 8b. Verify required CLI tools before node-pool operations
+      # 10. Verify required CLI tools before node-pool operations
       # -----------------------------------------------------------------------
       - name: Verify required CLI tools
         shell: bash
@@ -313,7 +438,7 @@ jobs:
           done
 
       # -----------------------------------------------------------------------
-      # 9. Record the original modeleval node count
+      # 11. Record the original modeleval node count
       #
       # Captured as a step output *before* anything can scale the pool, so the
       # always() cleanup step at the end restores the exact original count even
@@ -339,7 +464,7 @@ jobs:
           printf 'original-count=%s\n' "$count" >> "$GITHUB_OUTPUT"
 
       # -----------------------------------------------------------------------
-      # 10. Run the grounding orchestrator
+      # 12. Run the grounding orchestrator
       # -----------------------------------------------------------------------
       - name: Run grounding round
         working-directory: prompt-lab
@@ -373,7 +498,7 @@ jobs:
         run: bash scripts/run-grounding-round.sh
 
       # -----------------------------------------------------------------------
-      # 11. Append the safe round summary to the Job Summary
+      # 13. Append the safe round summary to the Job Summary
       # -----------------------------------------------------------------------
       - name: Append round summary to Job Summary
         if: always() && hashFiles('prompt-lab/artifacts/grounding-round/safe-evidence/round-summary.md') != ''
@@ -383,7 +508,7 @@ jobs:
           cat "$GROUNDING_SAFE_EVIDENCE_DIR/round-summary.md" >> "$GITHUB_STEP_SUMMARY"
 
       # -----------------------------------------------------------------------
-      # 12. Upload only the safe-evidence package (never raw live artifacts)
+      # 14. Upload only the safe-evidence package (never raw live artifacts)
       # -----------------------------------------------------------------------
       - name: Upload safe evidence
         if: always()
@@ -395,7 +520,7 @@ jobs:
           if-no-files-found: error
 
       # -----------------------------------------------------------------------
-      # 13. Sticky PR comment (optional, only when pr_number is provided)
+      # 15. Sticky PR comment (optional, only when pr_number is provided)
       # -----------------------------------------------------------------------
       - name: Update sticky PR comment
         if: always() && inputs.pr_number != '' && hashFiles('prompt-lab/artifacts/grounding-round/safe-evidence/round-summary.md') != ''
@@ -479,7 +604,7 @@ jobs:
             }
 
       # -----------------------------------------------------------------------
-      # 14. Restore the recorded modeleval node count (design lifecycle step 12)
+      # 16. Restore the recorded modeleval node count (design lifecycle step 12)
       #
       # The orchestrator's shell trap covers an orderly exit, but a cancelled or
       # evicted runner SIGKILLs it about ten seconds in — far short of the

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+import shlex
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml  # type: ignore[import-untyped]
@@ -113,6 +115,25 @@ _PROMOTION_BLOCKER_MILESTONE = "milestone_failed"
 _PROMOTION_BLOCKER_PASS_AT_3 = "pass_at_3_below_1_0"
 _PROMOTION_BLOCKER_PASS_AT_5 = "pass_at_5_below_1_0"
 
+#: An artifact may only be *named* in a round report when its own suffix says it
+#: is a structured summary the safe projection already covers.  Anything else —
+#: raw logs, serialized optimizer state, sockets — is not nameable evidence.
+_ARTIFACT_REF_ALLOWED_SUFFIXES = {".json", ".yaml", ".yml", ".md"}
+#: Substrings that mark an artifact as unsafe to name, let alone copy: request
+#: payloads, audit records, kubeconfigs, credentials, and optimizer state.
+_FORBIDDEN_ARTIFACT_TOKENS = (
+    "kubeconfig",
+    "credential",
+    "secret",
+    "token",
+    "password",
+    "audit",
+    "gepa_state",
+    "answer",
+    ".env",
+)
+_FORBIDDEN_ARTIFACT_NAMES = {"request.json"}
+
 
 @dataclass(frozen=True, slots=True)
 class CaseRunSummary:
@@ -125,6 +146,7 @@ class CaseRunSummary:
     efficiency: float | None
     hard_failures: tuple[str, ...]
     execution_mode: str
+    elapsed_seconds: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +156,7 @@ class RoundReport:
     candidate_fingerprint: str
     models: tuple[str, ...]
     aggregate_score: float
+    model_scores: Mapping[str, float]
     pass_at_3: float | None
     pass_at_5: float | None
     promotion_eligible: bool
@@ -141,6 +164,8 @@ class RoundReport:
     status_counts: Mapping[str, int]
     hard_failure_counts: Mapping[str, int]
     runs: tuple[CaseRunSummary, ...]
+    artifact_refs: tuple[str, ...]
+    reproduction_command: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +181,7 @@ class _ParsedResponse:
     verification: float | None
     efficiency: float | None
     hard_failures: tuple[str, ...]
+    elapsed_seconds: float | None
     payload: Mapping[str, Any]
 
 
@@ -179,12 +205,17 @@ def build_round_report(artifact_root: Path | str) -> RoundReport:
         pass_at_5=summary["pass_at_5"],
     )
     ordered_runs = tuple(sorted(runs, key=_run_sort_key))
+    models = tuple(sorted({run.model for run in ordered_runs}))
+    model_scores = dict(summary["model_scores"])
+    if set(models) != set(model_scores):
+        raise ValueError("model_scores must cover exactly the models the evidence names")
     return RoundReport(
         campaign_id=summary["campaign_id"],
         candidate_id=summary["candidate_id"],
         candidate_fingerprint=summary["candidate_fingerprint"],
-        models=tuple(sorted({run.model for run in ordered_runs})),
+        models=models,
         aggregate_score=summary["aggregate_score"],
+        model_scores={model: model_scores[model] for model in models},
         pass_at_3=summary["pass_at_3"],
         pass_at_5=summary["pass_at_5"],
         promotion_eligible=not promotion_blockers,
@@ -202,9 +233,12 @@ def build_round_report(artifact_root: Path | str) -> RoundReport:
                 efficiency=run.efficiency,
                 hard_failures=run.hard_failures,
                 execution_mode=run.execution_mode,
+                elapsed_seconds=run.elapsed_seconds,
             )
             for run in ordered_runs
         ),
+        artifact_refs=_safe_artifact_refs(summary["artifact_refs"]),
+        reproduction_command=tuple(summary["reproduction_command"]),
     )
 
 
@@ -228,11 +262,23 @@ def render_round_markdown(report: RoundReport) -> str:
         "| ---: | ---: | ---: |",
         f"| {report.aggregate_score:.3f} | {_format_metric(report.pass_at_3)} | {_format_metric(report.pass_at_5)} |",
         "",
-        "## Status counts",
+        "## Per-model scores",
         "",
-        "| Status | Count |",
+        "| Model | Score |",
         "| --- | ---: |",
     ]
+    for model in sorted(report.model_scores):
+        lines.append(f"| `{model}` | {report.model_scores[model]:.3f} |")
+
+    lines.extend(
+        [
+            "",
+            "## Status counts",
+            "",
+            "| Status | Count |",
+            "| --- | ---: |",
+        ]
+    )
     for status, count in report.status_counts.items():
         lines.append(f"| {status} | {count} |")
 
@@ -248,16 +294,34 @@ def render_round_markdown(report: RoundReport) -> str:
             "",
             "## Runs",
             "",
-            "| Model | Case | Run ID | Status | Completion | Verification | Efficiency | Hard failures | Execution mode |",
-            "| --- | --- | --- | --- | ---: | ---: | ---: | --- | --- |",
+            (
+                "| Model | Case | Run ID | Status | Completion | Verification |"
+                " Efficiency | Elapsed (s) | Hard failures | Execution mode |"
+            ),
+            "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- |",
         ]
     )
     for run in sorted(report.runs, key=_run_sort_key):
         failures = ", ".join(run.hard_failures) if run.hard_failures else "none"
         lines.append(
             f"| {run.model} | {run.case_id} | {run.run_id} | {run.status} | {_format_metric(run.completion)} | "
-            f"{_format_metric(run.verification)} | {_format_metric(run.efficiency)} | {failures} | {run.execution_mode} |"
+            f"{_format_metric(run.verification)} | {_format_metric(run.efficiency)} | "
+            f"{_format_metric(run.elapsed_seconds)} | {failures} | {run.execution_mode} |"
         )
+
+    lines.extend(["", "## Artifacts", "", "Artifact names recorded by the evaluation run:", ""])
+    if report.artifact_refs:
+        lines.extend(f"- `{ref}`" for ref in report.artifact_refs)
+    else:
+        lines.append("- none")
+
+    lines.extend(["", "## Reproduction command", ""])
+    if report.reproduction_command:
+        # Rendered through shlex.join so a copied command can never re-split or
+        # re-interpret an argument that contains spaces or shell metacharacters.
+        lines.extend(["```shell", shlex.join(report.reproduction_command), "```"])
+    else:
+        lines.append("- not recorded")
     return "\n".join(lines) + "\n"
 
 
@@ -333,6 +397,7 @@ def write_safe_evidence(
         "candidate_fingerprint": report.candidate_fingerprint,
         "models": list(report.models),
         "aggregate_score": report.aggregate_score,
+        "model_scores": dict(report.model_scores),
         "pass_at_3": report.pass_at_3,
         "pass_at_5": report.pass_at_5,
         "promotion_eligible": report.promotion_eligible,
@@ -348,21 +413,25 @@ def write_safe_evidence(
                 "completion": run.completion,
                 "verification": run.verification,
                 "efficiency": run.efficiency,
+                "elapsed_seconds": run.elapsed_seconds,
                 "hard_failures": list(run.hard_failures),
                 "execution_mode": run.execution_mode,
             }
             for run in report.runs
         ],
+        # What this package contains…
         "artifact_refs": [
             "round-summary.json",
             "round-summary.md",
             *copied_artifacts,
             *safe_response_paths,
         ],
+        # …and the safe artifact names the evaluation run itself recorded.
+        "evaluation_artifact_refs": list(report.artifact_refs),
         "prompt_lab_revision": prompt_lab_revision,
         "korvid_revision": korvid_revision,
         "workflow_run_url": workflow_run_url,
-        "reproduction_command": evaluation_summary["reproduction_command"],
+        "reproduction_command": list(report.reproduction_command),
     }
     _write_json(_resolve_destination_path(safe_output_path, safe_output_path / "round-summary.json"), summary_payload)
 
@@ -406,8 +475,8 @@ def _normalize_evaluation_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
     run_execution_modes = _normalize_run_execution_modes(summary.get("run_execution_modes"), evaluated_pairs)
     model_scores = _normalize_model_scores(summary.get("model_scores"))
     case_sets = _normalize_case_sets(summary.get("case_sets"))
-    artifact_refs = _require_string_list_allow_empty(summary.get("artifact_refs"), "artifact_refs")
-    reproduction_command = _require_string_list_allow_empty(summary.get("reproduction_command"), "reproduction_command")
+    artifact_refs = _require_artifact_refs(summary.get("artifact_refs"))
+    reproduction_command = _require_reproduction_command(summary.get("reproduction_command"))
 
     case_ids_from_pairs = {case_id for case_id, _ in (_decode_case_model_pair(pair) for pair in evaluated_pairs)}
     models_from_pairs = {model for _, model in (_decode_case_model_pair(pair) for pair in evaluated_pairs)}
@@ -529,6 +598,7 @@ def _parse_response(path: Path) -> _ParsedResponse:
     except (BridgeMalformedOutputError, ValueError) as exc:
         raise ValueError(str(exc)) from exc
 
+    elapsed_seconds = usage.get("wall_time_seconds")
     return _ParsedResponse(
         run_id=path.parent.name,
         case_id=case_id,
@@ -541,6 +611,7 @@ def _parse_response(path: Path) -> _ParsedResponse:
         verification=verification,
         efficiency=efficiency,
         hard_failures=hard_failures,
+        elapsed_seconds=None if elapsed_seconds is None else float(elapsed_seconds),
         payload={
             "protocol_version": protocol_version,
             "status": status,
@@ -622,7 +693,7 @@ def _parse_usage(payload: Mapping[str, Any], status: str) -> dict[str, Any]:
         return {
             "tool_calls": _require_non_negative_int(usage.get("tool_calls"), "usage.tool_calls"),
             "iterations": _require_non_negative_int(usage.get("iterations"), "usage.iterations"),
-            "wall_time_seconds": _require_numeric(usage.get("wall_time_seconds"), "usage.wall_time_seconds"),
+            "wall_time_seconds": _require_duration(usage.get("wall_time_seconds"), "usage.wall_time_seconds"),
         }
     _ensure_keys(usage, _MODEL_FAILURE_USAGE_ALLOWED_KEYS, "usage")
     return {}
@@ -819,7 +890,62 @@ def _write_text(path: Path, content: str) -> None:
 def _require_numeric(value: Any, context: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{context} must be numeric")  # noqa: TRY004
-    return float(value)
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        raise ValueError(f"{context} must be a finite number")
+    return numeric
+
+
+def _require_duration(value: Any, context: str) -> float:
+    duration = _require_numeric(value, context)
+    if duration < 0.0:
+        raise ValueError(f"{context} must not be negative")
+    return duration
+
+
+def _require_artifact_refs(value: Any) -> list[str]:
+    """Validate every recorded artifact name as a safe, relative, in-tree path."""
+    refs = _require_string_list_allow_empty(value, "artifact_refs")
+    validated: list[str] = []
+    for index, ref in enumerate(refs):
+        validated.append(_require_relative_path(ref, f"artifact_refs[{index}]"))
+    return list(dict.fromkeys(validated))
+
+
+def _require_relative_path(value: str, context: str) -> str:
+    if value != value.strip():
+        raise ValueError(f"{context} must not be padded with whitespace")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError(f"{context} must not contain control characters")
+    if "\\" in value or value.startswith(("/", "~")):
+        raise ValueError(f"{context} must be a relative POSIX path inside the artifact root")
+    parts = PurePosixPath(value).parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"{context} must not traverse outside the artifact root")
+    return value
+
+
+def _safe_artifact_refs(refs: Sequence[str]) -> tuple[str, ...]:
+    """Keep only the artifact names a round report is allowed to display."""
+    return tuple(ref for ref in refs if _is_displayable_artifact_ref(ref))
+
+
+def _is_displayable_artifact_ref(ref: str) -> bool:
+    path = PurePosixPath(ref)
+    if path.suffix.lower() not in _ARTIFACT_REF_ALLOWED_SUFFIXES:
+        return False
+    if path.name.lower() in _FORBIDDEN_ARTIFACT_NAMES:
+        return False
+    lowered = ref.lower()
+    return not any(token in lowered for token in _FORBIDDEN_ARTIFACT_TOKENS)
+
+
+def _require_reproduction_command(value: Any) -> list[str]:
+    tokens = _require_string_list_allow_empty(value, "reproduction_command")
+    for index, token in enumerate(tokens):
+        if any(ord(character) < 32 or ord(character) == 127 for character in token):
+            raise ValueError(f"reproduction_command[{index}] must not contain control characters")
+    return tokens
 
 
 def _require_optional_metric(value: Any, context: str) -> float | None:

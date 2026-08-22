@@ -250,6 +250,193 @@ def test_round_cli_accepts_a_separate_optimize_artifact_root(
     assert (safe_output / "best-candidate.yaml").is_file()
 
 
+# ---------------------------------------------------------------------------
+# Result contract: the design's Job Summary is per-model scores, per-run elapsed
+# duration, artifact names, and a reproducible command — and nothing raw
+# ---------------------------------------------------------------------------
+
+
+def test_round_report_carries_per_model_scores_durations_artifacts_and_command(
+    tmp_path: Path,
+) -> None:
+    report = build_round_report(write_realistic_live_fixture(tmp_path))
+
+    assert report.model_scores == {LIVE_MODEL: 0.01}, (
+        "the design requires a per-model score beside the aggregate"
+    )
+    assert {run.run_id: run.elapsed_seconds for run in report.runs} == LIVE_WALL_TIMES, (
+        "per-run elapsed duration must come from the safe usage.wall_time_seconds"
+    )
+    assert report.reproduction_command == LIVE_REPRODUCTION_COMMAND
+    assert report.artifact_refs == (
+        "evaluation-summary.json",
+        "runs/aks-restart-denied-qwen3-0.6b-r01/response.json",
+        "runs/aks-restart-denied-qwen3-0.6b-r02/response.json",
+        "runs/aks-scale-deployment-up-qwen3-0.6b-r01/response.json",
+        "runs/aks-scale-deployment-up-qwen3-0.6b-r02/response.json",
+    ), "artifact names come from the evaluation summary, minus forbidden artifacts"
+    assert not any("request.json" in ref for ref in report.artifact_refs), (
+        "request payload artifacts must never be named in the round report"
+    )
+
+
+def test_render_round_markdown_shows_scores_durations_artifacts_and_safe_command(
+    tmp_path: Path,
+) -> None:
+    report = build_round_report(write_realistic_live_fixture(tmp_path))
+    markdown = render_round_markdown(report)
+
+    assert "## Per-model scores" in markdown
+    assert f"| `{LIVE_MODEL}` | 0.010 |" in markdown
+
+    assert "Elapsed (s)" in markdown
+    for elapsed in LIVE_WALL_TIMES.values():
+        assert f"{elapsed:.3f}" in markdown
+
+    assert "## Artifacts" in markdown
+    assert "- `evaluation-summary.json`" in markdown
+    assert "request.json" not in markdown, "request artifacts are never displayed"
+
+    assert "## Reproduction command" in markdown
+    assert "'artifacts/live/round 1'" in markdown, (
+        "the reproduction command must be displayed shell-quoted so copying it "
+        "cannot silently split or re-interpret an argument"
+    )
+    assert markdown == render_round_markdown(report), "rendering must be deterministic"
+    assert "raw answer" not in markdown
+
+
+def test_round_report_never_names_forbidden_artifacts(tmp_path: Path) -> None:
+    artifact_root = write_realistic_live_fixture(
+        tmp_path,
+        artifact_refs=[
+            "evaluation-summary.json",
+            "runs/aks-restart-denied-qwen3-0.6b-r01/request.json",
+            "runs/aks-restart-denied-qwen3-0.6b-r01/audit.jsonl",
+            "runs/aks-restart-denied-qwen3-0.6b-r01/response.json",
+            ".kubeconfig-round.yaml",
+            "bridge-stderr.log",
+            "gepa_state.bin",
+            "reflection-credential.json",
+        ],
+    )
+
+    report = build_round_report(artifact_root)
+    markdown = render_round_markdown(report)
+
+    assert report.artifact_refs == (
+        "evaluation-summary.json",
+        "runs/aks-restart-denied-qwen3-0.6b-r01/response.json",
+    )
+    for forbidden in (
+        "request.json",
+        "audit.jsonl",
+        "kubeconfig",
+        ".log",
+        "gepa_state",
+        "credential",
+    ):
+        assert forbidden not in markdown
+
+
+@pytest.mark.parametrize(
+    "unsafe_ref",
+    ["/etc/passwd", "../../escape.json", "runs/../../escape.json", "", "runs/\u0000.json"],
+)
+def test_round_report_rejects_unsafe_artifact_ref_paths(
+    tmp_path: Path, unsafe_ref: str
+) -> None:
+    artifact_root = write_realistic_live_fixture(
+        tmp_path, artifact_refs=["evaluation-summary.json", unsafe_ref]
+    )
+
+    with pytest.raises(ValueError, match="artifact_refs"):
+        build_round_report(artifact_root)
+
+
+@pytest.mark.parametrize("unsafe_token", ["kubectl\nrm -rf /", "kubectl\u0000"])
+def test_round_report_rejects_unsafe_reproduction_command_tokens(
+    tmp_path: Path, unsafe_token: str
+) -> None:
+    artifact_root = write_realistic_live_fixture(
+        tmp_path, reproduction_command=["uv", "run", unsafe_token]
+    )
+
+    with pytest.raises(ValueError, match="reproduction_command"):
+        build_round_report(artifact_root)
+
+
+@pytest.mark.parametrize("wall_time", [-1.0, float("inf"), float("nan")])
+def test_round_report_rejects_an_unusable_elapsed_duration(
+    tmp_path: Path, wall_time: float
+) -> None:
+    artifact_root = write_live_fixture(tmp_path)
+    response_path = artifact_root / "runs" / "case-a-model-a-r01" / "response.json"
+    payload = json.loads(response_path.read_text(encoding="utf-8"))
+    payload["usage"]["wall_time_seconds"] = wall_time
+    response_path.write_text(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2, allow_nan=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="wall_time_seconds"):
+        build_round_report(artifact_root)
+
+
+def test_round_report_reports_no_duration_for_a_model_failure(tmp_path: Path) -> None:
+    artifact_root = write_live_fixture(
+        tmp_path,
+        responses=[response("model_failure", error="turn timeout")],
+        aggregate_score=0.0,
+        pass_at_3=0.0,
+        pass_at_5=0.0,
+        milestone_passed=False,
+    )
+
+    report = build_round_report(artifact_root)
+    markdown = render_round_markdown(report)
+
+    assert [run.elapsed_seconds for run in report.runs] == [None], (
+        "a model failure carries no usage block, so its duration is unknown"
+    )
+    assert "| n/a |" in markdown
+
+
+def test_safe_round_summary_json_publishes_the_full_result_contract(
+    tmp_path: Path,
+) -> None:
+    artifact_root = write_realistic_live_fixture(tmp_path)
+    safe_output = tmp_path / "safe-evidence"
+
+    write_safe_evidence(
+        artifact_root,
+        safe_output,
+        prompt_lab_revision="0" * 40,
+        korvid_revision="1" * 40,
+        workflow_run_url="https://github.example/actions/runs/42",
+    )
+
+    payload = json.loads((safe_output / "round-summary.json").read_text(encoding="utf-8"))
+
+    assert payload["model_scores"] == {LIVE_MODEL: 0.01}
+    assert {run["run_id"]: run["elapsed_seconds"] for run in payload["runs"]} == LIVE_WALL_TIMES
+    assert payload["reproduction_command"] == list(LIVE_REPRODUCTION_COMMAND)
+    assert payload["evaluation_artifact_refs"] == list(
+        build_round_report(artifact_root).artifact_refs
+    )
+    assert sorted(payload["artifact_refs"]) == sorted(
+        path.relative_to(safe_output).as_posix()
+        for path in safe_output.rglob("*")
+        if path.is_file()
+    ), "the package manifest must name exactly the files that were written"
+
+    written = "\n".join(
+        path.read_text(encoding="utf-8") for path in safe_output.rglob("*") if path.is_file()
+    )
+    for forbidden in ("raw answer", "SECRET REQUEST PROMPT", "request.json"):
+        assert forbidden not in written
+
+
 def response(
     status: str,
     *,
@@ -264,6 +451,9 @@ def response(
     answer: str = "raw answer",
     candidate_fingerprint: str = FINGERPRINT,
     run_id: str | None = None,
+    wall_time_seconds: float = 1.25,
+    tool_calls: int = 0,
+    iterations: int = 1,
 ) -> dict[str, Any]:
     resolved_run_id = run_id or f"{case_id}-{model}-r{repetition:02d}"
     payload: dict[str, Any] = {
@@ -301,7 +491,11 @@ def response(
             "audit_record_count": 0,
             "hard_failure_count": len(hard_failures),
         }
-        payload["usage"] = {"tool_calls": 0, "iterations": 1, "wall_time_seconds": 1.25}
+        payload["usage"] = {
+            "tool_calls": tool_calls,
+            "iterations": iterations,
+            "wall_time_seconds": wall_time_seconds,
+        }
         payload["error"] = None
     return payload
 
@@ -319,6 +513,11 @@ def write_live_fixture(
     execution_modes: Sequence[str] = ("live",),
     include_optimization: bool = False,
     include_best_candidate: bool = False,
+    model_scores: Mapping[str, float] | None = None,
+    artifact_refs: Sequence[str] | None = None,
+    reproduction_command: Sequence[str] | None = None,
+    write_request_artifacts: bool = False,
+    campaign_id: str = "campaign-2026-08-22",
 ) -> Path:
     artifact_root = tmp_path / "artifacts"
     artifact_root.mkdir(parents=True, exist_ok=True)
@@ -327,19 +526,27 @@ def write_live_fixture(
     models = list(dict.fromkeys(str(item["request_identity"]["model"]) for item in raw_responses))
     pairs = list(dict.fromkeys(_pair(item) for item in raw_responses if item["request_identity"]["case_id"] in case_ids))
     run_execution_modes = {pair: "live" for pair in pairs}
+    run_ids = [str(item["run_id"]) for item in raw_responses]
+
+    #: The evaluator records every JSON/YAML artifact it wrote, request payloads
+    #: included; the round report must never surface those names.
+    default_artifact_refs = ["evaluation-summary.json"]
+    for run_id in sorted(run_ids):
+        default_artifact_refs.append(f"runs/{run_id}/request.json")
+        default_artifact_refs.append(f"runs/{run_id}/response.json")
 
     summary = {
         "bundle_kind": "common",
         "candidate_id": "candidate-alpha",
         "candidate_fingerprint": FINGERPRINT,
-        "campaign_id": "campaign-2026-08-22",
+        "campaign_id": campaign_id,
         "campaign_case_ids": list(case_ids),
         "evaluated_case_ids": list(case_ids),
         "evaluated_models": list(models),
         "campaign_case_model_pairs": list(pairs),
         "evaluated_case_model_pairs": list(pairs),
         "aggregate_score": aggregate_score,
-        "model_scores": {model: aggregate_score for model in models},
+        "model_scores": dict(model_scores) if model_scores is not None else {model: aggregate_score for model in models},
         "execution_modes": list(execution_modes),
         "run_execution_modes": run_execution_modes,
         "repetitions_per_case": repetitions_per_case,
@@ -349,8 +556,10 @@ def write_live_fixture(
         "systemic_failures": 0,
         "milestone_passed": milestone_passed,
         "case_sets": {"train": list(case_ids), "validation": list(case_ids), "milestone": list(case_ids)},
-        "artifact_refs": ["evaluation-summary.json"],
-        "reproduction_command": ["uv", "run", "--python", "3.12", "korvid-prompt-lab", "evaluate"],
+        "artifact_refs": list(artifact_refs) if artifact_refs is not None else default_artifact_refs,
+        "reproduction_command": list(reproduction_command)
+        if reproduction_command is not None
+        else ["uv", "run", "--python", "3.12", "korvid-prompt-lab", "evaluate"],
     }
     (artifact_root / "evaluation-summary.json").write_text(
         json.dumps(summary, sort_keys=True, ensure_ascii=False, indent=2) + "\n",
@@ -410,7 +619,86 @@ def write_live_fixture(
             json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        if write_request_artifacts:
+            (run_dir / "request.json").write_text(
+                json.dumps(
+                    {
+                        "protocol_version": PROTOCOL_VERSION,
+                        "request_identity": payload["request_identity"],
+                        "prompt": "SECRET REQUEST PROMPT",
+                    },
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
     return artifact_root
+
+
+#: A realistic live round: one allowlisted model, the two shipped AKS cases, two
+#: repetitions each, and the artifact names an actual evaluate run records.
+LIVE_MODEL = "qwen3:0.6b"
+LIVE_CASES = ("aks-scale-deployment-up", "aks-restart-denied")
+LIVE_WALL_TIMES = {
+    "aks-scale-deployment-up-qwen3-0.6b-r01": 61.42,
+    "aks-scale-deployment-up-qwen3-0.6b-r02": 58.004,
+    "aks-restart-denied-qwen3-0.6b-r01": 35.87,
+    "aks-restart-denied-qwen3-0.6b-r02": 41.2,
+}
+LIVE_REPRODUCTION_COMMAND = (
+    "uv",
+    "run",
+    "--python",
+    "3.12",
+    "korvid-prompt-lab",
+    "evaluate",
+    "--candidate",
+    "examples/candidates/shipped-small.yaml",
+    "--campaign",
+    "examples/campaigns/aks-shared-runners.yaml",
+    "--artifact-root",
+    "artifacts/live/round 1",
+    "--bundle-kind",
+    "common",
+)
+
+
+def write_realistic_live_fixture(tmp_path: Path, **overrides: Any) -> Path:
+    responses = [
+        response(
+            "completed",
+            case_id=case_id,
+            model=LIVE_MODEL,
+            repetition=repetition,
+            run_id=f"{case_id}-qwen3-0.6b-r{repetition:02d}",
+            completion=0.0,
+            verification=0.0,
+            efficiency=1.0,
+            hard_failures=["write_before_fresh_read"] if case_id == LIVE_CASES[1] else [],
+            answer="raw answer the model produced",
+            wall_time_seconds=LIVE_WALL_TIMES[f"{case_id}-qwen3-0.6b-r{repetition:02d}"],
+            tool_calls=1,
+            iterations=2,
+        )
+        for case_id in LIVE_CASES
+        for repetition in (1, 2)
+    ]
+    kwargs: dict[str, Any] = {
+        "responses": responses,
+        "repetitions_per_case": 2,
+        "aggregate_score": 0.01,
+        "pass_at_3": 0.0,
+        "pass_at_5": 0.0,
+        "milestone_passed": False,
+        "model_scores": {LIVE_MODEL: 0.01},
+        "reproduction_command": list(LIVE_REPRODUCTION_COMMAND),
+        "write_request_artifacts": True,
+        "campaign_id": "aks-shared-runners",
+    }
+    kwargs.update(overrides)
+    return write_live_fixture(tmp_path, **kwargs)
 
 
 def _pair(payload: Mapping[str, Any]) -> str:

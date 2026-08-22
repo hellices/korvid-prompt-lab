@@ -647,7 +647,7 @@ and fill in:
 
 | Input | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `prompt_lab_ref` | yes | — | Exact 40-hex SHA of the Prompt Lab commit to evaluate |
+| `prompt_lab_ref` | yes | — | Exact 40-hex SHA of the Prompt Lab commit to evaluate; must be contained in the default branch, or be the head of the same-repository PR named by `pr_number` |
 | `korvid_ref` | yes | pinned SHA | Exact 40-hex SHA of the Korvid commit to use |
 | `model` | yes | `qwen3:1.7b` | Ollama tag from the closed allowlist |
 | `round_type` | yes | `evaluate` | `evaluate` or `optimize-evaluate` |
@@ -658,23 +658,48 @@ and fill in:
 | `milestone_case_ids` | yes | both cases | Comma-separated case ids forming the milestone pack |
 | `max_metric_calls` | yes | `12` | GEPA budget for `optimize-evaluate` rounds |
 | `seed` | yes | `0` | GEPA search seed |
-| `pr_number` | no | blank | Pull request to update with a sticky comment |
+| `pr_number` | no | blank | Same-repository pull request that vouches for `prompt_lab_ref` and receives the sticky comment |
 
 The workflow validates every input before any credential is used. A
 non-default-branch dispatch, a non-SHA ref, a path with `..`, or a duplicate
 train/validation case id fails immediately.
 
+### Trust boundary for `prompt_lab_ref`
+
+An exact 40-hex SHA is a *shape*, not provenance: `actions/checkout` can fetch
+any commit the repository can reach, including the head of a **fork** pull
+request through `refs/pull/<n>/head`. Running such a commit would execute
+unreviewed third-party code beside the Korvid app token and the Azure OIDC
+session.
+
+The job therefore proves the requested commit is repository code *before* the
+first checkout and *before* any credential exists, using only the job's own
+read-only `GITHUB_TOKEN` and values bound through `env:`:
+
+| Dispatch | Accepted when | Rejected when |
+| --- | --- | --- |
+| `pr_number` supplied | The number is a pull request in this repository, its head repository is this repository, and its head SHA equals `prompt_lab_ref` exactly | The number is not a PR here, the head repository is a fork, or `prompt_lab_ref` is not that PR's head commit |
+| `pr_number` blank | `prompt_lab_ref` is the tip of the default branch or an ancestor of it (compare status `identical` or `ahead`) | The commit has diverged from, or is not contained in, the default branch — an unmerged or unknown commit |
+
+Same-repository pull requests stay groundable (a same-repository branch already
+requires write access); fork heads never are.
+
 ### Result locations
 
 | Surface | Contents |
 | --- | --- |
-| **Job Summary** | Round identity, model, aggregate score, pass^3/5, status/safety counts, per-case completion/verification/efficiency, promotion eligibility, artifact names and reproduction command |
-| **Artifact** (`grounding-round-<run-id>`) | `round-summary.json`, `round-summary.md`, `evaluation-summary.json`, `optimization-summary.json` (when present), `best-candidate.yaml` (when present), bridge `response.json` files |
+| **Job Summary** | Round identity, model, aggregate score, per-model scores, pass^3/5, status/safety counts, per-run completion/verification/efficiency and elapsed duration, promotion eligibility, artifact names, and the shell-quoted reproduction command |
+| **Artifact** (`safe-evidence`) | `round-summary.json`, `round-summary.md`, `evaluation-summary.json`, `optimization-summary.json` (when present), `best-candidate.yaml` (when present), bridge `response.json` files under `responses/` |
 | **PR comment** (when `pr_number` is set) | Compact score/safety table, link to Actions run and artifact; sticky per model+candidate; replaces itself on rerun |
+
+`round-summary.json` names both surfaces explicitly: `artifact_refs` lists the
+files inside the uploaded `safe-evidence` package, and `evaluation_artifact_refs`
+lists the safe artifact names the evaluation run itself recorded.
 
 The summary and artifact never contain raw answers, request JSON, audit JSONL,
 Kubernetes manifests, credentials, kubeconfigs, unrestricted tool output,
-process logs, or GEPA internal state.
+process logs, or GEPA internal state — such artifact names are dropped from the
+report even when the evaluation summary recorded them.
 
 ### Cleanup and rerun semantics
 
