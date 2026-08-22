@@ -250,6 +250,39 @@ The checkout stays read-only: the worker runs under
 so no sync, no lockfile edit, and no bytecode cache is ever written into it. The
 audit log Korvid produces is written into the campaign's own run directory.
 
+The launcher owns its worker's **whole process group**. `uv` execs the worker, so
+signalling only `uv` would orphan a live grader that can still write a late
+`response.json` into a run directory the control plane has already given up on —
+and because run directories are deterministic, that late file would carry a
+matching fingerprint and request identity on the next run of the same candidate.
+
+`korvid-bridge` therefore starts the worker in its own session, so its kills stay
+scoped to the worker subtree and can never reach the shell that launched it. On
+timeout or interrupt it signals that group with SIGTERM and escalates to SIGKILL.
+The escalation is gated on the *group* draining, never on `uv` having exited:
+`uv` dies on SIGTERM at once, so "the direct child is gone" would skip the
+escalation and leave the grader running.
+
+`KorvidProcessRunner` sets `KORVID_BRIDGE_TIMEOUT_SECONDS` for that bound. It is
+derived from the campaign's `bridge_timeout_seconds` minus a reservation — 10% of
+the budget, floored at the launcher's own worst-case teardown window, capped at ten
+seconds, and clamped to half the budget — so the launcher normally terminates its
+worker and reports a systemic failure before the runner stops waiting. The runner
+owns the launcher's process group in exactly the same way, so a runner-initiated
+kill is passed all the way down: `korvid-bridge` turns SIGTERM/SIGINT/SIGHUP into a
+teardown of its own worker group. A bridge that ignores both the budget and SIGTERM
+is still SIGKILLed with its whole group.
+
+Two windows in that handoff are closed explicitly, because in both of them the
+launcher holds the only reachable handle on its worker's private session:
+
+- during `korvid-bridge`'s own teardown the termination signals are ignored, so a
+  runner SIGTERM arriving mid-escalation cannot unwind the launcher before it sends
+  SIGKILL (their deadlines deliberately overlap on short campaign timeouts);
+- while the worker is being spawned the signals are latched rather than raised —
+  the fork happens well before `Popen` returns — and replayed as a teardown the
+  moment the launcher holds the handle.
+
 ### What one invocation does
 
 1. Reads `{request}` and validates it strictly: protocol version, candidate
@@ -268,7 +301,10 @@ audit log Korvid produces is written into the campaign's own run directory.
 Useful flags (all runtime policy, never candidate text):
 
 - `--scripted` runs Korvid's deterministic operation scripts instead of the model
-  endpoint — the offline self-test path, useful to prove the wiring without AKS
+  endpoint — the offline self-test path, useful to prove the wiring without AKS.
+  The response then declares `execution_mode: "scripted"`, and the flag is refused
+  outright for any request carrying a `runtime.model_endpoint`, so a live campaign
+  can never be graded without a model
 - `--profile` selects the Korvid agent profile (default `small`)
 - `--approval-timeout` sets the approval window (default `5.0`)
 - `--turn-timeout` bounds one turn (default `120.0`, sized for a small live model)
@@ -285,9 +321,15 @@ KORVID_SOURCE_ROOT=/path/to/korvid-source-checkout \
   Korvid's own vocabulary.
 - A graded run always reports `status: "completed"`, even when the operation did
   not finish — an unfinished operation is a low grade, not a systemic failure.
-- `status: "model_failure"` is used only when Korvid produced no executable
-  result at all (provider error, transport failure, or a turn that never
-  finished), and then `grade` is `null`.
+- `status: "model_failure"` is used only when the *model* is to blame: a provider
+  or transport error, or a timeout after Korvid had already asked the model for a
+  turn. Then `grade` is `null`.
+- A wait timeout **before** the first model turn is not the model's fault. Korvid's
+  pre-turn Textual work (navigating to the target and selecting the fixture row)
+  raises the same `WaitTimeout` the turn loop does, so the worker wraps the
+  provider and records the moment a completion is first requested. A timeout
+  before that moment is systemic and exits non-zero — grading a broken harness
+  `0.0` would let an optimization run to completion against no evidence.
 - System, configuration, import, and protocol failures never produce a graded
   response: the bridge exits non-zero so the runner reports a systemic failure.
 - The response `journal` is a reflection-safe projection: checkpoint names from
@@ -357,7 +399,7 @@ Requests always include:
 
 ```json
 {
-  "protocol_version": 1,
+  "protocol_version": 2,
   "candidate_fingerprint": "<sha256>",
   "candidate": {
     "schema_version": 1,
@@ -392,15 +434,44 @@ Requests always include:
 loopback base URL (for example `http://127.0.0.1:41001`) for `aks_port_forward`
 serving. A bridge that talks to the AKS-hosted model must read it from there.
 
-Responses must include protocol version `1`, the exact candidate fingerprint, a
-matching `request_identity`, `status`, `answer`, `journal`, `usage`, `error`,
-and either:
+Responses must include protocol version `2`, the exact candidate fingerprint, a
+matching `request_identity`, `status`, `execution_mode`, `answer`, `journal`,
+`usage`, `error`, and either:
 
 - `status: "completed"` with a grade object containing `completion`,
   `verification`, `efficiency`, and `hard_failures`, or
 - `status: "model_failure"` with `grade: null`
 
 Any other status is treated as systemic and aborts evaluation/publication.
+
+### `execution_mode` (protocol 2)
+
+Every response must declare how its grade was produced:
+
+| `execution_mode` | Meaning |
+| --- | --- |
+| `live` | Korvid ran the journey against a real model provider |
+| `scripted` | Korvid's deterministic operation scripts stood in for the model |
+
+A scripted grade is model-free by construction, so it can be perfect while
+proving nothing about a model. The mode therefore travels with the grade through
+`BridgeResult`, the evaluation summary (`execution_modes` and per-pair
+`run_execution_modes`), the optimization summary, the published bundle payload,
+and the registry index entry. Three gates enforce it:
+
+- `korvid-bridge` refuses `--scripted` for any request that carries a
+  `runtime.model_endpoint`, and fails closed before Korvid is even imported;
+- `KorvidProcessRunner` refuses any non-`live` response when the campaign is
+  serving a model endpoint, and the GEPA adapter refuses to mix modes inside one
+  optimization;
+- `publish` refuses any evaluation summary whose `execution_modes` is not
+  exactly `["live"]`.
+
+**Migration.** Protocol 1 had no `execution_mode`, so a version-1 peer can never
+prove that its evidence came from a model. There is no compatibility shim in
+either direction: both sides moved to 2 in one change, a version-1 request is
+refused by the worker, and a version-1 response is refused by the runner. Assuming
+`live` for a silent peer is exactly the failure this field exists to prevent.
 
 ## Fake smoke path and real Korvid bridge integration
 
@@ -474,6 +545,10 @@ Additional CLI publish gates:
   the evaluation summary.
 - every bundle requires non-empty, disjoint `case_sets.train` and
   `case_sets.validation` drawn from the campaign cases.
+- every bundle requires `execution_modes == ["live"]`. A summary that is missing
+  the field, reports `scripted`, or mixes the two is refused with exit code `2`
+  before anything is written, because part or all of that evidence never
+  contacted a model.
 
 ## Model matrix
 

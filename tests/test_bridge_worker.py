@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -12,21 +13,32 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from korvid_prompt_lab.bridge_worker import (
+    EXECUTION_MODE_LIVE,
+    EXECUTION_MODE_SCRIPTED,
+    EXIT_SYSTEMIC_FAILURE,
     LIFECYCLE_FALLBACK,
     MAX_ANSWER_CHARS,
+    PROTOCOL_VERSION,
+    TurnPhase,
     WorkerConfigurationError,
+    WorkerModelFailure,
     build_completed_response,
     build_model_failure_response,
+    classify_run_failure,
     install_prompt_overrides,
     load_request,
     map_components_to_overrides,
+    observe_model_turns,
     parse_request,
     project_journal,
     require_prompt_matches_journey,
+    resolve_execution_mode,
+    run_bridge,
     sanitize_error,
     select_journey,
     write_response,
 )
+from korvid_prompt_lab.bridge_worker import main as worker_main
 from korvid_prompt_lab.contracts import Candidate, EvalCase
 from korvid_prompt_lab.runner import KorvidProcessRunner
 
@@ -54,7 +66,7 @@ def _fingerprint(candidate: dict[str, Any]) -> str:
 
 def _payload(**overrides: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "protocol_version": 1,
+        "protocol_version": PROTOCOL_VERSION,
         "candidate_fingerprint": _fingerprint(CANDIDATE),
         "candidate": json.loads(json.dumps(CANDIDATE)),
         "case": {
@@ -146,7 +158,14 @@ def test_parse_request_accepts_a_well_formed_request() -> None:
 
 def test_parse_request_rejects_an_unsupported_protocol_version() -> None:
     with pytest.raises(WorkerConfigurationError, match="protocol_version"):
-        parse_request(_payload(protocol_version=2))
+        parse_request(_payload(protocol_version=PROTOCOL_VERSION + 1))
+
+
+def test_parse_request_refuses_the_superseded_protocol_version_one() -> None:
+    # Protocol 1 had no execution_mode, so a version-1 peer can never prove that its
+    # evidence came from a model. It must be refused, never migrated.
+    with pytest.raises(WorkerConfigurationError, match="protocol_version"):
+        parse_request(_payload(protocol_version=1))
 
 
 def test_parse_request_rejects_unknown_fields() -> None:
@@ -231,6 +250,64 @@ def test_load_request_rejects_a_file_that_is_not_protocol_json(tmp_path: Path) -
     path.write_text("{not json", encoding="utf-8")
     with pytest.raises(WorkerConfigurationError, match="JSON"):
         load_request(path)
+
+
+# --- execution mode --------------------------------------------------------------
+
+
+def test_completed_response_declares_the_live_execution_mode() -> None:
+    response = build_completed_response(
+        parse_request(_payload()), _fake_run(), LIFECYCLE_FALLBACK, execution_mode=EXECUTION_MODE_LIVE
+    )
+
+    assert response["execution_mode"] == "live"
+
+
+def test_completed_response_declares_the_scripted_execution_mode() -> None:
+    payload = _payload()
+    payload["runtime"]["model_endpoint"] = None
+
+    response = build_completed_response(
+        parse_request(payload), _fake_run(), LIFECYCLE_FALLBACK, execution_mode=EXECUTION_MODE_SCRIPTED
+    )
+
+    assert response["execution_mode"] == "scripted"
+
+
+def test_model_failure_response_declares_the_execution_mode() -> None:
+    response = build_model_failure_response(
+        parse_request(_payload()),
+        RuntimeError("the model never answered"),
+        execution_mode=EXECUTION_MODE_LIVE,
+        env={},
+    )
+
+    assert response["execution_mode"] == "live"
+
+
+def test_responses_refuse_an_execution_mode_outside_the_closed_vocabulary() -> None:
+    with pytest.raises(WorkerConfigurationError, match="execution_mode"):
+        build_completed_response(
+            parse_request(_payload()), _fake_run(), LIFECYCLE_FALLBACK, execution_mode="simulated"
+        )
+
+
+def test_resolve_execution_mode_refuses_scripted_evidence_for_a_live_endpoint() -> None:
+    # A campaign that carries a model endpoint is a live campaign; grading it from
+    # Korvid's canned scripts would publish a perfect score no model ever earned.
+    with pytest.raises(WorkerConfigurationError, match="scripted"):
+        resolve_execution_mode(parse_request(_payload()), scripted=True)
+
+
+def test_resolve_execution_mode_reports_live_for_a_live_endpoint() -> None:
+    assert resolve_execution_mode(parse_request(_payload()), scripted=False) == EXECUTION_MODE_LIVE
+
+
+def test_resolve_execution_mode_allows_scripted_without_a_model_endpoint() -> None:
+    payload = _payload()
+    payload["runtime"]["model_endpoint"] = None
+
+    assert resolve_execution_mode(parse_request(payload), scripted=True) == EXECUTION_MODE_SCRIPTED
 
 
 # --- candidate override mapping ------------------------------------------------
@@ -370,7 +447,7 @@ def test_project_journal_ignores_events_outside_the_lifecycle_vocabulary() -> No
 
 
 def test_completed_response_never_carries_audit_manifests_or_raw_journal_payload() -> None:
-    response = build_completed_response(parse_request(_payload()), _fake_run(), LIFECYCLE_FALLBACK)
+    response = build_completed_response(parse_request(_payload()), _fake_run(), LIFECYCLE_FALLBACK, execution_mode=EXECUTION_MODE_LIVE)
 
     encoded = json.dumps(response)
     for leaked in (
@@ -389,11 +466,12 @@ def test_completed_response_never_carries_audit_manifests_or_raw_journal_payload
 
 
 def test_completed_response_matches_the_runner_protocol_shape() -> None:
-    response = build_completed_response(parse_request(_payload()), _fake_run(), LIFECYCLE_FALLBACK)
+    response = build_completed_response(parse_request(_payload()), _fake_run(), LIFECYCLE_FALLBACK, execution_mode=EXECUTION_MODE_LIVE)
 
     assert set(response) == {
         "protocol_version",
         "status",
+        "execution_mode",
         "candidate_fingerprint",
         "request_identity",
         "grade",
@@ -402,8 +480,9 @@ def test_completed_response_matches_the_runner_protocol_shape() -> None:
         "usage",
         "error",
     }
-    assert response["protocol_version"] == 1
+    assert response["protocol_version"] == PROTOCOL_VERSION
     assert response["status"] == "completed"
+    assert response["execution_mode"] == "live"
     assert response["candidate_fingerprint"] == _fingerprint(CANDIDATE)
     assert response["request_identity"] == {
         "case_id": "aks-scale-up",
@@ -426,7 +505,7 @@ def test_completed_response_maps_korvid_boolean_grade_signals_to_metrics() -> No
         )
     )
 
-    response = build_completed_response(parse_request(_payload()), run, LIFECYCLE_FALLBACK)
+    response = build_completed_response(parse_request(_payload()), run, LIFECYCLE_FALLBACK, execution_mode=EXECUTION_MODE_LIVE)
 
     assert response["grade"] == {
         "completion": 0.0,
@@ -439,7 +518,7 @@ def test_completed_response_maps_korvid_boolean_grade_signals_to_metrics() -> No
 def test_a_graded_incomplete_run_stays_completed_with_a_low_grade() -> None:
     run = _fake_run(grade=_fake_grade(completion=False, verification=False, efficiency=0.0), answer="")
 
-    response = build_completed_response(parse_request(_payload()), run, LIFECYCLE_FALLBACK)
+    response = build_completed_response(parse_request(_payload()), run, LIFECYCLE_FALLBACK, execution_mode=EXECUTION_MODE_LIVE)
 
     assert response["status"] == "completed"
     assert response["grade"]["completion"] == 0.0
@@ -448,7 +527,7 @@ def test_a_graded_incomplete_run_stays_completed_with_a_low_grade() -> None:
 def test_completed_response_bounds_the_answer() -> None:
     run = _fake_run(answer="x" * (MAX_ANSWER_CHARS + 500))
 
-    response = build_completed_response(parse_request(_payload()), run, LIFECYCLE_FALLBACK)
+    response = build_completed_response(parse_request(_payload()), run, LIFECYCLE_FALLBACK, execution_mode=EXECUTION_MODE_LIVE)
 
     assert len(response["answer"]) <= MAX_ANSWER_CHARS + 32
     assert response["answer"].endswith("[truncated]")
@@ -457,7 +536,7 @@ def test_completed_response_bounds_the_answer() -> None:
 def test_completed_response_clamps_efficiency_into_the_scoreable_range() -> None:
     run = _fake_run(grade=_fake_grade(efficiency=1.5))
 
-    response = build_completed_response(parse_request(_payload()), run, LIFECYCLE_FALLBACK)
+    response = build_completed_response(parse_request(_payload()), run, LIFECYCLE_FALLBACK, execution_mode=EXECUTION_MODE_LIVE)
 
     assert response["grade"]["efficiency"] == 1.0
 
@@ -466,6 +545,7 @@ def test_model_failure_response_has_no_grade_and_a_sanitized_error() -> None:
     response = build_model_failure_response(
         parse_request(_payload()),
         RuntimeError("upstream rejected key hunter2-secret"),
+        execution_mode=EXECUTION_MODE_LIVE,
         env={"KORVID_EVAL_API_KEY": "hunter2-secret"},
     )
 
@@ -536,7 +616,7 @@ def test_worker_response_is_accepted_by_the_korvid_process_runner(tmp_path: Path
 
     payload_path = tmp_path / "worker-response.json"
     payload_path.write_text(
-        json.dumps(build_completed_response(parse_request(_payload()), _fake_run(), LIFECYCLE_FALLBACK)),
+        json.dumps(build_completed_response(parse_request(_payload()), _fake_run(), LIFECYCLE_FALLBACK, execution_mode=EXECUTION_MODE_LIVE)),
         encoding="utf-8",
     )
 
@@ -583,6 +663,7 @@ def _bridge_result(response: dict[str, Any]) -> Any:
     return BridgeResult(
         protocol_version=response["protocol_version"],
         status=response["status"],
+        execution_mode=response["execution_mode"],
         candidate_fingerprint=response["candidate_fingerprint"],
         grade=None
         if grade_payload is None
@@ -606,7 +687,7 @@ def test_reflection_records_report_the_bridge_reported_gaps_and_tool_calls(tmp_p
     from korvid_prompt_lab.scoring import score_result
 
     run = _fake_run(grade=_fake_grade(completion=False, verification=False, efficiency=0.2, tool_calls=7))
-    response = build_completed_response(parse_request(_payload()), run, LIFECYCLE_FALLBACK)
+    response = build_completed_response(parse_request(_payload()), run, LIFECYCLE_FALLBACK, execution_mode=EXECUTION_MODE_LIVE)
 
     case = EvalCase(
         case_id="aks-scale-up",
@@ -645,3 +726,235 @@ def test_reflection_records_trust_an_empty_bridge_reported_gap_list(tmp_path: Pa
     assert _missing_checkpoints({"missing_checkpoints": []}, ("dispatch",)) == ()
     # A bridge that reports no gap list at all keeps the legacy inference.
     assert _missing_checkpoints({"checkpoints": ["dispatch"]}, ("dispatch",)) == ("verify",)
+
+
+# --- failure taxonomy: only a real model turn can produce a model_failure ----------
+
+
+class _StubProvider:
+    """The smallest provider surface Korvid's runtime consults."""
+
+    def __init__(self) -> None:
+        self.completions: list[tuple[Any, ...]] = []
+        self.closed = False
+
+    def complete(self, messages: Any, tools: Any, *, stream: bool = True) -> str:
+        self.completions.append((messages, tools, stream))
+        return "stream"
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+    @property
+    def name(self) -> str:
+        return "stub-model"
+
+
+def test_turn_phase_starts_only_when_the_provider_is_asked_for_a_completion() -> None:
+    phase = TurnPhase()
+    provider = _StubProvider()
+    observed = observe_model_turns(provider, phase)
+
+    assert phase.model_turn_started is False
+    # Building and inspecting the provider is pre-turn work; only `complete` is a turn.
+    assert observed.name == "stub-model"
+    assert phase.model_turn_started is False
+
+    assert observed.complete(["message"], ["tool"], stream=False) == "stream"
+
+    assert phase.model_turn_started is True
+    assert provider.completions == [(["message"], ["tool"], False)]
+
+
+def test_observed_provider_still_exposes_the_close_hook_korvid_calls() -> None:
+    phase = TurnPhase()
+    provider = _StubProvider()
+    observed = observe_model_turns(provider, phase)
+
+    # Korvid looks the hook up exactly this way on whatever the factory returned.
+    aclose = getattr(observed, "aclose", None)
+    assert callable(aclose)
+    asyncio.run(aclose())
+
+    assert provider.closed is True
+
+
+def test_a_harness_timeout_before_any_model_turn_is_systemic_not_a_model_failure() -> None:
+    # Korvid's pre-turn Textual work (navigate, select the fixture row) can time out
+    # with the same WaitTimeout the turn loop raises. Blaming the model for a failure
+    # that happened before the model was ever asked would score a broken harness 0.0
+    # and let optimization keep running against nothing.
+    phase = TurnPhase()
+
+    with pytest.raises(WorkerConfigurationError, match="before the model was asked"):
+        classify_run_failure(TimeoutError("fixture target row selected not met within 5.0s"), phase)
+
+
+def test_a_timeout_after_a_model_turn_started_stays_a_model_failure() -> None:
+    phase = TurnPhase()
+    phase.mark_model_turn_started()
+
+    with pytest.raises(WorkerModelFailure):
+        classify_run_failure(TimeoutError("turn did not finish within 120.0s"), phase)
+
+
+def test_a_provider_failure_is_a_model_failure_even_before_a_turn_completes() -> None:
+    class ProviderError(RuntimeError):
+        pass
+
+    phase = TurnPhase()
+
+    with pytest.raises(WorkerModelFailure):
+        classify_run_failure(
+            ProviderError("connection refused"), phase, provider_errors=(ProviderError,)
+        )
+
+
+class _FakeWaitTimeout(Exception):
+    """Stands in for Korvid's `tests.ui.waits.WaitTimeout`."""
+
+
+class _FakeProviderError(RuntimeError):
+    """Stands in for `korvid.providers.openai_compat.ProviderError`."""
+
+
+def _fake_korvid(run_journey: Any) -> Any:
+    """Build the Korvid boundary `run_bridge` resolves out of KORVID_SOURCE_ROOT.
+
+    Only that boundary is stubbed: it lives in another checkout, so it cannot be
+    imported here. Everything `run_bridge` itself does — phase tracking, provider
+    wrapping, failure classification — is the real code under test.
+    """
+    from korvid_prompt_lab.bridge_worker import _Korvid
+
+    operation_app = ModuleType("fake_operation_app")
+    operation_app.build_profile = lambda name, **kwargs: SimpleNamespace(name=name)  # type: ignore[attr-defined]
+    journey = SimpleNamespace(
+        id="scale-deployment-up",
+        turns=("Scale checkout-a in shop-a from 2 to 3 replicas.",),
+    )
+    return _Korvid(
+        operation_app=operation_app,
+        run_operation_journey=run_journey,
+        approval_timeout_for=lambda _journey, timeout: timeout,
+        load_operation_journeys=lambda _directory: [journey],
+        bundled_operations_dir=lambda: Path("operations"),
+        lifecycle_checkpoints=LIFECYCLE_FALLBACK,
+        prompt_overrides=lambda **kwargs: SimpleNamespace(**kwargs),
+        scripted_provider=lambda script: _StubProvider(),
+        operation_scripts={"scale-deployment-up": ("script",)},
+        live_provider=lambda *args, **kwargs: _StubProvider(),
+        static_credentials=lambda key: SimpleNamespace(key=key),
+        provider_errors=(_FakeProviderError,),
+        turn_timeout_errors=(_FakeWaitTimeout, TimeoutError),
+    )
+
+
+def test_run_bridge_reports_a_pre_turn_harness_timeout_as_systemic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def never_reaches_the_model(journey: Any, **kwargs: Any) -> Any:
+        kwargs["provider_factory"]()  # Korvid builds the provider before it selects a row.
+        raise _FakeWaitTimeout("fixture target row selected not met within 5.0s")
+
+    monkeypatch.setattr(
+        "korvid_prompt_lab.bridge_worker._import_korvid",
+        lambda: _fake_korvid(never_reaches_the_model),
+    )
+    payload = _payload()
+    payload["runtime"]["artifact_dir"] = str(tmp_path / "run")
+
+    with pytest.raises(WorkerConfigurationError, match="before the model was asked"):
+        run_bridge(parse_request(payload), execution_mode=EXECUTION_MODE_LIVE, env={})
+
+
+def test_run_bridge_reports_a_timeout_after_a_model_turn_as_a_model_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def stalls_after_the_first_turn(journey: Any, **kwargs: Any) -> Any:
+        provider = kwargs["provider_factory"]()
+        provider.complete([{"role": "user"}], [])
+        raise _FakeWaitTimeout("turn did not finish within 120.0s")
+
+    monkeypatch.setattr(
+        "korvid_prompt_lab.bridge_worker._import_korvid",
+        lambda: _fake_korvid(stalls_after_the_first_turn),
+    )
+    payload = _payload()
+    payload["runtime"]["artifact_dir"] = str(tmp_path / "run")
+
+    with pytest.raises(WorkerModelFailure):
+        run_bridge(parse_request(payload), execution_mode=EXECUTION_MODE_LIVE, env={})
+
+
+def test_run_bridge_reports_a_provider_error_as_a_model_failure_before_any_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def provider_refuses(journey: Any, **kwargs: Any) -> Any:
+        kwargs["provider_factory"]()
+        raise _FakeProviderError("connection refused by the model endpoint")
+
+    monkeypatch.setattr(
+        "korvid_prompt_lab.bridge_worker._import_korvid",
+        lambda: _fake_korvid(provider_refuses),
+    )
+    payload = _payload()
+    payload["runtime"]["artifact_dir"] = str(tmp_path / "run")
+
+    with pytest.raises(WorkerModelFailure):
+        run_bridge(parse_request(payload), execution_mode=EXECUTION_MODE_LIVE, env={})
+
+
+def test_worker_exits_nonzero_without_a_response_when_the_harness_fails_pre_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def never_reaches_the_model(journey: Any, **kwargs: Any) -> Any:
+        kwargs["provider_factory"]()
+        raise _FakeWaitTimeout("fixture target row selected not met within 5.0s")
+
+    monkeypatch.setattr(
+        "korvid_prompt_lab.bridge_worker._import_korvid",
+        lambda: _fake_korvid(never_reaches_the_model),
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    payload = _payload()
+    payload["runtime"]["artifact_dir"] = str(run_dir)
+    request_path = run_dir / "request.json"
+    request_path.write_text(json.dumps(payload), encoding="utf-8")
+    response_path = run_dir / "response.json"
+
+    exit_code = worker_main(["--request", str(request_path), "--response", str(response_path)])
+
+    assert exit_code == EXIT_SYSTEMIC_FAILURE
+    assert not response_path.exists()
+    assert "before the model was asked" in capsys.readouterr().err
+
+
+def test_worker_writes_a_model_failure_response_when_a_started_turn_times_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def stalls_after_the_first_turn(journey: Any, **kwargs: Any) -> Any:
+        provider = kwargs["provider_factory"]()
+        provider.complete([{"role": "user"}], [])
+        raise _FakeWaitTimeout("turn did not finish within 120.0s")
+
+    monkeypatch.setattr(
+        "korvid_prompt_lab.bridge_worker._import_korvid",
+        lambda: _fake_korvid(stalls_after_the_first_turn),
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    payload = _payload()
+    payload["runtime"]["artifact_dir"] = str(run_dir)
+    request_path = run_dir / "request.json"
+    request_path.write_text(json.dumps(payload), encoding="utf-8")
+    response_path = run_dir / "response.json"
+
+    exit_code = worker_main(["--request", str(request_path), "--response", str(response_path)])
+
+    assert exit_code == 0
+    response = json.loads(response_path.read_text(encoding="utf-8"))
+    assert response["status"] == "model_failure"
+    assert response["execution_mode"] == "live"
+    assert response["grade"] is None

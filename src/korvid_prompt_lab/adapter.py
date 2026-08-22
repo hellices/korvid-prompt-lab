@@ -9,7 +9,7 @@ from typing import Any
 from gepa.core.adapter import EvaluationBatch, ProposalFn
 
 from .contracts import Candidate, EvalCase
-from .runner import KorvidProcessRunner
+from .runner import BridgeExecutionModeError, KorvidProcessRunner
 from .scoring import BridgeResult, score_result
 
 
@@ -18,6 +18,7 @@ class SafeExecutionTrace:
     case_id: str
     template_id: str
     model: str
+    execution_mode: str
     final_answer: str
     checkpoint_names: tuple[str, ...]
     tool_call_count: int
@@ -46,6 +47,28 @@ class KorvidGEPAAdapter:
         self.candidate_id = candidate_id
         self.candidate_metadata = dict(candidate_metadata or {})
         self._execution_index = 0
+        self._execution_modes: list[str] = []
+
+    @property
+    def execution_modes(self) -> tuple[str, ...]:
+        """Every distinct way this optimization's evidence was produced, in first-seen order."""
+        return tuple(self._execution_modes)
+
+    def _record_execution_mode(self, result: BridgeResult) -> None:
+        """Keep one optimization on one kind of evidence.
+
+        GEPA only ever compares candidates against each other, so a run that switched
+        from live grades to model-free scripted grades would rank a candidate against
+        a different experiment. Mixing is systemic, not a score.
+        """
+        if result.execution_mode in self._execution_modes:
+            return
+        if self._execution_modes:
+            raise BridgeExecutionModeError(
+                "optimization evidence must not mix execution modes:"
+                f" {self._execution_modes[0]} then {result.execution_mode}"
+            )
+        self._execution_modes.append(result.execution_mode)
 
     def evaluate(
         self,
@@ -62,6 +85,7 @@ class KorvidGEPAAdapter:
         for case in batch:
             run_dir = self._next_run_dir(resolved_candidate.fingerprint, case)
             result = self.runner.run(resolved_candidate, case, run_dir)
+            self._record_execution_mode(result)
             scored = score_result(result)
             outputs.append(result)
             scores.append(scored.score)
@@ -122,6 +146,7 @@ class KorvidGEPAAdapter:
             case_id=case.case_id,
             template_id=case.template_id,
             model=case.models[0],
+            execution_mode=result.execution_mode,
             final_answer=result.answer,
             checkpoint_names=checkpoint_names,
             tool_call_count=_count_tool_calls(reported_tool_calls),
@@ -143,6 +168,7 @@ class KorvidGEPAAdapter:
                 "checkpoint_names": list(trace.checkpoint_names),
                 "tool_call_count": trace.tool_call_count,
                 "outcome": trace.outcome,
+                "execution_mode": trace.execution_mode,
             },
             "Feedback": _build_feedback(trace),
             "score": trace.score,

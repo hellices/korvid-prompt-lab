@@ -26,6 +26,9 @@ def _case_tags(case_id: str) -> set[str]:
 
 TUNED_MARKER = "korvid-tuned"
 
+#: Protocol 2 added the typed ``execution_mode`` every response must declare.
+PROTOCOL_VERSION = 2
+
 
 def _default_grade(candidate: dict[str, object]) -> dict[str, object]:
     """Grade a healthy, fully completed run, rewarding candidates that carry the tuned marker."""
@@ -82,7 +85,7 @@ def main() -> int:
         response_path.mkdir(parents=True, exist_ok=True)
         return 0
 
-    protocol_version = 2 if "protocol-mismatch" in tags else 1
+    protocol_version = PROTOCOL_VERSION + 1 if "protocol-mismatch" in tags else PROTOCOL_VERSION
     candidate_fingerprint = fingerprint + "-wrong" if "fingerprint-mismatch" in tags else fingerprint
 
     if "systemic-status" in tags:
@@ -384,6 +387,16 @@ def main() -> int:
         journal = payload.get("journal")
         if isinstance(journal, dict):
             journal["model_endpoint"] = request["runtime"].get("model_endpoint")
+        if "missing-execution-mode" in tags:
+            payload.pop("execution_mode", None)
+        elif "bad-execution-mode-type" in tags:
+            payload["execution_mode"] = 7
+        elif "unknown-execution-mode" in tags:
+            payload["execution_mode"] = "simulated"
+        elif "scripted-mode" in tags:
+            payload["execution_mode"] = "scripted"
+        else:
+            payload["execution_mode"] = "live"
         if "identity-mismatch" in tags:
             payload["request_identity"] = {
                 **request_identity,

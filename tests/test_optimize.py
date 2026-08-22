@@ -413,3 +413,30 @@ def test_optimize_campaign_requires_explicit_disjoint_case_splits(
             artifact_root=tmp_path / "artifacts",
             max_metric_calls=4,
         )
+
+
+def test_optimization_summary_records_how_its_evidence_was_produced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    train_case = _case("train-1[scripted-mode]")
+    validation_case = _case("val-1[scripted-mode]")
+    runner = _runner([train_case, validation_case])
+
+    def fake_optimize(**kwargs: object) -> GEPAResult:
+        adapter = cast(Any, kwargs["adapter"])
+        adapter.evaluate([train_case], _seed_candidate().components, capture_traces=True)
+        return _fake_gepa_result(cast(str, kwargs["run_dir"]))
+
+    monkeypatch.setattr("korvid_prompt_lab.optimize.gepa.optimize", fake_optimize)
+
+    result = optimize_campaign(
+        runner=runner,
+        seed_candidate=_seed_candidate(),
+        train_cases=[train_case],
+        validation_cases=[validation_case],
+        artifact_root=tmp_path / "artifacts",
+        max_metric_calls=3,
+    )
+
+    summary = json.loads(result.summary_path.read_text(encoding="utf-8"))
+    assert summary["execution_modes"] == ["scripted"]

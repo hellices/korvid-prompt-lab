@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml  # type: ignore[import-untyped]
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -125,6 +126,7 @@ def _evaluation_summary(**overrides: object) -> dict[str, object]:
             "campaign.yaml",
         ],
     }
+    summary.setdefault("execution_modes", ["live"])
     summary.update(overrides)
     summary.setdefault("model_scores", {"mock-small": summary["aggregate_score"]})
     return summary
@@ -528,6 +530,7 @@ def test_render_scoreboard_uses_aggregate_score_for_prompt_bundle_rows(tmp_path:
         pass_at_3=1.0,
         pass_at_5=1.0,
         hard_safety_failures=1,
+        execution_modes=("live",),
         bundle_dir=tmp_path / "registry" / "bundles" / "mock-small" / "pb-unsafe000000000",
         prompt_bundle_path=tmp_path / "registry" / "bundles" / "mock-small" / "pb-unsafe000000000" / "prompt-bundle.yaml",
         evaluation_summary_path=tmp_path / "registry" / "bundles" / "mock-small" / "pb-unsafe000000000" / "evaluation-summary.json",
@@ -678,3 +681,68 @@ def test_publish_bundle_defaults_to_a_non_zero_minimum_model_improvement(tmp_pat
     assert marginal.published is False
     assert "improvement" in marginal.reason
     assert clear_win.published is True
+
+
+def test_publish_refuses_evidence_that_was_not_produced_live(tmp_path: Path) -> None:
+    # A scripted bridge run never contacts a model, so its perfect grade says nothing
+    # about the model the bundle is published for.
+    with pytest.raises(ValueError, match="execution_modes"):
+        publish_bundle(
+            candidate=_candidate(),
+            campaign=_campaign(),
+            model_metadata=_model_metadata(),
+            evaluation_summary=_evaluation_summary(execution_modes=["scripted"]),
+            registry_root=tmp_path / "registry",
+        )
+
+    assert not (tmp_path / "registry").exists()
+
+
+def test_publish_refuses_evidence_that_mixes_live_and_scripted_runs(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="execution_modes"):
+        publish_bundle(
+            candidate=_candidate(),
+            campaign=_campaign(),
+            model_metadata=_model_metadata(),
+            evaluation_summary=_evaluation_summary(execution_modes=["live", "scripted"]),
+            registry_root=tmp_path / "registry",
+        )
+
+
+def test_publish_requires_the_summary_to_declare_its_execution_modes(tmp_path: Path) -> None:
+    summary = _evaluation_summary()
+    del summary["execution_modes"]
+
+    with pytest.raises(ValueError, match="execution_modes"):
+        publish_bundle(
+            candidate=_candidate(),
+            campaign=_campaign(),
+            model_metadata=_model_metadata(),
+            evaluation_summary=summary,
+            registry_root=tmp_path / "registry",
+        )
+
+
+def test_publish_records_the_live_execution_mode_in_the_bundle_and_index(tmp_path: Path) -> None:
+    registry_root = tmp_path / "registry"
+
+    decision = publish_bundle(
+        candidate=_candidate(),
+        campaign=_campaign(),
+        model_metadata=_model_metadata(),
+        evaluation_summary=_evaluation_summary(),
+        registry_root=registry_root,
+    )
+
+    assert decision.published
+    assert decision.bundle is not None
+    assert decision.bundle.execution_modes == ("live",)
+
+    bundle_payload = yaml.safe_load(decision.bundle.prompt_bundle_path.read_text(encoding="utf-8"))
+    assert bundle_payload["evaluation"]["execution_modes"] == ["live"]
+
+    summary_payload = json.loads(decision.bundle.evaluation_summary_path.read_text(encoding="utf-8"))
+    assert summary_payload["execution_modes"] == ["live"]
+
+    index = json.loads((registry_root / "index.json").read_text(encoding="utf-8"))
+    assert index["bundles"][0]["execution_modes"] == ["live"]

@@ -19,8 +19,9 @@ from korvid_prompt_lab.scoring import (
 
 def _completed_result(*, grade: OperationGrade) -> BridgeResult:
     return BridgeResult(
-        protocol_version=1,
+        protocol_version=2,
         status="completed",
+        execution_mode="live",
         candidate_fingerprint="candidate-fingerprint",
         grade=grade,
         answer="done",
@@ -62,8 +63,9 @@ def test_score_result_zeroes_hard_failures() -> None:
 def test_score_result_accepts_model_failures() -> None:
     scored = score_result(
         BridgeResult(
-            protocol_version=1,
+            protocol_version=2,
             status="model_failure",
+            execution_mode="live",
             candidate_fingerprint="candidate-fingerprint",
             grade=None,
             answer="",
@@ -80,8 +82,9 @@ def test_score_result_accepts_model_failures() -> None:
 
 def test_score_result_rejects_systemic_statuses() -> None:
     result = BridgeResult(
-        protocol_version=1,
+        protocol_version=2,
         status="system_failure",
+        execution_mode="live",
         candidate_fingerprint="candidate-fingerprint",
         grade=None,
         answer="",
@@ -139,8 +142,9 @@ def test_result_passed_rejects_unsafe_results() -> None:
 def test_result_passed_rejects_model_failures() -> None:
     scored = score_result(
         BridgeResult(
-            protocol_version=1,
+            protocol_version=2,
             status="model_failure",
+            execution_mode="live",
             candidate_fingerprint="candidate-fingerprint",
             grade=None,
             answer="",

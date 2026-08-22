@@ -32,7 +32,7 @@ from types import ModuleType
 from typing import Any
 from urllib.parse import urlsplit
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 EXIT_SYSTEMIC_FAILURE = 2
 MAX_ANSWER_CHARS = 4000
 MAX_ERROR_CHARS = 300
@@ -40,6 +40,18 @@ DEFAULT_PROFILE = "small"
 DEFAULT_APPROVAL_TIMEOUT_SECONDS = 5.0
 DEFAULT_TURN_TIMEOUT_SECONDS = 120.0
 AUDIT_FILENAME = "korvid-audit.jsonl"
+
+#: A grade produced by contacting a real model provider over the request's endpoint.
+EXECUTION_MODE_LIVE = "live"
+#: A grade produced from Korvid's deterministic operation scripts — no model was asked.
+EXECUTION_MODE_SCRIPTED = "scripted"
+#: The closed vocabulary of :data:`PROTOCOL_VERSION` 2's ``execution_mode`` field.
+#:
+#: Protocol 1 had no such field, so a version-1 peer could never prove that a grade
+#: came from a model. Both sides moved to 2 together and version 1 is refused rather
+#: than migrated: assuming "live" for a silent peer is exactly the failure this
+#: field exists to prevent.
+EXECUTION_MODES: frozenset[str] = frozenset({EXECUTION_MODE_LIVE, EXECUTION_MODE_SCRIPTED})
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
@@ -276,6 +288,37 @@ def load_request(path: Path | str) -> BridgeRequest:
     return parse_request(payload)
 
 
+# --- execution mode -------------------------------------------------------------
+
+
+def require_execution_mode(value: Any) -> str:
+    """Return *value* only when it names a mode in the closed vocabulary."""
+    if not isinstance(value, str) or value not in EXECUTION_MODES:
+        raise WorkerConfigurationError(
+            f"execution_mode must be one of {', '.join(sorted(EXECUTION_MODES))}"
+        )
+    return value
+
+
+def resolve_execution_mode(request: BridgeRequest, *, scripted: bool) -> str:
+    """Decide, fail-closed, which execution mode this run is allowed to claim.
+
+    ``--scripted`` replaces the model with Korvid's canned operation scripts, so a
+    scripted run grades prompt plumbing, never a model. A request that carries a
+    ``runtime.model_endpoint`` is a live campaign by construction, and letting it
+    return scripted evidence would publish a model-free score as if a model had
+    earned it. That combination is systemic, not gradeable.
+    """
+    if not scripted:
+        return EXECUTION_MODE_LIVE
+    if request.model_endpoint is not None:
+        raise WorkerConfigurationError(
+            "scripted mode is refused for a request that carries runtime.model_endpoint:"
+            " a live campaign must never be graded from Korvid's deterministic scripts"
+        )
+    return EXECUTION_MODE_SCRIPTED
+
+
 # --- candidate -> Korvid prompt overrides --------------------------------------
 
 
@@ -406,17 +449,21 @@ def build_completed_response(
     request: BridgeRequest,
     run: Any,
     lifecycle_checkpoints: Sequence[str],
+    *,
+    execution_mode: str,
 ) -> dict[str, Any]:
     """Build the strict response for a run Korvid actually executed and graded.
 
     A graded-but-incomplete run is still ``completed``: it earned a low grade,
-    which is evidence, not a systemic failure.
+    which is evidence, not a systemic failure. ``execution_mode`` travels with the
+    grade so no downstream consumer has to guess whether a model produced it.
     """
     grade = run.grade
     wall_time = getattr(run, "wall_time_s", 0.0)
     return {
         "protocol_version": PROTOCOL_VERSION,
         "status": "completed",
+        "execution_mode": require_execution_mode(execution_mode),
         "candidate_fingerprint": request.candidate_fingerprint,
         "request_identity": request.request_identity,
         "grade": {
@@ -440,12 +487,14 @@ def build_model_failure_response(
     request: BridgeRequest,
     error: BaseException | str,
     *,
+    execution_mode: str,
     env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build the response for a run Korvid could not execute because of the model."""
     return {
         "protocol_version": PROTOCOL_VERSION,
         "status": "model_failure",
+        "execution_mode": require_execution_mode(execution_mode),
         "candidate_fingerprint": request.candidate_fingerprint,
         "request_identity": request.request_identity,
         "grade": None,
@@ -496,6 +545,85 @@ def write_response(path: Path | str, payload: Mapping[str, Any]) -> Path:
     return response_path
 
 
+# --- failure taxonomy ---------------------------------------------------------------
+
+
+class TurnPhase:
+    """Records whether Korvid ever got as far as asking the model for a turn.
+
+    Korvid's harness raises the same wait timeout for two very different events:
+    a Textual selection or approval step that never settled (before the model was
+    ever consulted), and a turn the model failed to finish. Only the second is the
+    model's fault. Instead of guessing from the message, the worker observes the
+    provider: the phase flips the first time a completion is actually requested.
+    """
+
+    __slots__ = ("_started",)
+
+    def __init__(self) -> None:
+        self._started = False
+
+    @property
+    def model_turn_started(self) -> bool:
+        return self._started
+
+    def mark_model_turn_started(self) -> None:
+        self._started = True
+
+
+class _TurnObservingProvider:
+    """Wraps a Korvid provider so the worker sees the first real model turn.
+
+    Everything except ``complete`` is forwarded untouched, including the ``aclose``
+    hook Korvid looks up on the object the factory returned.
+    """
+
+    __slots__ = ("_phase", "_provider")
+
+    def __init__(self, provider: Any, phase: TurnPhase) -> None:
+        self._provider = provider
+        self._phase = phase
+
+    def complete(self, messages: Any, tools: Any, *, stream: bool = True) -> Any:
+        self._phase.mark_model_turn_started()
+        return self._provider.complete(messages, tools, stream=stream)
+
+    def __getattr__(self, name: str) -> Any:
+        if name in _TurnObservingProvider.__slots__:  # pragma: no cover - recursion guard
+            raise AttributeError(name)
+        return getattr(self._provider, name)
+
+
+def observe_model_turns(provider: Any, phase: TurnPhase) -> Any:
+    """Return *provider* wrapped so *phase* learns when the model is first asked."""
+    return _TurnObservingProvider(provider, phase)
+
+
+def classify_run_failure(
+    error: BaseException,
+    phase: TurnPhase,
+    *,
+    provider_errors: tuple[type[BaseException], ...] = (),
+    env: Mapping[str, str] | None = None,
+) -> None:
+    """Raise the right kind of failure for an exception that escaped the journey.
+
+    A provider or transport error is always the model's: only the provider raises it.
+    A timeout is the model's only once the model has actually been asked for a turn;
+    a timeout before that is the Textual harness failing to reach the model at all,
+    which is systemic — grading it ``model_failure`` would score a broken harness
+    ``0.0`` and let an optimization run to completion against no evidence.
+    """
+    if provider_errors and isinstance(error, provider_errors):
+        raise WorkerModelFailure(sanitize_error(error, env)) from error
+    if phase.model_turn_started:
+        raise WorkerModelFailure(sanitize_error(error, env)) from error
+    raise WorkerConfigurationError(
+        "korvid harness failed before the model was asked for a turn:"
+        f" {sanitize_error(error, env)}"
+    ) from error
+
+
 # --- Korvid execution --------------------------------------------------------------
 
 
@@ -512,7 +640,10 @@ class _Korvid:
     operation_scripts: Mapping[str, Any]
     live_provider: Any
     static_credentials: Any
-    model_failure_errors: tuple[type[BaseException], ...]
+    #: Errors only a provider or its transport can raise — always the model's fault.
+    provider_errors: tuple[type[BaseException], ...]
+    #: Errors whose blame depends on whether a model turn had started.
+    turn_timeout_errors: tuple[type[BaseException], ...]
 
 
 def _import_korvid() -> _Korvid:
@@ -551,7 +682,8 @@ def _import_korvid() -> _Korvid:
         operation_scripts=OPERATION_SCRIPTS,
         live_provider=OpenAICompatProvider,
         static_credentials=StaticHeaderSource,
-        model_failure_errors=(ProviderError, httpx.HTTPError, WaitTimeout, TimeoutError),
+        provider_errors=(ProviderError, httpx.HTTPError),
+        turn_timeout_errors=(WaitTimeout, TimeoutError),
     )
 
 
@@ -562,6 +694,7 @@ def _build_provider_factory(
     scripted: bool,
     turn_timeout: float,
     env: Mapping[str, str],
+    phase: TurnPhase,
 ) -> Any:
     if scripted:
         script = korvid.operation_scripts.get(request.template_id)
@@ -569,7 +702,7 @@ def _build_provider_factory(
             raise WorkerConfigurationError(
                 f"scripted mode has no deterministic script for operation journey {request.template_id!r}"
             )
-        return lambda: korvid.scripted_provider(script)
+        return lambda: observe_model_turns(korvid.scripted_provider(script), phase)
 
     if request.model_endpoint is None:
         raise WorkerConfigurationError(
@@ -581,11 +714,14 @@ def _build_provider_factory(
 
     def factory() -> Any:
         credentials = korvid.static_credentials(api_key) if api_key else None
-        return korvid.live_provider(
-            base_url,
-            request.model,
-            credentials=credentials,
-            timeout_seconds=turn_timeout,
+        return observe_model_turns(
+            korvid.live_provider(
+                base_url,
+                request.model,
+                credentials=credentials,
+                timeout_seconds=turn_timeout,
+            ),
+            phase,
         )
 
     return factory
@@ -594,7 +730,7 @@ def _build_provider_factory(
 def run_bridge(
     request: BridgeRequest,
     *,
-    scripted: bool = False,
+    execution_mode: str,
     profile: str = DEFAULT_PROFILE,
     approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
     turn_timeout: float = DEFAULT_TURN_TIMEOUT_SECONDS,
@@ -602,6 +738,8 @@ def run_bridge(
 ) -> dict[str, Any]:
     """Run one graded Korvid operation journey and return the strict response."""
     environment = os.environ if env is None else env
+    scripted = require_execution_mode(execution_mode) == EXECUTION_MODE_SCRIPTED
+    phase = TurnPhase()
     korvid = _import_korvid()
 
     journeys = korvid.load_operation_journeys(korvid.bundled_operations_dir())
@@ -617,6 +755,7 @@ def run_bridge(
         scripted=scripted,
         turn_timeout=turn_timeout,
         env=environment,
+        phase=phase,
     )
 
     audit_path = Path(request.artifact_dir) / AUDIT_FILENAME
@@ -641,10 +780,13 @@ def run_bridge(
                 turn_timeout=turn_timeout,
             )
         )
-    except korvid.model_failure_errors as exc:
-        raise WorkerModelFailure(sanitize_error(exc, environment)) from exc
+    except (*korvid.provider_errors, *korvid.turn_timeout_errors) as exc:
+        classify_run_failure(exc, phase, provider_errors=korvid.provider_errors, env=environment)
+        raise  # pragma: no cover - classify_run_failure always raises
 
-    return build_completed_response(request, run, korvid.lifecycle_checkpoints)
+    return build_completed_response(
+        request, run, korvid.lifecycle_checkpoints, execution_mode=execution_mode
+    )
 
 
 # --- entry point --------------------------------------------------------------------
@@ -682,20 +824,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     request: BridgeRequest | None = None
+    execution_mode: str | None = None
     try:
         request = load_request(args.request)
+        # Fail closed before Korvid is even imported: a live request may never be
+        # answered with scripted evidence.
+        execution_mode = resolve_execution_mode(request, scripted=args.scripted)
         payload = run_bridge(
             request,
-            scripted=args.scripted,
+            execution_mode=execution_mode,
             profile=args.profile,
             approval_timeout=args.approval_timeout,
             turn_timeout=args.turn_timeout,
         )
     except WorkerModelFailure as exc:
-        if request is None:  # pragma: no cover - defensive; the model cannot fail before parsing
+        if request is None or execution_mode is None:  # pragma: no cover - defensive; the model cannot fail before parsing
             print(f"korvid-bridge-worker: {sanitize_error(exc)}", file=sys.stderr)
             return EXIT_SYSTEMIC_FAILURE
-        payload = build_model_failure_response(request, exc)
+        payload = build_model_failure_response(request, exc, execution_mode=execution_mode)
     except WorkerConfigurationError as exc:
         print(f"korvid-bridge-worker: {sanitize_error(exc)}", file=sys.stderr)
         return EXIT_SYSTEMIC_FAILURE

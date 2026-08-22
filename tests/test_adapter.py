@@ -14,7 +14,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from korvid_prompt_lab.adapter import KorvidGEPAAdapter
 from korvid_prompt_lab.contracts import Campaign, Candidate, EvalCase, ProcessServing
-from korvid_prompt_lab.runner import BridgeStatusError, KorvidProcessRunner
+from korvid_prompt_lab.runner import (
+    BridgeExecutionModeError,
+    BridgeStatusError,
+    KorvidProcessRunner,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests" / "fixtures"))
@@ -119,8 +123,9 @@ response_path = Path(sys.argv[sys.argv.index("--response") + 1])
 response_path.write_text(
     json.dumps(
         {
-            "protocol_version": 1,
+            "protocol_version": 2,
             "status": "completed",
+            "execution_mode": "live",
             "candidate_fingerprint": request["candidate_fingerprint"],
             "request_identity": {
                 "case_id": request["case"]["case_id"],
@@ -198,8 +203,9 @@ unsafe = case_id.endswith("unsafe")
 response_path.write_text(
     json.dumps(
         {
-            "protocol_version": 1,
+            "protocol_version": 2,
             "status": "completed",
+            "execution_mode": "live",
             "candidate_fingerprint": request["candidate_fingerprint"],
             "request_identity": {
                 "case_id": request["case"]["case_id"],
@@ -285,3 +291,39 @@ def test_real_gepa_invokes_the_adapter_proposal_contract_and_can_beat_the_seed(t
     assert best_candidate != seed_components
     assert TUNED_MARKER in "".join(best_candidate.values())
     assert result.val_aggregate_scores[result.best_idx] > result.val_aggregate_scores[0]
+
+
+def test_adapter_records_how_each_grade_was_produced(tmp_path: Path) -> None:
+    live = _case("case[completed]")
+    adapter = _adapter(tmp_path, [live])
+
+    eval_batch = adapter.evaluate([live], _seed_candidate().components, capture_traces=True)
+
+    assert eval_batch.trajectories is not None
+    assert eval_batch.trajectories[0].execution_mode == "live"
+    assert adapter.execution_modes == ("live",)
+
+    record = adapter._trace_to_record(eval_batch.trajectories[0])
+    assert record["Generated Outputs"]["execution_mode"] == "live"
+
+
+def test_adapter_refuses_to_mix_scripted_evidence_into_a_live_optimization(tmp_path: Path) -> None:
+    # GEPA compares candidates against each other. A run that silently switched to
+    # model-free scripted evidence would rank a candidate on a different experiment.
+    live = _case("case[completed]")
+    scripted = _case("case[scripted-mode]")
+    adapter = _adapter(tmp_path, [live, scripted])
+
+    adapter.evaluate([live], _seed_candidate().components, capture_traces=True)
+
+    with pytest.raises(BridgeExecutionModeError, match="execution modes"):
+        adapter.evaluate([scripted], _seed_candidate().components, capture_traces=True)
+
+
+def test_adapter_allows_a_wholly_scripted_optimization(tmp_path: Path) -> None:
+    scripted = _case("case[scripted-mode]")
+    adapter = _adapter(tmp_path, [scripted])
+
+    adapter.evaluate([scripted], _seed_candidate().components, capture_traces=True)
+
+    assert adapter.execution_modes == ("scripted",)

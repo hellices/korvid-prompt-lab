@@ -34,6 +34,7 @@ class PromptBundle:
     pass_at_3: float
     pass_at_5: float
     hard_safety_failures: int
+    execution_modes: tuple[str, ...]
     bundle_dir: Path
     prompt_bundle_path: Path
     evaluation_summary_path: Path
@@ -148,6 +149,7 @@ def publish_bundle(
         pass_at_3=summary["pass_at_3"],
         pass_at_5=summary["pass_at_5"],
         hard_safety_failures=summary["hard_safety_failures"],
+        execution_modes=tuple(summary["execution_modes"]),
         bundle_dir=bundle_dir,
         prompt_bundle_path=prompt_bundle_path,
         evaluation_summary_path=evaluation_summary_path,
@@ -327,6 +329,7 @@ def _normalize_evaluation_summary(value: Mapping[str, Any]) -> dict[str, Any]:
     case_sets = _normalize_case_sets(summary.get("case_sets"))
     artifact_refs = _normalize_unordered_string_list(summary.get("artifact_refs"), "artifact_refs")
     reproduction_command = _normalize_string_list(summary.get("reproduction_command"), "reproduction_command")
+    execution_modes = _require_live_execution_modes(summary.get("execution_modes"))
 
     return {
         "bundle_kind": bundle_kind,
@@ -336,10 +339,31 @@ def _normalize_evaluation_summary(value: Mapping[str, Any]) -> dict[str, Any]:
         "hard_safety_failures": hard_safety_failures,
         "systemic_failures": systemic_failures,
         "milestone_passed": milestone_passed,
+        "execution_modes": execution_modes,
         "case_sets": case_sets,
         "artifact_refs": artifact_refs,
         "reproduction_command": reproduction_command,
     }
+
+
+def _require_live_execution_modes(value: Any) -> list[str]:
+    """Publication requires evidence a model actually produced.
+
+    ``scripted`` runs replace the model with Korvid's canned operation scripts, so a
+    scripted grade is model-free by construction and can never justify a bundle that
+    claims a model earned it. A summary that mixes modes is refused too: half the
+    evidence would still be model-free.
+    """
+    if value is None:
+        raise ValueError(
+            "evaluation summary execution_modes is required; publication only accepts live bridge evidence"
+        )
+    modes = _normalize_unordered_string_list(value, "execution_modes")
+    if modes != ["live"]:
+        raise ValueError(
+            f"publication requires execution_modes == ['live'], not {modes}"
+        )
+    return modes
 
 
 def _require_usable_case_sets(case_sets: Mapping[str, Sequence[str]], campaign: Campaign) -> None:
@@ -467,6 +491,7 @@ def _bundle_index_entry(
         "pass_at_3": bundle.pass_at_3,
         "pass_at_5": bundle.pass_at_5,
         "hard_safety_failures": bundle.hard_safety_failures,
+        "execution_modes": list(bundle.execution_modes),
         "path": f"bundles/{bundle.model_family}/{bundle.version}",
     }
 

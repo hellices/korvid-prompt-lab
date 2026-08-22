@@ -11,6 +11,7 @@ import dspy  # type: ignore[import-untyped]
 
 from .aks import AKSPortForward, AKSPortForwardError
 from .artifacts import write_json_artifact
+from .bridge_worker import EXECUTION_MODE_LIVE
 from .config import load_campaign, load_candidate
 from .contracts import AKSPortForwardServing, Campaign, Candidate, EvalCase
 from .optimize import (
@@ -485,6 +486,7 @@ def _evaluate_campaign(
                     "unsafe": scored.unsafe,
                     "score": scored.score,
                     "status": result.status,
+                    "execution_mode": result.execution_mode,
                     "hard_failures": list(result.grade.hard_failures) if result.grade is not None else [],
                 }
             )
@@ -549,6 +551,10 @@ def _evaluate_campaign(
         "evaluated_case_model_pairs": evaluated_case_model_pairs,
         "aggregate_score": sum(scores) / len(scores) if scores else 0.0,
         "model_scores": _model_scores(run_records),
+        # How every graded run got its evidence. `scripted` grades never contacted a
+        # model, so publication refuses anything that is not wholly `live`.
+        "execution_modes": _execution_modes(run_records),
+        "run_execution_modes": _run_execution_modes(run_records),
         "repetitions_per_case": campaign.repetitions,
         "pass_at_3": pass_hat_k(repetition_outcomes, 3),
         "pass_at_5": pass_hat_k(repetition_outcomes, 5),
@@ -588,6 +594,28 @@ def _model_scores(run_records: Sequence[dict[str, Any]]) -> dict[str, float]:
         totals[model] = totals.get(model, 0.0) + float(record["score"])
         counts[model] = counts.get(model, 0) + 1
     return {model: totals[model] / counts[model] for model in sorted(totals)}
+
+
+def _execution_modes(run_records: Sequence[dict[str, Any]]) -> list[str]:
+    return sorted({str(record["execution_mode"]) for record in run_records})
+
+
+def _run_execution_modes(run_records: Sequence[dict[str, Any]]) -> dict[str, str]:
+    """Name the execution mode of every case/model pair, refusing a pair that disagrees.
+
+    A pair whose repetitions were graded different ways is not one experiment, so it
+    can never be summarized into a single claim.
+    """
+    modes: dict[str, str] = {}
+    for record in run_records:
+        pair = _encode_case_model_pair(str(record["case_id"]), str(record["model"]))
+        mode = str(record["execution_mode"])
+        previous = modes.setdefault(pair, mode)
+        if previous != mode:
+            raise ValueError(
+                f"case/model pair {pair} mixed bridge execution modes: {previous} and {mode}"
+            )
+    return {pair: modes[pair] for pair in sorted(modes)}
 
 
 def _case_model_pairs(cases: Sequence[EvalCase]) -> list[str]:
@@ -647,6 +675,7 @@ def _validate_publish_summary(
     campaign_case_ids = _require_unique_string_list(summary.get("campaign_case_ids"), "campaign_case_ids")
     evaluated_case_ids = _require_unique_string_list(summary.get("evaluated_case_ids"), "evaluated_case_ids")
     evaluated_models = _require_unique_string_list(summary.get("evaluated_models"), "evaluated_models")
+    _require_live_execution_modes(summary)
     campaign_case_model_pairs = _require_unique_string_list(
         summary.get("campaign_case_model_pairs"), "campaign_case_model_pairs"
     )
@@ -711,6 +740,23 @@ def _validate_publish_summary(
             expected_target_pairs
         ):
             raise ValueError("model-specific publication requires the full target-model case pack")
+
+
+def _require_live_execution_modes(summary: dict[str, Any]) -> list[str]:
+    """Refuse, before anything is written, a summary that is not wholly live evidence.
+
+    ``scripted`` bridge runs replace the model with Korvid's deterministic operation
+    scripts, so their grades are model-free. Publishing them would advertise a score
+    the model never earned, and a mixed summary is no better: part of the evidence
+    would still be model-free.
+    """
+    modes = _require_unique_string_list(summary.get("execution_modes"), "execution_modes")
+    if sorted(modes) != [EXECUTION_MODE_LIVE]:
+        raise ValueError(
+            "evaluation summary execution_modes must be exactly ['live']; scripted bridge"
+            f" evidence never contacted a model: {sorted(modes)}"
+        )
+    return modes
 
 
 def _require_string_field(summary: dict[str, Any], field_name: str) -> str:

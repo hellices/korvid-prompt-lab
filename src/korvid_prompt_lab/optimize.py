@@ -135,6 +135,9 @@ def optimize_campaign(
             "best_candidate_differs_from_seed": best_candidate.fingerprint != seed_candidate.fingerprint,
             "train_case_ids": train_case_ids,
             "validation_case_ids": validation_case_ids,
+            # How this search's evidence was produced. A candidate tuned against
+            # model-free scripted grades is not comparable to one tuned live.
+            "execution_modes": list(adapter.execution_modes),
             "num_candidates": result.num_candidates,
             "total_metric_calls": result.total_metric_calls,
             "num_full_val_evals": result.num_full_val_evals,

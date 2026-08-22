@@ -13,6 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from korvid_prompt_lab.bridge import BridgeConfigurationError, resolve_source_root
+from korvid_prompt_lab.bridge_worker import PROTOCOL_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -48,7 +49,14 @@ def _fingerprint(candidate: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _request(run_dir: Path, *, template_id: str, prompt: str, case_id: str) -> dict[str, Any]:
+def _request(
+    run_dir: Path,
+    *,
+    template_id: str,
+    prompt: str,
+    case_id: str,
+    model_endpoint: str | None = None,
+) -> dict[str, Any]:
     candidate = {
         "schema_version": 1,
         "candidate_id": "shipped-small",
@@ -60,7 +68,7 @@ def _request(run_dir: Path, *, template_id: str, prompt: str, case_id: str) -> d
         "metadata": {"source": "shipped"},
     }
     return {
-        "protocol_version": 1,
+        "protocol_version": PROTOCOL_VERSION,
         "candidate_fingerprint": _fingerprint(candidate),
         "candidate": candidate,
         "case": {
@@ -75,7 +83,7 @@ def _request(run_dir: Path, *, template_id: str, prompt: str, case_id: str) -> d
             "campaign_id": "aks-shared-runners",
             "repetitions": 5,
             "artifact_dir": str(run_dir),
-            "model_endpoint": None,
+            "model_endpoint": model_endpoint,
         },
     }
 
@@ -169,8 +177,9 @@ def test_bridge_runs_the_authoritative_korvid_grader_against_the_source_checkout
     assert completed.returncode == 0, completed.stderr
     response = json.loads(response_path.read_text(encoding="utf-8"))
 
-    assert response["protocol_version"] == 1
+    assert response["protocol_version"] == PROTOCOL_VERSION
     assert response["status"] == "completed"
+    assert response["execution_mode"] == "scripted"
     assert response["request_identity"]["template_id"] == "scale-deployment-up"
     assert response["grade"] == {
         "completion": 1.0,
@@ -292,4 +301,26 @@ def test_bridge_rejects_a_campaign_prompt_that_is_not_the_journey_first_turn(tmp
 
     assert completed.returncode != 0
     assert "first turn" in completed.stderr
+    assert not response_path.exists()
+
+
+def test_bridge_refuses_scripted_evidence_for_a_request_with_a_model_endpoint(tmp_path: Path) -> None:
+    """A live campaign must never receive a grade Korvid's canned scripts produced."""
+    source_root = _source_root()
+
+    completed, response_path = _run_bridge(
+        tmp_path,
+        _request(
+            tmp_path / "run",
+            template_id="scale-deployment-up",
+            prompt="Scale checkout-a in shop-a from 2 to 3 replicas.",
+            case_id="aks-scale-up",
+            model_endpoint="http://127.0.0.1:41001",
+        ),
+        source_root=source_root,
+        scripted=True,
+    )
+
+    assert completed.returncode != 0
+    assert "scripted" in completed.stderr
     assert not response_path.exists()

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .artifacts import write_json_artifact
+from .bridge_worker import EXECUTION_MODE_LIVE, EXECUTION_MODES, PROTOCOL_VERSION
 from .contracts import (
     AKSPortForwardServing,
     Campaign,
@@ -23,6 +27,44 @@ from .contracts import (
 from .scoring import BridgeResult, OperationGrade
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+#: Runtime policy handed to the bridge launcher so it can tear its own worker
+#: process group down before this runner stops waiting. Never read from a
+#: candidate or the optimizer: it is derived from campaign policy alone.
+BRIDGE_TIMEOUT_ENV = "KORVID_BRIDGE_TIMEOUT_SECONDS"
+
+#: Share of the campaign timeout reserved for the launcher's own cleanup.
+LAUNCHER_GRACE_FRACTION = 0.1
+#: Upper bound on that reservation, so a long campaign budget is not wasted.
+LAUNCHER_MAX_GRACE_SECONDS = 10.0
+#: Lower bound on that reservation: the launcher's own worst-case teardown window
+#: (:data:`korvid_prompt_lab.bridge.WORKER_TEARDOWN_BUDGET_SECONDS`). Reserving less
+#: would let this runner start killing while the launcher is mid-escalation.
+LAUNCHER_TEARDOWN_RESERVATION_SECONDS = 4.0
+#: How long each termination signal is given before the next escalation step.
+PROCESS_GROUP_TERMINATION_GRACE_SECONDS = 5.0
+#: How often the runner re-checks whether the bridge process group has drained.
+_GROUP_POLL_INTERVAL_SECONDS = 0.05
+
+
+def launcher_timeout_seconds(timeout_seconds: float) -> float:
+    """Return the launcher's budget: strictly inside the campaign timeout.
+
+    The launcher owns its own worker process group, so it must be able to run a
+    full SIGTERM/SIGKILL teardown and report a systemic failure before this runner
+    gives up and starts killing. The reservation is therefore at least the
+    launcher's worst-case teardown window, proportional above that so a long
+    campaign is not cut short, and capped so a 900-second budget does not donate
+    90 seconds to cleanup. It is finally clamped to half the timeout so a very
+    short campaign still leaves the launcher a usable budget; the two deadlines
+    then overlap, which is safe because the launcher ignores termination signals
+    for the duration of its own teardown.
+    """
+    grace = min(
+        max(timeout_seconds * LAUNCHER_GRACE_FRACTION, LAUNCHER_TEARDOWN_RESERVATION_SECONDS),
+        LAUNCHER_MAX_GRACE_SECONDS,
+    )
+    return timeout_seconds - min(grace, timeout_seconds * 0.5)
 
 
 def _require_loopback_endpoint(endpoint: str) -> str:
@@ -78,6 +120,10 @@ class BridgeIdentityMismatchError(BridgeSystemError):
 
 class BridgeStatusError(BridgeSystemError):
     """Raised when the bridge returns a systemic status."""
+
+
+class BridgeExecutionModeError(BridgeSystemError):
+    """Raised when the bridge evidence was not produced the way the campaign requires."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,14 +182,7 @@ class KorvidProcessRunner:
             raise BridgeInvocationError("bridge command must not be empty")
 
         try:
-            completed = subprocess.run(
-                command,
-                shell=False,
-                timeout=self.timeout_seconds,
-                capture_output=True,
-                text=False,
-                check=False,
-            )
+            completed = self._run_bridge_process_group(command)
         except FileNotFoundError as exc:
             raise BridgeInvocationError(f"bridge command could not be launched: {command[0]}") from exc
         except OSError as exc:
@@ -161,8 +200,10 @@ class KorvidProcessRunner:
 
         payload = self._load_response(response_path)
         protocol_version = _require_response_int(payload, "protocol_version")
-        if protocol_version != 1:
-            raise BridgeProtocolMismatchError("bridge response protocol_version must be 1")
+        if protocol_version != PROTOCOL_VERSION:
+            raise BridgeProtocolMismatchError(
+                f"bridge response protocol_version must be {PROTOCOL_VERSION}"
+            )
 
         response_fingerprint = _require_response_string(payload, "candidate_fingerprint")
         if response_fingerprint != candidate.fingerprint:
@@ -173,10 +214,12 @@ class KorvidProcessRunner:
         if status not in {"completed", "model_failure"}:
             raise BridgeStatusError(f"bridge returned systemic status: {status}")
 
+        execution_mode = self._require_execution_mode(payload)
         grade = self._parse_grade(payload, status)
         return BridgeResult(
             protocol_version=protocol_version,
             status=status,
+            execution_mode=execution_mode,
             candidate_fingerprint=candidate.fingerprint,
             grade=grade,
             answer=_require_response_text(payload, "answer"),
@@ -184,6 +227,55 @@ class KorvidProcessRunner:
             usage=_require_response_mapping(payload, "usage"),
             error=_require_optional_response_string(payload, "error"),
         )
+
+    def _require_execution_mode(self, payload: Mapping[str, Any]) -> str:
+        """Return how this evidence was produced, refusing anything a live campaign forbids."""
+        execution_mode = _require_response_string(payload, "execution_mode")
+        if execution_mode not in EXECUTION_MODES:
+            raise BridgeExecutionModeError(
+                f"bridge response execution_mode must be one of {', '.join(sorted(EXECUTION_MODES))}"
+            )
+        # A campaign that stood up a model endpoint is a live campaign. Scripted
+        # evidence is model-free by construction, so accepting it here would let a
+        # perfect score be published for a model that was never contacted.
+        if self.model_endpoint is not None and execution_mode != EXECUTION_MODE_LIVE:
+            raise BridgeExecutionModeError(
+                "a campaign serving a model endpoint requires live bridge evidence,"
+                f" but the bridge reported execution_mode {execution_mode}"
+            )
+        return execution_mode
+
+    def _bridge_environment(self) -> dict[str, str]:
+        """Campaign runtime policy for the launcher; never candidate or optimizer text."""
+        timeout = float(self.timeout_seconds if self.timeout_seconds is not None else 0.0)
+        return {
+            **os.environ,
+            BRIDGE_TIMEOUT_ENV: repr(launcher_timeout_seconds(timeout)),
+        }
+
+    def _run_bridge_process_group(self, command: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
+        """Run the bridge as its own process group and never leave a descendant behind.
+
+        ``subprocess.run(timeout=...)`` kills only the direct child, so a launcher that
+        execs ``uv``, which execs the worker, leaves a live grader that can still write
+        a late ``response.json`` into this run directory. Owning the group means one
+        signal reaches the whole subtree.
+        """
+        process = subprocess.Popen(
+            list(command),
+            shell=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            env=self._bridge_environment(),
+            start_new_session=os.name == "posix",
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=self.timeout_seconds)
+        except BaseException:  # a timeout or an interrupt must never orphan the bridge
+            _terminate_process_group(process)
+            raise
+        return subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
 
     def _build_request(
         self,
@@ -197,7 +289,7 @@ class KorvidProcessRunner:
             raise ValueError("KorvidProcessRunner requires exactly one model per case")
 
         return {
-            "protocol_version": 1,
+            "protocol_version": PROTOCOL_VERSION,
             "candidate_fingerprint": candidate.fingerprint,
             "candidate": {
                 "schema_version": candidate.schema_version,
@@ -252,6 +344,7 @@ class KorvidProcessRunner:
                 {
                     "protocol_version",
                     "status",
+                    "execution_mode",
                     "candidate_fingerprint",
                     "request_identity",
                     "grade",
@@ -324,6 +417,86 @@ class KorvidProcessRunner:
         }
         if actual != expected:
             raise BridgeIdentityMismatchError("bridge response identity does not match the request")
+
+
+def _process_group_is_populated(group: int) -> bool:
+    """Return whether any process is still a member of *group*."""
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # A member exists that we may not signal — most often our own unreaped
+        # zombie, which the caller clears with poll() before the next probe.
+        return True
+    except OSError:  # pragma: no cover - defensive
+        return False
+    return True
+
+
+def _await_process_group_exit(process: subprocess.Popen[bytes], group: int, timeout: float) -> bool:
+    """Poll until *group* drains, reaping the bridge so it stops holding it open."""
+    deadline = time.monotonic() + timeout
+    while True:
+        # An unreaped zombie is still a group member, so reap before testing.
+        process.poll()
+        if not _process_group_is_populated(group):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
+
+
+def _close_process_pipes(process: subprocess.Popen[bytes]) -> None:
+    """Close this side of the bridge's pipes; a survivor may still hold the other end."""
+    for stream in (process.stdout, process.stderr, process.stdin):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except OSError:  # pragma: no cover - defensive
+            continue
+
+
+def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Signal the bridge's whole process group, escalating to SIGKILL.
+
+    The bridge was started with ``start_new_session=True``, so its process-group id
+    equals its pid and every descendant that did not start its own session is in it.
+    SIGTERM first gives the launcher a chance to hand the termination on to its own
+    worker group and report a systemic failure; SIGKILL then guarantees nothing here
+    survives to write a late response artifact.
+
+    The escalation is gated on the *group* draining, not on the bridge process being
+    reaped: a launcher that exits immediately on SIGTERM would otherwise end the
+    escalation while its descendants are still running. ``communicate`` is avoided
+    for the same reason — a surviving descendant inherits the pipes and would block
+    it until its own deadline.
+    """
+    if os.name != "posix":  # pragma: no cover - POSIX-only process groups
+        process.kill()
+        process.wait()
+        _close_process_pipes(process)
+        return
+
+    try:
+        group = os.getpgid(process.pid)
+    except (OSError, ProcessLookupError):  # pragma: no cover - already reaped
+        group = process.pid
+
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(group, sig)
+        except (OSError, ProcessLookupError):
+            break
+        if _await_process_group_exit(process, group, PROCESS_GROUP_TERMINATION_GRACE_SECONDS):
+            break
+
+    try:
+        process.wait(timeout=PROCESS_GROUP_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:  # pragma: no cover - SIGKILL is not refusable
+        pass
+    _close_process_pipes(process)
 
 
 def _coerce_metric(value: Any, field_name: str) -> float:

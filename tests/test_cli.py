@@ -233,6 +233,67 @@ def test_evaluate_runs_fake_bridge_and_emits_json_summary(tmp_path: Path) -> Non
     assert (artifact_root / "evaluation-summary.json").is_file()
 
 
+def test_evaluate_summary_records_how_every_run_produced_its_grade(tmp_path: Path) -> None:
+    candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
+    campaign_path = _write_yaml(
+        tmp_path / "campaign.yaml",
+        _process_campaign_payload("smoke-happy", extra_case_ids=("smoke-scripted[scripted-mode]",)),
+    )
+
+    exit_code, stdout, _ = _run_cli(
+        [
+            "evaluate",
+            "--candidate",
+            str(candidate_path),
+            "--campaign",
+            str(campaign_path),
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--train-case-id",
+            "smoke-happy",
+            "--validation-case-id",
+            "smoke-scripted[scripted-mode]",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    summary = json.loads(stdout)
+    assert summary["execution_modes"] == ["live", "scripted"]
+    assert summary["run_execution_modes"] == {
+        "smoke-happy::mock-small": "live",
+        "smoke-scripted[scripted-mode]::mock-small": "scripted",
+    }
+
+
+def test_evaluate_summary_of_a_wholly_live_campaign_declares_live_only(tmp_path: Path) -> None:
+    candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
+    campaign_path = _write_yaml(
+        tmp_path / "campaign.yaml",
+        _process_campaign_payload("smoke-happy", extra_case_ids=("smoke-guardrail",)),
+    )
+
+    exit_code, stdout, _ = _run_cli(
+        [
+            "evaluate",
+            "--candidate",
+            str(candidate_path),
+            "--campaign",
+            str(campaign_path),
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--train-case-id",
+            "smoke-happy",
+            "--validation-case-id",
+            "smoke-guardrail",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    assert json.loads(stdout)["execution_modes"] == ["live"]
+
+
 def test_evaluate_returns_exit_1_for_systemic_bridge_failure(tmp_path: Path) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
@@ -613,6 +674,7 @@ def test_publish_reads_inputs_and_writes_registry(tmp_path: Path) -> None:
             "pass_at_5": 1.0,
             "hard_safety_failures": 0,
             "systemic_failures": 0,
+            "execution_modes": ["live"],
             "milestone_passed": True,
             "case_sets": {
                 "train": ["smoke-happy"],
@@ -699,6 +761,7 @@ def test_publish_rejects_mismatched_candidate_identity_in_summary(tmp_path: Path
             "pass_at_5": 1.0,
             "hard_safety_failures": 0,
             "systemic_failures": 0,
+            "execution_modes": ["live"],
             "milestone_passed": True,
             "case_sets": {
                 "train": ["smoke-happy"],
@@ -780,6 +843,7 @@ def test_publish_rejects_model_specific_summary_without_full_milestone_pack(tmp_
             "pass_at_5": 1.0,
             "hard_safety_failures": 0,
             "systemic_failures": 0,
+            "execution_modes": ["live"],
             "milestone_passed": True,
             "case_sets": {
                 "train": ["smoke-a"],
@@ -827,6 +891,7 @@ def test_publish_rejects_model_specific_summary_without_full_milestone_pack(tmp_
             "pass_at_5": 1.0,
             "hard_safety_failures": 0,
             "systemic_failures": 0,
+            "execution_modes": ["live"],
             "milestone_passed": True,
             "case_sets": {
                 "train": ["smoke-a"],
@@ -935,6 +1000,7 @@ def test_publish_rejects_common_summary_without_full_case_model_matrix(tmp_path:
             "pass_at_5": 1.0,
             "hard_safety_failures": 0,
             "systemic_failures": 0,
+            "execution_modes": ["live"],
             "milestone_passed": True,
             "case_sets": {
                 "train": ["smoke-a"],
@@ -1041,6 +1107,7 @@ def test_publish_accepts_common_summary_with_full_model_matrix_despite_model_ord
             "pass_at_5": 1.0,
             "hard_safety_failures": 0,
             "systemic_failures": 0,
+            "execution_modes": ["live"],
             "milestone_passed": True,
             "case_sets": {
                 "train": ["smoke-happy"],
@@ -1143,6 +1210,7 @@ def test_publish_accepts_common_summary_with_sorted_case_lists(tmp_path: Path) -
             "pass_at_5": 1.0,
             "hard_safety_failures": 0,
             "systemic_failures": 0,
+            "execution_modes": ["live"],
             "milestone_passed": True,
             "case_sets": {
                 "train": ["a-case"],
@@ -1215,6 +1283,7 @@ def test_publish_rejects_common_summary_with_unrelated_model_metadata(tmp_path: 
             "pass_at_5": 1.0,
             "hard_safety_failures": 0,
             "systemic_failures": 0,
+            "execution_modes": ["live"],
             "milestone_passed": True,
             "case_sets": {
                 "train": ["smoke-happy"],
@@ -1323,6 +1392,7 @@ def test_publish_rejects_model_specific_summary_not_bound_to_target_model(tmp_pa
             "pass_at_5": 1.0,
             "hard_safety_failures": 0,
             "systemic_failures": 0,
+            "execution_modes": ["live"],
             "milestone_passed": True,
             "case_sets": {
                 "train": ["smoke-happy"],
@@ -1377,6 +1447,7 @@ def test_publish_rejects_model_specific_summary_not_bound_to_target_model(tmp_pa
             "pass_at_5": 1.0,
             "hard_safety_failures": 0,
             "systemic_failures": 0,
+            "execution_modes": ["live"],
             "milestone_passed": True,
             "case_sets": {
                 "train": ["smoke-happy"],
@@ -1427,8 +1498,9 @@ with events_path.open("a", encoding="utf-8") as handle:
 response_path.write_text(
     json.dumps(
         {
-            "protocol_version": 1,
+            "protocol_version": 2,
             "status": "completed",
+            "execution_mode": "live",
             "candidate_fingerprint": request["candidate_fingerprint"],
             "request_identity": {
                 "case_id": request["case"]["case_id"],
@@ -2246,6 +2318,7 @@ def _publish_summary_payload(*, bundle_kind: str, aggregate_score: float) -> dic
         "pass_at_5": 1.0,
         "hard_safety_failures": 0,
         "systemic_failures": 0,
+        "execution_modes": ["live"],
         "milestone_passed": True,
         "case_sets": {
             "train": ["smoke-happy"],
@@ -2362,3 +2435,98 @@ def test_publish_rejects_insufficient_pass_hat_k_evidence(tmp_path: Path) -> Non
     assert exit_code == 1
     assert stdout == ""
     assert "recorded repetitions" in stderr
+
+
+@pytest.mark.parametrize(
+    "execution_modes",
+    [None, ["scripted"], ["live", "scripted"], "live", []],
+)
+def test_publish_refuses_a_summary_that_is_not_wholly_live(tmp_path: Path, execution_modes: Any) -> None:
+    candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
+    campaign_path = _write_yaml(
+        tmp_path / "campaign.yaml",
+        _process_campaign_payload("smoke-happy", extra_case_ids=("smoke-guardrail",)),
+    )
+    model_metadata_path = _write_json(
+        tmp_path / "model-metadata.json",
+        {
+            "model_family": "mock-small",
+            "model_name": "mock-small@2026-08-21",
+            "model_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "quantization": "fp16",
+            "context_length": 8192,
+            "serving_engine": "korvid-process",
+        },
+    )
+    summary = _publish_summary_payload(bundle_kind="common", aggregate_score=0.85)
+    summary["candidate_fingerprint"] = "05386c2e97901414449c3e2356ff736f1def9c9ca5172e28d7b63fa120a335d7"
+    if execution_modes is None:
+        del summary["execution_modes"]
+    else:
+        summary["execution_modes"] = execution_modes
+    evaluation_summary_path = _write_json(tmp_path / "evaluation-summary.json", summary)
+    registry_root = tmp_path / "registry"
+
+    exit_code, stdout, stderr = _run_cli(
+        [
+            "publish",
+            "--candidate",
+            str(candidate_path),
+            "--campaign",
+            str(campaign_path),
+            "--model-metadata",
+            str(model_metadata_path),
+            "--evaluation-summary",
+            str(evaluation_summary_path),
+            "--registry-root",
+            str(registry_root),
+        ]
+    )
+
+    assert exit_code == 2
+    assert stdout == ""
+    assert "execution_modes" in stderr
+    assert not registry_root.exists()
+
+
+def test_publish_accepts_a_summary_whose_runs_were_all_live(tmp_path: Path) -> None:
+    candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
+    campaign_path = _write_yaml(
+        tmp_path / "campaign.yaml",
+        _process_campaign_payload("smoke-happy", extra_case_ids=("smoke-guardrail",)),
+    )
+    model_metadata_path = _write_json(
+        tmp_path / "model-metadata.json",
+        {
+            "model_family": "mock-small",
+            "model_name": "mock-small@2026-08-21",
+            "model_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "quantization": "fp16",
+            "context_length": 8192,
+            "serving_engine": "korvid-process",
+        },
+    )
+    summary = _publish_summary_payload(bundle_kind="common", aggregate_score=0.85)
+    summary["candidate_fingerprint"] = "05386c2e97901414449c3e2356ff736f1def9c9ca5172e28d7b63fa120a335d7"
+    evaluation_summary_path = _write_json(tmp_path / "evaluation-summary.json", summary)
+    registry_root = tmp_path / "registry"
+
+    exit_code, stdout, stderr = _run_cli(
+        [
+            "publish",
+            "--candidate",
+            str(candidate_path),
+            "--campaign",
+            str(campaign_path),
+            "--model-metadata",
+            str(model_metadata_path),
+            "--evaluation-summary",
+            str(evaluation_summary_path),
+            "--registry-root",
+            str(registry_root),
+        ]
+    )
+
+    assert exit_code == 0
+    assert stderr == ""
+    assert "published" in stdout

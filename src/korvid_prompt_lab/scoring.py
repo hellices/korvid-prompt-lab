@@ -31,6 +31,7 @@ class OperationGrade:
 class BridgeResult:
     protocol_version: int
     status: str
+    execution_mode: str
     candidate_fingerprint: str
     grade: OperationGrade | None
     answer: str
@@ -43,6 +44,7 @@ class BridgeResult:
         *,
         protocol_version: int,
         status: str,
+        execution_mode: str,
         candidate_fingerprint: str,
         grade: OperationGrade | None,
         answer: str,
@@ -52,6 +54,7 @@ class BridgeResult:
     ) -> None:
         object.__setattr__(self, "protocol_version", protocol_version)
         object.__setattr__(self, "status", status)
+        object.__setattr__(self, "execution_mode", execution_mode)
         object.__setattr__(self, "candidate_fingerprint", candidate_fingerprint)
         object.__setattr__(self, "grade", grade)
         object.__setattr__(self, "answer", answer)

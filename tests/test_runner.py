@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -19,7 +20,10 @@ from korvid_prompt_lab.contracts import (
     ProcessServing,
 )
 from korvid_prompt_lab.runner import (
+    BRIDGE_TIMEOUT_ENV,
+    LAUNCHER_TEARDOWN_RESERVATION_SECONDS,
     BridgeArtifactError,
+    BridgeExecutionModeError,
     BridgeFingerprintMismatchError,
     BridgeIdentityMismatchError,
     BridgeInvocationError,
@@ -28,8 +32,10 @@ from korvid_prompt_lab.runner import (
     BridgeProcessExitError,
     BridgeProtocolMismatchError,
     BridgeStatusError,
+    BridgeSystemError,
     BridgeTimeoutError,
     KorvidProcessRunner,
+    launcher_timeout_seconds,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -169,8 +175,9 @@ request_identity = {
 response_path.write_text(
     json.dumps(
         {
-            "protocol_version": 1,
+            "protocol_version": 2,
             "status": "completed",
+            "execution_mode": "live",
             "candidate_fingerprint": request["candidate_fingerprint"],
             "request_identity": request_identity,
             "grade": {
@@ -317,6 +324,9 @@ def test_runner_wraps_non_utf8_process_failure_output(tmp_path: Path) -> None:
         ("case[missing-answer]", BridgeMalformedOutputError, 1.0),
         ("case[missing-journal]", BridgeMalformedOutputError, 1.0),
         ("case[missing-usage]", BridgeMalformedOutputError, 1.0),
+        ("case[missing-execution-mode]", BridgeMalformedOutputError, 1.0),
+        ("case[bad-execution-mode-type]", BridgeMalformedOutputError, 1.0),
+        ("case[unknown-execution-mode]", BridgeExecutionModeError, 1.0),
         ("case[extra-response-field]", BridgeMalformedOutputError, 1.0),
         ("case[extra-grade-field]", BridgeMalformedOutputError, 1.0),
     ],
@@ -328,6 +338,86 @@ def test_runner_raises_typed_errors_for_systemic_failures(
 
     with pytest.raises(error_type):
         _runner(case, timeout_seconds=timeout_seconds).run(_candidate(), case, tmp_path / "run")
+
+
+def test_runner_refuses_a_protocol_one_response_instead_of_assuming_it_was_live(
+    tmp_path: Path,
+) -> None:
+    """Protocol 1 carried no execution_mode, so it can never prove a model ran."""
+    case = _case("case[legacy]")
+    bridge_path = tmp_path / "legacy_bridge.py"
+    bridge_path.write_text(
+        """
+import json
+import sys
+from pathlib import Path
+
+request = json.loads(Path(sys.argv[sys.argv.index("--request") + 1]).read_text(encoding="utf-8"))
+response_path = Path(sys.argv[sys.argv.index("--response") + 1])
+response_path.write_text(
+    json.dumps(
+        {
+            "protocol_version": 1,
+            "status": "completed",
+            "candidate_fingerprint": request["candidate_fingerprint"],
+            "request_identity": {
+                "case_id": request["case"]["case_id"],
+                "template_id": request["case"]["template_id"],
+                "model": request["case"]["model"],
+                "repetition": request["case"]["repetition"],
+                "seed": request["case"]["seed"],
+            },
+            "grade": {
+                "completion": 1.0,
+                "verification": 1.0,
+                "efficiency": 1.0,
+                "hard_failures": [],
+            },
+            "answer": "verified",
+            "journal": {"checkpoints": ["dispatch", "verify"]},
+            "usage": {"completion_tokens": 12},
+            "error": None,
+        }
+    ),
+    encoding="utf-8",
+)
+""".strip(),
+        encoding="utf-8",
+    )
+    command = (sys.executable, str(bridge_path), "--request", "{request}", "--response", "{response}")
+
+    with pytest.raises(BridgeProtocolMismatchError, match="protocol_version must be 2"):
+        _runner_with_command(case, command).run(_candidate(), case, tmp_path / "run")
+
+
+def test_runner_reports_the_execution_mode_the_bridge_declared(tmp_path: Path) -> None:
+    live_case = _case("case[completed]")
+    scripted_case = _case("case[scripted-mode]")
+
+    live = _runner(live_case).run(_candidate(), live_case, tmp_path / "live")
+    scripted = _runner(scripted_case).run(_candidate(), scripted_case, tmp_path / "scripted")
+
+    assert live.execution_mode == "live"
+    assert scripted.execution_mode == "scripted"
+
+
+def test_runner_refuses_scripted_evidence_from_a_live_model_endpoint(tmp_path: Path) -> None:
+    # A campaign holding a live model endpoint must never accept a grade produced
+    # from Korvid's canned scripts: that evidence is model-free by construction.
+    case = _case("case[scripted-mode]")
+    runner = _aks_runner(case, model_endpoint="http://127.0.0.1:41001")
+
+    with pytest.raises(BridgeExecutionModeError, match="live"):
+        runner.run(_candidate(), case, tmp_path / "run")
+
+
+def test_runner_accepts_live_evidence_from_a_live_model_endpoint(tmp_path: Path) -> None:
+    case = _case("case[completed]")
+    runner = _aks_runner(case, model_endpoint="http://127.0.0.1:41001")
+
+    result = runner.run(_candidate(), case, tmp_path / "run")
+
+    assert result.execution_mode == "live"
 
 
 def test_runner_defaults_its_timeout_to_the_campaign_bridge_timeout() -> None:
@@ -461,3 +551,262 @@ def test_runner_rejects_a_model_endpoint_for_process_serving() -> None:
 
     with pytest.raises(ValueError, match="model_endpoint"):
         KorvidProcessRunner(campaign, model_endpoint="http://127.0.0.1:41001")
+
+
+# --- process-tree ownership -------------------------------------------------------
+
+
+FAKE_PROCESS_TREE = ROOT / "tests" / "fixtures" / "fake_process_tree.py"
+
+
+def _process_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # pragma: no cover - alive but owned by another user
+        return True
+    return True
+
+
+def _recorded_pids(pid_file: Path) -> dict[str, int]:
+    entries: dict[str, int] = {}
+    for line in pid_file.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        label, _, pid = line.partition(":")
+        entries[label] = int(pid)
+    return entries
+
+
+def _await_process_exit(pids: dict[str, int], *, timeout: float = 15.0) -> dict[str, bool]:
+    deadline = time.monotonic() + timeout
+    alive = {label: _process_is_alive(pid) for label, pid in pids.items()}
+    while time.monotonic() < deadline and any(alive.values()):
+        time.sleep(0.05)
+        alive = {label: _process_is_alive(pid) for label, pid in pids.items()}
+    return alive
+
+
+def _process_tree_runner(
+    case: EvalCase,
+    tmp_path: Path,
+    *,
+    bridge_timeout_seconds: float,
+) -> KorvidProcessRunner:
+    campaign = Campaign(
+        schema_version=1,
+        campaign_id="campaign-tree",
+        repetitions=1,
+        models=("mock-small",),
+        cases=(case,),
+        serving=ProcessServing(
+            backend="process",
+            command=(
+                sys.executable,
+                str(FAKE_PROCESS_TREE),
+                "--request",
+                "{request}",
+                "--response",
+                "{response}",
+            ),
+        ),
+        bridge_timeout_seconds=bridge_timeout_seconds,
+    )
+    return KorvidProcessRunner(campaign)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups are a POSIX guarantee")
+def test_runner_timeout_leaves_no_surviving_bridge_descendant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Killing only the launcher PID orphans uv and the worker, which then write late.
+
+    The runner owns the launcher's whole process group, so a timeout must leave no
+    descendant alive and no response.json can appear afterwards.
+    """
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    pid_file = tmp_path / "pids.txt"
+    pid_file.touch()
+
+    monkeypatch.setenv("FAKE_TREE_PID_FILE", str(pid_file))
+    monkeypatch.setenv("FAKE_TREE_DEPTH", "2")
+    monkeypatch.setenv("FAKE_TREE_SLEEP", "5")
+
+    case = _case("case[process-tree]")
+    runner = _process_tree_runner(case, tmp_path, bridge_timeout_seconds=1.0)
+
+    with pytest.raises(BridgeSystemError):
+        runner.run(_candidate(), case, run_dir)
+
+    pids = _recorded_pids(pid_file)
+    assert sorted(pids) == ["level-0", "level-1", "level-2", "parent"]
+    descendants = {label: pid for label, pid in pids.items() if label != "parent"}
+
+    assert _await_process_exit(descendants) == dict.fromkeys(descendants, False)
+
+    # The deepest level would have written its response after FAKE_TREE_SLEEP.
+    time.sleep(6.0)
+    assert not (run_dir / "response.json").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups are a POSIX guarantee")
+def test_runner_gives_the_launcher_a_budget_strictly_inside_the_campaign_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The launcher must be able to clean up before the runner stops waiting."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    env_dump = tmp_path / "env.json"
+    case = _case("case[budget]")
+    command = (
+        sys.executable,
+        "-c",
+        (
+            "import json, os, sys, pathlib;"
+            "pathlib.Path(sys.argv[3]).write_text(json.dumps(dict(os.environ)));"
+            "pathlib.Path(sys.argv[2]).write_text('{}')"
+        ),
+        "{request}",
+        "{response}",
+        str(env_dump),
+    )
+    campaign = Campaign(
+        schema_version=1,
+        campaign_id="campaign-budget",
+        repetitions=1,
+        models=("mock-small",),
+        cases=(case,),
+        serving=ProcessServing(backend="process", command=command),
+        bridge_timeout_seconds=900.0,
+    )
+
+    with pytest.raises(BridgeSystemError):
+        KorvidProcessRunner(campaign).run(_candidate(), case, run_dir)
+
+    child_env = json.loads(env_dump.read_text(encoding="utf-8"))
+    budget = float(child_env[BRIDGE_TIMEOUT_ENV])
+    assert 0.0 < budget < 900.0
+    assert budget == pytest.approx(890.0)
+
+
+@pytest.mark.parametrize("campaign_timeout", [1.0, 10.0, 60.0, 300.0, 900.0])
+def test_launcher_budget_reserves_the_launcher_teardown_window(campaign_timeout: float) -> None:
+    """The launcher must be able to finish SIGTERM *and* SIGKILL inside the campaign."""
+    budget = launcher_timeout_seconds(campaign_timeout)
+    reservation = campaign_timeout - budget
+
+    assert 0.0 < budget < campaign_timeout
+    assert reservation >= min(LAUNCHER_TEARDOWN_RESERVATION_SECONDS, campaign_timeout * 0.5)
+
+
+def test_launcher_teardown_reservation_matches_the_launcher_own_budget() -> None:
+    """The two modules must agree, or the runner starts killing mid-teardown."""
+    from korvid_prompt_lab.bridge import WORKER_TEARDOWN_BUDGET_SECONDS
+
+    assert LAUNCHER_TEARDOWN_RESERVATION_SECONDS == WORKER_TEARDOWN_BUDGET_SECONDS
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups are a POSIX guarantee")
+def test_runner_timeout_kills_a_descendant_that_ignores_sigterm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A launcher that dies on SIGTERM must not end the runner's escalation early."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    pid_file = tmp_path / "pids.txt"
+    pid_file.touch()
+
+    late_write_after = 20.0
+    monkeypatch.setenv("FAKE_TREE_PID_FILE", str(pid_file))
+    monkeypatch.setenv("FAKE_TREE_DEPTH", "1")
+    monkeypatch.setenv("FAKE_TREE_SLEEP", str(late_write_after))
+    monkeypatch.setenv("FAKE_TREE_IGNORE_SIGTERM", "1")
+
+    case = _case("case[stubborn-tree]")
+    runner = _process_tree_runner(case, tmp_path, bridge_timeout_seconds=1.0)
+
+    started = time.monotonic()
+    with pytest.raises(BridgeSystemError):
+        runner.run(_candidate(), case, run_dir)
+
+    pids = _recorded_pids(pid_file)
+    descendants = {label: pid for label, pid in pids.items() if label != "parent"}
+
+    assert _await_process_exit(descendants) == dict.fromkeys(descendants, False)
+    # Dead well before it could reach its own write, so the escalation really ran.
+    assert time.monotonic() - started < late_write_after
+    assert not (run_dir / "response.json").exists()
+
+
+def _fake_korvid_checkout(tmp_path: Path) -> Path:
+    root = tmp_path / "korvid-checkout"
+    (root / "src" / "korvid").mkdir(parents=True)
+    (root / "tests" / "evals").mkdir(parents=True)
+    (root / "pyproject.toml").write_text("[project]\nname='korvid'\n", encoding="utf-8")
+    (root / "src" / "korvid" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "tests" / "evals" / "operation_app.py").write_text("", encoding="utf-8")
+    return root
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups are a POSIX guarantee")
+def test_runner_timeout_kills_a_stubborn_worker_behind_the_real_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole real chain: runner -> korvid-bridge -> uv -> a SIGTERM-ignoring worker.
+
+    The runner and the launcher tear down on overlapping deadlines, so the launcher's
+    own escalation must not be abortable by the runner's SIGTERM: the worker lives in
+    the launcher's private session and nothing else can reach it.
+    """
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    pid_file = tmp_path / "pids.txt"
+    pid_file.touch()
+    late_write_after = 30.0
+
+    monkeypatch.setenv("KORVID_SOURCE_ROOT", str(_fake_korvid_checkout(tmp_path)))
+    monkeypatch.setenv("KORVID_UV_BIN", str(FAKE_PROCESS_TREE))
+    monkeypatch.setenv("FAKE_TREE_PID_FILE", str(pid_file))
+    monkeypatch.setenv("FAKE_TREE_DEPTH", "1")
+    monkeypatch.setenv("FAKE_TREE_SLEEP", str(late_write_after))
+    monkeypatch.setenv("FAKE_TREE_IGNORE_SIGTERM", "1")
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join([str(ROOT / "src"), *([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])]),
+    )
+
+    case = _case("case[stubborn-launcher]")
+    campaign = Campaign(
+        schema_version=1,
+        campaign_id="campaign-launcher",
+        repetitions=1,
+        models=("mock-small",),
+        cases=(case,),
+        serving=ProcessServing(
+            backend="process",
+            command=(
+                sys.executable,
+                "-m",
+                "korvid_prompt_lab.bridge",
+                "--request",
+                "{request}",
+                "--response",
+                "{response}",
+            ),
+        ),
+        bridge_timeout_seconds=1.0,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(BridgeSystemError):
+        KorvidProcessRunner(campaign).run(_candidate(), case, run_dir)
+
+    pids = _recorded_pids(pid_file)
+    descendants = {label: pid for label, pid in pids.items() if label != "parent"}
+    assert descendants, "the fake uv chain never started"
+
+    assert _await_process_exit(descendants) == dict.fromkeys(descendants, False)
+    assert time.monotonic() - started < late_write_after
+    assert not (run_dir / "response.json").exists()
