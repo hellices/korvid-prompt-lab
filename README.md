@@ -861,6 +861,31 @@ The workflow validates every input before any credential is used. A
 non-default-branch dispatch, a non-SHA ref, a path with `..`, or a duplicate
 train/validation case id fails immediately.
 
+#### AKS-local reflection
+
+An `optimize-evaluate` round can use a model served by the cluster's local
+Ollama instance as the reflection LM.  Set `GROUNDING_REFLECTION_MODEL` in the
+`aks-grounding` GitHub Actions environment to any supported `ollama` or
+`ollama_chat` model tag:
+
+```bash
+printf '%s' 'ollama_chat/qwen3:14b' |
+  gh variable set GROUNDING_REFLECTION_MODEL \
+    --env aks-grounding \
+    --repo hellices/korvid-prompt-lab
+```
+
+**No `GROUNDING_REFLECTION_CREDENTIAL` secret is required** for `ollama` or
+`ollama_chat` providers: the workflow detects those prefixes and skips the
+credential lookup entirely.  Hosted providers (e.g. `openai/`, `anthropic/`,
+`gemini/`) still require a matching `GROUNDING_REFLECTION_CREDENTIAL` secret in
+the same environment.
+
+The workflow constructs the cluster-local base URL from the `KORVID_AKS_SERVICE`
+and `KORVID_AKS_NAMESPACE` environment variables — the same pair that identify
+the main evaluation service — so no additional networking configuration is
+needed when the reflection model runs in the same namespace.
+
 ### Trust boundary for `prompt_lab_ref`
 
 An exact 40-hex SHA is a *shape*, not provenance: `actions/checkout` can fetch
