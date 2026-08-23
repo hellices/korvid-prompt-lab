@@ -750,6 +750,20 @@ rounds are not silently dropped.  A hung round holds the single slot until its
 `timeout-minutes: 180` expires, so callers should expect up to a three-hour wait
 in the worst case.
 
+#### Installing and verifying the runner scale set
+
+```bash
+# Install (requires ARC_GITHUB_APP_* env vars and cluster access)
+scripts/install-prompt-lab-runner.sh
+
+# Read-only verification of the full deployment
+scripts/verify-grounding-deployment.sh
+```
+
+The installer writes secret material only to mode-0600 files in a temporary
+directory cleaned on exit, and passes them via `--from-file`; no secret ever
+appears as a command-line argument.  The verifier is strictly read-only.
+
 ### Dispatching a grounding round
 
 Navigate to **Actions → Grounding Round → Run workflow** (default branch only)

@@ -1100,3 +1100,26 @@ def test_reflection_credential_file_must_be_readable(access: AccessHarness) -> N
     )
     assert run.returncode != 0
     assert run.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Task 4 — installer and verifier script contract tests
+# ---------------------------------------------------------------------------
+
+
+def test_runner_installer_pins_arc_and_handles_secrets_through_files() -> None:
+    body = (ROOT / "scripts/install-prompt-lab-runner.sh").read_text(encoding="utf-8")
+    assert "gha-runner-scale-set" in body
+    assert "--version 0.14.2" in body
+    assert "--from-file=github_app_private_key=" in body
+    assert "--from-literal" not in body
+    assert "trap cleanup EXIT" in body
+
+
+def test_deployment_verifier_is_read_only() -> None:
+    body = (ROOT / "scripts/verify-grounding-deployment.sh").read_text(encoding="utf-8")
+    for forbidden in ("kubectl apply", "kubectl delete", "helm upgrade", "az aks nodepool scale"):
+        assert forbidden not in body
+    assert "prompt-lab-runners" in body
+    assert "modeleval" in body
+    assert "safe-evidence" in body
