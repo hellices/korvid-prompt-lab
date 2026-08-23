@@ -110,7 +110,8 @@ def test_prompt_lab_runner_image_pins_required_tools_and_non_root_user() -> None
         "FROM ghcr.io/astral-sh/uv:0.10.9 AS uv\n"
         "FROM acrpensionguard.azurecr.io/runner-base:v1"
     )
-    assert "--kubectl-version v1.35.6" in body
+    assert "--client-version v1.35.6" in body
+    assert "--kubectl-version" not in body
     assert "--kubelogin-version v0.2.19" in body
     assert "COPY --from=uv /uv /uvx /usr/local/bin/" in body
     assert body.rstrip().endswith("USER runner")
@@ -138,7 +139,7 @@ FROM acrpensionguard.azurecr.io/runner-base:v1
 USER root
 
 RUN az aks install-cli \
-      --kubectl-version v1.35.6 \
+      --client-version v1.35.6 \
       --kubelogin-version v0.2.19 \
     && kubectl version --client \
     && kubelogin --version

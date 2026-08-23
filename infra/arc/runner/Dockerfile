@@ -4,7 +4,7 @@ FROM acrpensionguard.azurecr.io/runner-base:v1
 USER root
 
 RUN az aks install-cli \
-      --kubectl-version v1.35.6 \
+      --client-version v1.35.6 \
       --kubelogin-version v0.2.19 \
     && kubectl version --client \
     && kubelogin --version
