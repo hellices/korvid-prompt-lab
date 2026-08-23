@@ -1,21 +1,63 @@
 #!/usr/bin/env bash
-# verify-grounding-deployment.sh — read-only verification of the Prompt Lab
-# ARC runner scale set and grounding infrastructure.
+# verify-grounding-deployment.sh — read-only audit of the Prompt Lab grounding
+# deployment: the ARC runner scale set, the model node pool, the Ollama
+# deployment it serves, the protected GitHub Environment, and the workflow
+# contract that ties them together.
 #
-# This script is strictly read-only: it never applies, deletes, upgrades, or
-# scales any resource.  It prints identities and secret names only, never
-# secret values.
+# The script only reads.  It never creates, changes, deletes, or scales
+# anything, and it prints identities and variable/secret *names* only — never a
+# value.  Every gh, az, kubectl, and helm call is fatal on failure: a check that
+# cannot run is a failed check, not a skipped one.
+#
+# Like the installer it downloads its own kubeconfig into a private temporary
+# directory and deletes it on exit, so the operator's ~/.kube/config is never
+# read or rewritten.
 #
 # Usage:  scripts/verify-grounding-deployment.sh
 
 set -Eeuo pipefail
+umask 077
 
-NAMESPACE="arc-runners-prompt-lab"
-RELEASE_NAME="prompt-lab-runners"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
 REPOSITORY="hellices/korvid-prompt-lab"
+ENVIRONMENT_NAME="aks-grounding"
+
 AKS_RESOURCE_GROUP="rg-pension-guard"
 AKS_CLUSTER_NAME="aks-shared-runners"
 MODEL_NODE_POOL="modeleval"
+
+RUNNER_NAMESPACE="arc-runners-prompt-lab"
+RELEASE_NAME="prompt-lab-runners"
+
+MODEL_NAMESPACE="ollama"
+MODEL_DEPLOYMENT="ollama"
+# Live scheduling of the model deployment on the shared cluster.
+MODEL_NODE_SELECTOR_KEY="purpose"
+MODEL_NODE_SELECTOR_VALUE="korvid-model-eval"
+
+EXPECTED_CONFIG_URL="https://github.com/${REPOSITORY}"
+EXPECTED_MIN_RUNNERS="0"
+EXPECTED_MAX_RUNNERS="1"
+EXPECTED_SERVICE_ACCOUNT="prompt-lab-runners-no-permission"
+EXPECTED_NODE_SELECTOR="gha-runner"
+EXPECTED_RUN_AS_USER="1001"
+EXPECTED_RUN_AS_GROUP="1001"
+
+WORKFLOW_FILE="${REPO_ROOT}/.github/workflows/grounding-round.yml"
+SAFE_EVIDENCE_DIR="prompt-lab/artifacts/grounding-round/safe-evidence"
+
+REQUIRED_VARIABLES=(
+  AZURE_CLIENT_ID
+  AZURE_SUBSCRIPTION_ID
+  AZURE_TENANT_ID
+  KORVID_AKS_NAMESPACE
+  KORVID_AKS_SERVICE
+  KORVID_APP_ID
+)
+REQUIRED_SECRET="KORVID_APP_PRIVATE_KEY"
+OPTIONAL_SECRET="GROUNDING_REFLECTION_CREDENTIAL"
 
 die() {
   printf 'verify-grounding-deployment: FAIL — %s\n' "$*" >&2
@@ -30,155 +72,270 @@ section() {
   printf '\n── %s ──\n' "$*"
 }
 
-# ── 1. ARC release status ─────────────────────────────────────────────────
-section "ARC release status"
+require_command() {
+  local command_name
+  for command_name in "$@"; do
+    command -v "${command_name}" >/dev/null 2>&1 \
+      || die "required command not found: ${command_name}"
+  done
+}
 
-release_status="$(helm status "${RELEASE_NAME}" -n "${NAMESPACE}" -o json \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["status"])')" \
-  || die "helm release ${RELEASE_NAME} not found"
+require_command az gh helm jq kubectl kubelogin python3
 
+python3 -c 'import yaml' >/dev/null 2>&1 \
+  || die "python3 with PyYAML is required to parse the workflow contract"
+
+[[ -r "${WORKFLOW_FILE}" ]] \
+  || die "missing workflow: .github/workflows/grounding-round.yml"
+
+# ── Private workspace for this run's kubeconfig ───────────────────────────
+# An explicit template keeps the directory inside TMPDIR on every platform:
+# BSD mktemp ignores TMPDIR when no template is given.
+tmp_root="${TMPDIR:-/tmp}"
+tmp="$(mktemp -d "${tmp_root%/}/verify-grounding.XXXXXXXX")"
+chmod 700 "${tmp}"
+
+cleanup() {
+  rm -rf "${tmp}"
+}
+trap cleanup EXIT
+
+section "Cluster access"
+
+az account show --output none \
+  || die "no active Azure subscription: run 'az login' first"
+
+kubeconfig="${tmp}/kubeconfig"
+az aks get-credentials \
+  --resource-group "${AKS_RESOURCE_GROUP}" \
+  --name "${AKS_CLUSTER_NAME}" \
+  --file "${kubeconfig}" \
+  --overwrite-existing \
+  --only-show-errors \
+  --output none \
+  || die "cannot download credentials for ${AKS_CLUSTER_NAME}"
+chmod 600 "${kubeconfig}"
+
+export KUBECONFIG="${kubeconfig}"
+kubelogin convert-kubeconfig -l azurecli \
+  || die "kubelogin could not convert the kubeconfig"
+ok "reached ${AKS_CLUSTER_NAME} through a private kubeconfig"
+
+# ── 1. Release status ─────────────────────────────────────────────────────
+section "ARC release"
+
+release_json="$(helm status "${RELEASE_NAME}" --namespace "${RUNNER_NAMESPACE}" --output json)" \
+  || die "helm release ${RELEASE_NAME} is not installed in ${RUNNER_NAMESPACE}"
+release_status="$(printf '%s' "${release_json}" | jq -r '.info.status')" \
+  || die "cannot read the release status"
 [[ "${release_status}" == "deployed" ]] \
-  || die "release status is '${release_status}', expected 'deployed'"
+  || die "release ${RELEASE_NAME} is '${release_status}', expected 'deployed'"
 ok "release ${RELEASE_NAME} is deployed"
 
-# ── 2. Scale set URL ──────────────────────────────────────────────────────
-section "Scale set configuration"
+# ── 2. Scale set shape ────────────────────────────────────────────────────
+section "Runner scale set"
 
-config_url="$(kubectl -n "${NAMESPACE}" get autoscalingrunnersets.actions.github.com \
-  "${RELEASE_NAME}" -o jsonpath='{.spec.githubConfigUrl}')" \
-  || die "cannot read AutoscalingRunnerSet"
+runner_set_json="$(kubectl --namespace "${RUNNER_NAMESPACE}" \
+  get autoscalingrunnersets.actions.github.com "${RELEASE_NAME}" -o json)" \
+  || die "cannot read the AutoscalingRunnerSet ${RELEASE_NAME}"
 
-[[ "${config_url}" == "https://github.com/${REPOSITORY}" ]] \
-  || die "githubConfigUrl is '${config_url}', expected 'https://github.com/${REPOSITORY}'"
-ok "githubConfigUrl: ${config_url}"
+runner_field() {
+  local expression="$1" value
+  value="$(printf '%s' "${runner_set_json}" | jq -r "${expression}")" \
+    || die "cannot read ${expression} from the AutoscalingRunnerSet"
+  printf '%s' "${value}"
+}
 
-# ── 3. Min/max runners ────────────────────────────────────────────────────
-min_runners="$(kubectl -n "${NAMESPACE}" get autoscalingrunnersets.actions.github.com \
-  "${RELEASE_NAME}" -o jsonpath='{.spec.minRunners}')"
-max_runners="$(kubectl -n "${NAMESPACE}" get autoscalingrunnersets.actions.github.com \
-  "${RELEASE_NAME}" -o jsonpath='{.spec.maxRunners}')"
+assert_runner_field() {
+  local expression="$1" expected="$2" actual
+  actual="$(runner_field "${expression}")"
+  [[ "${actual}" == "${expected}" ]] \
+    || die "AutoscalingRunnerSet ${expression} is '${actual}', expected '${expected}'"
+  ok "${expression} = ${actual}"
+}
 
-[[ "${min_runners}" == "0" ]] || die "minRunners is ${min_runners}, expected 0"
-[[ "${max_runners}" == "1" ]] || die "maxRunners is ${max_runners}, expected 1"
-ok "minRunners: ${min_runners}  maxRunners: ${max_runners}"
+assert_runner_field '.spec.githubConfigUrl' "${EXPECTED_CONFIG_URL}"
+assert_runner_field '.spec.minRunners' "${EXPECTED_MIN_RUNNERS}"
+assert_runner_field '.spec.maxRunners' "${EXPECTED_MAX_RUNNERS}"
+assert_runner_field '.spec.template.spec.serviceAccountName' "${EXPECTED_SERVICE_ACCOUNT}"
+assert_runner_field '.spec.template.spec.automountServiceAccountToken' "false"
+assert_runner_field '.spec.template.spec.nodeSelector.workload' "${EXPECTED_NODE_SELECTOR}"
 
-# ── 4. Runner template scheduling ─────────────────────────────────────────
-section "Runner template scheduling"
+section "Runner security context"
 
-node_selector="$(kubectl -n "${NAMESPACE}" get autoscalingrunnersets.actions.github.com \
-  "${RELEASE_NAME}" -o jsonpath='{.spec.template.spec.nodeSelector.workload}')"
+# Select the runner container by name: the controller is free to reorder or
+# add containers, so an index would silently check the wrong one.
+runner_container_json="$(runner_field '
+  [ .spec.template.spec.containers[]? | select(.name == "runner") ] | first // empty')"
+[[ -n "${runner_container_json}" ]] \
+  || die "the AutoscalingRunnerSet has no container named 'runner'"
 
-[[ "${node_selector}" == "gha-runner" ]] \
-  || die "runner nodeSelector workload is '${node_selector}', expected 'gha-runner'"
-ok "nodeSelector workload=gha-runner"
+assert_container_field() {
+  local expression="$1" expected="$2" actual
+  actual="$(printf '%s' "${runner_container_json}" | jq -r "${expression}")" \
+    || die "cannot read ${expression} from the runner container"
+  [[ "${actual}" == "${expected}" ]] \
+    || die "runner container ${expression} is '${actual}', expected '${expected}'"
+  ok "runner ${expression} = ${actual}"
+}
 
-# ── 5. Runner must NOT tolerate workload=ollama ───────────────────────────
-tolerations_json="$(kubectl -n "${NAMESPACE}" get autoscalingrunnersets.actions.github.com \
-  "${RELEASE_NAME}" -o jsonpath='{.spec.template.spec.tolerations}')"
+assert_container_field '.securityContext.runAsNonRoot' "true"
+assert_container_field '.securityContext.runAsUser' "${EXPECTED_RUN_AS_USER}"
+assert_container_field '.securityContext.runAsGroup' "${EXPECTED_RUN_AS_GROUP}"
+assert_container_field '.securityContext.allowPrivilegeEscalation' "false"
 
-if echo "${tolerations_json}" | grep -q '"key":"ollama"'; then
-  die "runner tolerates ollama taint — runners must not schedule on model nodes"
-fi
-ok "no ollama toleration on runners"
+# The runner must tolerate neither taint the model nodes carry.
+model_tolerations="$(runner_field '
+  [ .spec.template.spec.tolerations[]?
+    | select((.key == "workload" and .value == "ollama")
+             or .key == "kubernetes.azure.com/scalesetpriority")
+    | .key ]
+  | join(", ")')"
+[[ -z "${model_tolerations}" ]] \
+  || die "the runner template tolerates model-node taints: ${model_tolerations}"
+ok "runner template tolerates no model-node taint"
 
-# ── 6. Security context ───────────────────────────────────────────────────
-section "Runner security"
+# ── 3. Model node pool ────────────────────────────────────────────────────
+section "Model node pool"
 
-run_as_non_root="$(kubectl -n "${NAMESPACE}" get autoscalingrunnersets.actions.github.com \
-  "${RELEASE_NAME}" -o jsonpath='{.spec.template.spec.containers[0].securityContext.runAsNonRoot}')"
-
-[[ "${run_as_non_root}" == "true" ]] \
-  || die "runner container is not runAsNonRoot"
-ok "runner runs as non-root"
-
-# ── 7. Workflow uses prompt-lab-runners label ─────────────────────────────
-section "Workflow configuration"
-
-workflow_file="$(find "$(git rev-parse --show-toplevel)/.github/workflows" \
-  -name '*.yml' -o -name '*.yaml' | head -20)"
-
-found_label=false
-for wf in ${workflow_file}; do
-  if grep -q 'runs-on:.*prompt-lab-runners' "${wf}" 2>/dev/null; then
-    ok "workflow $(basename "${wf}") uses prompt-lab-runners"
-    found_label=true
-  fi
-done
-[[ "${found_label}" == "true" ]] \
-  || die "no workflow found with runs-on: prompt-lab-runners"
-
-# ── 8. GitHub Environment variable/secret names ──────────────────────────
-section "GitHub Environment"
-
-env_vars="$(gh api "repos/${REPOSITORY}/environments/aks-grounding/variables" \
-  --jq '.[].name' 2>/dev/null || true)"
-env_secrets="$(gh api "repos/${REPOSITORY}/environments/aks-grounding/secrets" \
-  --jq '.[].name' 2>/dev/null || true)"
-
-if [[ -n "${env_vars}" ]]; then
-  printf '  variables: %s\n' "${env_vars}" | tr '\n' ', '
-  printf '\n'
-fi
-if [[ -n "${env_secrets}" ]]; then
-  printf '  secrets (names only): %s\n' "${env_secrets}" | tr '\n' ', '
-  printf '\n'
-fi
-ok "environment variable/secret names listed (values never printed)"
-
-# ── 9. modeleval node pool ────────────────────────────────────────────────
-section "modeleval node pool"
-
-pool_count="$(az aks nodepool show \
+node_pool_json="$(az aks nodepool show \
   --resource-group "${AKS_RESOURCE_GROUP}" \
   --cluster-name "${AKS_CLUSTER_NAME}" \
   --name "${MODEL_NODE_POOL}" \
-  --query count -o tsv 2>/dev/null)" \
-  || die "cannot query ${MODEL_NODE_POOL} node pool"
+  --output json)" \
+  || die "cannot read the ${MODEL_NODE_POOL} node pool"
 
-pool_state="$(az aks nodepool show \
-  --resource-group "${AKS_RESOURCE_GROUP}" \
-  --cluster-name "${AKS_CLUSTER_NAME}" \
-  --name "${MODEL_NODE_POOL}" \
-  --query provisioningState -o tsv 2>/dev/null)"
+pool_count="$(printf '%s' "${node_pool_json}" | jq -r '.count')" \
+  || die "cannot read the ${MODEL_NODE_POOL} count"
+pool_state="$(printf '%s' "${node_pool_json}" | jq -r '.provisioningState')" \
+  || die "cannot read the ${MODEL_NODE_POOL} provisioningState"
 
 [[ "${pool_count}" == "0" || "${pool_count}" == "1" ]] \
-  || die "modeleval count is ${pool_count}, expected 0 or 1"
+  || die "${MODEL_NODE_POOL} count is ${pool_count}, expected 0 or 1"
 [[ "${pool_state}" == "Succeeded" ]] \
-  || die "modeleval provisioningState is '${pool_state}', expected 'Succeeded'"
-ok "modeleval count=${pool_count} provisioningState=${pool_state}"
+  || die "${MODEL_NODE_POOL} provisioningState is '${pool_state}', expected 'Succeeded'"
+ok "${MODEL_NODE_POOL} count=${pool_count} provisioningState=${pool_state}"
 
-# ── 10. Ollama scheduling targets modeleval ───────────────────────────────
+# ── 4. Ollama still targets the model nodes ───────────────────────────────
 section "Ollama scheduling"
 
-ollama_ns="ollama"
-ollama_selector="$(kubectl -n "${ollama_ns}" get deploy ollama \
-  -o jsonpath='{.spec.template.spec.nodeSelector.workload}' 2>/dev/null)" \
-  || die "cannot read Ollama deployment"
+ollama_json="$(kubectl --namespace "${MODEL_NAMESPACE}" \
+  get deployment "${MODEL_DEPLOYMENT}" -o json)" \
+  || die "cannot read the ${MODEL_DEPLOYMENT} deployment in ${MODEL_NAMESPACE}"
 
-[[ "${ollama_selector}" == "modeleval" ]] \
-  || die "Ollama nodeSelector workload is '${ollama_selector}', expected 'modeleval'"
-ok "Ollama nodeSelector workload=modeleval"
+ollama_selector="$(printf '%s' "${ollama_json}" \
+  | jq -r --arg key "${MODEL_NODE_SELECTOR_KEY}" '.spec.template.spec.nodeSelector[$key]')" \
+  || die "cannot read the Ollama nodeSelector"
+[[ "${ollama_selector}" == "${MODEL_NODE_SELECTOR_VALUE}" ]] \
+  || die "Ollama nodeSelector ${MODEL_NODE_SELECTOR_KEY} is '${ollama_selector}', expected '${MODEL_NODE_SELECTOR_VALUE}'"
+ok "Ollama nodeSelector ${MODEL_NODE_SELECTOR_KEY}=${ollama_selector}"
 
-ollama_tolerations="$(kubectl -n "${ollama_ns}" get deploy ollama \
-  -o jsonpath='{.spec.template.spec.tolerations}' 2>/dev/null)"
+assert_ollama_toleration() {
+  local key="$1" value="$2" matches
+  matches="$(printf '%s' "${ollama_json}" | jq -r --arg key "${key}" --arg value "${value}" '
+    [ .spec.template.spec.tolerations[]?
+      | select(.key == $key and .value == $value and .effect == "NoSchedule") ]
+    | length')" \
+    || die "cannot read the Ollama tolerations"
+  [[ "${matches}" != "0" ]] \
+    || die "Ollama does not tolerate ${key}=${value}:NoSchedule"
+  ok "Ollama tolerates ${key}=${value}:NoSchedule"
+}
 
-if ! echo "${ollama_tolerations}" | grep -q 'modeleval'; then
-  die "Ollama does not tolerate modeleval taint"
-fi
-ok "Ollama tolerates modeleval"
+assert_ollama_toleration "workload" "ollama"
+assert_ollama_toleration "kubernetes.azure.com/scalesetpriority" "spot"
 
-# ── 11. Artifact upload path ends at safe-evidence/ ──────────────────────
-section "Safe evidence path"
+# ── 5. Protected GitHub Environment ───────────────────────────────────────
+section "GitHub Environment"
 
-safe_evidence_ok=false
-for wf in ${workflow_file}; do
-  if grep -q 'safe-evidence' "${wf}" 2>/dev/null; then
-    safe_evidence_ok=true
-    ok "workflow $(basename "${wf}") references safe-evidence path"
-  fi
+environment_name="$(gh api "repos/${REPOSITORY}/environments/${ENVIRONMENT_NAME}" --jq '.name')" \
+  || die "cannot read the ${ENVIRONMENT_NAME} Environment of ${REPOSITORY}"
+[[ "${environment_name}" == "${ENVIRONMENT_NAME}" ]] \
+  || die "the environment endpoint answered '${environment_name}', expected '${ENVIRONMENT_NAME}'"
+ok "environment ${ENVIRONMENT_NAME} exists"
+
+# The environment endpoints answer with objects, so the names live under
+# .variables[] and .secrets[] — never a bare array.
+variable_names="$(gh api "repos/${REPOSITORY}/environments/${ENVIRONMENT_NAME}/variables" \
+  --paginate --jq '.variables[].name')" \
+  || die "cannot list the ${ENVIRONMENT_NAME} Environment variables"
+
+for required_variable in "${REQUIRED_VARIABLES[@]}"; do
+  grep -Fxq -- "${required_variable}" <<<"${variable_names}" \
+    || die "environment variable missing: ${required_variable}"
+  ok "variable ${required_variable}"
 done
-[[ "${safe_evidence_ok}" == "true" ]] \
-  || die "no workflow references safe-evidence artifact path"
 
-# ── Done ──────────────────────────────────────────────────────────────────
+secret_names="$(gh api "repos/${REPOSITORY}/environments/${ENVIRONMENT_NAME}/secrets" \
+  --paginate --jq '.secrets[].name')" \
+  || die "cannot list the ${ENVIRONMENT_NAME} Environment secrets"
+
+grep -Fxq -- "${REQUIRED_SECRET}" <<<"${secret_names}" \
+  || die "environment secret missing: ${REQUIRED_SECRET}"
+ok "secret ${REQUIRED_SECRET} (name only — no value is ever read)"
+
+if grep -Fxq -- "${OPTIONAL_SECRET}" <<<"${secret_names}"; then
+  ok "secret ${OPTIONAL_SECRET} present — optimize-evaluate rounds are enabled"
+else
+  ok "secret ${OPTIONAL_SECRET} absent — evaluate-only rounds"
+fi
+
+# ── 6. Workflow contract ──────────────────────────────────────────────────
+section "Workflow contract"
+
+# Parsed structurally: the grounding job of this one workflow must name the
+# scale set and upload exactly the safe-evidence directory.  A grep over every
+# workflow would accept a decoy file or a comment.
+if ! python3 - "${WORKFLOW_FILE}" "${RELEASE_NAME}" "${SAFE_EVIDENCE_DIR}" <<'PY'
+import sys
+
+import yaml
+
+workflow_path, scale_set, safe_evidence_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+
+with open(workflow_path, encoding="utf-8") as handle:
+    workflow = yaml.safe_load(handle)
+
+problems = []
+job = (workflow.get("jobs") or {}).get("grounding")
+
+if job is None:
+    problems.append("the workflow has no 'grounding' job")
+else:
+    runs_on = job.get("runs-on")
+    if runs_on != scale_set:
+        problems.append(f"runs-on is {runs_on!r}, expected {scale_set!r}")
+
+    evidence_dir = str((job.get("env") or {}).get("GROUNDING_SAFE_EVIDENCE_DIR", ""))
+    if not evidence_dir.endswith("/" + safe_evidence_dir):
+        problems.append(
+            f"GROUNDING_SAFE_EVIDENCE_DIR is {evidence_dir!r}, "
+            f"expected it to end with {safe_evidence_dir!r}"
+        )
+
+    uploads = [
+        step
+        for step in (job.get("steps") or [])
+        if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+    ]
+    if len(uploads) != 1:
+        problems.append(f"expected exactly one upload-artifact step, found {len(uploads)}")
+    else:
+        uploaded = str((uploads[0].get("with") or {}).get("path", "")).strip()
+        if uploaded.rstrip("/") != safe_evidence_dir:
+            problems.append(
+                f"the artifact upload path is {uploaded!r}, expected the "
+                f"safe-evidence directory {safe_evidence_dir + '/'!r}"
+            )
+
+for problem in problems:
+    print(problem, file=sys.stderr)
+
+sys.exit(1 if problems else 0)
+PY
+then
+  die "the grounding workflow does not match the Prompt Lab runner contract"
+fi
+ok "grounding job runs on ${RELEASE_NAME} and uploads only ${SAFE_EVIDENCE_DIR}/"
+
 printf '\nverify-grounding-deployment: all checks passed ✓\n'

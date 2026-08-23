@@ -752,17 +752,50 @@ in the worst case.
 
 #### Installing and verifying the runner scale set
 
+Both scripts need `az`, `helm`, `jq`, `kubectl`, and `kubelogin` on `PATH`; the
+verifier additionally needs `gh` and a `python3` that can `import yaml`.  Each
+one checks for every tool before it touches anything.
+
 ```bash
-# Install (requires ARC_GITHUB_APP_* env vars and cluster access)
+# Install (requires ARC_GITHUB_APP_ID, ARC_GITHUB_APP_INSTALLATION_ID,
+# ARC_GITHUB_APP_PRIVATE_KEY_FILE, and Azure sign-in)
 scripts/install-prompt-lab-runner.sh
 
-# Read-only verification of the full deployment
+# Read-only audit of the whole grounding deployment
 scripts/verify-grounding-deployment.sh
 ```
 
-The installer writes secret material only to mode-0600 files in a temporary
-directory cleaned on exit, and passes them via `--from-file`; no secret ever
-appears as a command-line argument.  The verifier is strictly read-only.
+**Credentials belong to the run, not to the workstation.**  Each script creates
+a mode-0700 temporary directory, downloads the cluster credentials with
+`az aks get-credentials --file "$tmp/kubeconfig"`, converts them with
+`kubelogin convert-kubeconfig -l azurecli`, exports `KUBECONFIG` for its own
+calls only, and deletes the directory on exit — including on failure.  Your
+`~/.kube/config` is never read, merged, or overwritten.
+
+**The installer** writes secret material only to mode-0600 files and passes
+them with `--from-file`, so no secret ever appears in `argv` or in the output.
+After the pinned `0.14.2` chart is installed it re-reads the
+`AutoscalingRunnerSet` and **fails** unless `githubConfigUrl`, `minRunners`,
+`maxRunners`, `serviceAccountName`, `automountServiceAccountToken`, the
+`workload=gha-runner` selector, and the runner container's
+`runAsNonRoot`/`runAsUser`/`runAsGroup`/`allowPrivilegeEscalation` match the
+committed values exactly, and unless the runner template tolerates *neither*
+model-node taint.  It then waits for the listener pod in **`arc-systems`** — the
+ARC controller namespace where listeners actually run, not the runner
+namespace.
+
+**The verifier** only reads, prints variable and secret *names* but never a
+value, and treats every `gh`, `az`, `kubectl`, and `helm` failure as fatal: a
+check that cannot run is a failed check.  On top of the scale-set assertions
+above it requires the release to be `deployed`, the `aks-grounding` Environment
+to exist with all six required variables and the `KORVID_APP_PRIVATE_KEY`
+secret (`GROUNDING_REFLECTION_CREDENTIAL` stays optional), the `modeleval` pool
+to be `Succeeded` with zero or one node, the Ollama deployment to still select
+`purpose=korvid-model-eval` and tolerate both `workload=ollama:NoSchedule` and
+`kubernetes.azure.com/scalesetpriority=spot:NoSchedule`, and the
+`grounding-round` workflow — parsed as YAML, not grepped — to run on
+`prompt-lab-runners` and upload exactly
+`prompt-lab/artifacts/grounding-round/safe-evidence/`.
 
 ### Dispatching a grounding round
 
