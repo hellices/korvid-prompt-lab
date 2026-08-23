@@ -835,9 +835,10 @@ to be `Succeeded` with zero or one node, the Ollama deployment to still select
 | Component | State | Notes |
 |---|---|---|
 | `runner-base:prompt-lab-v1` ACR image | **Built and pushed** | digest `sha256:5c8105400a9f6035a8fb7f7a06e6f81277af45584a148a0af6437bef259bae56`, pushed 2026-08-23T04:13:18Z |
-| `aks-grounding` GitHub Environment | **Installed and verified** | Environment review, six variables, Korvid checkout App secret, Azure OIDC federation, and least-privilege role assignments are configured |
+| `aks-grounding` GitHub Environment | **Installed and verified** | Environment review, seven variables (including `GROUNDING_REFLECTION_MODEL=ollama_chat/qwen3:14b`), Korvid checkout App secret, Azure OIDC federation, and least-privilege role assignments are configured |
 | `prompt-lab-runners` ARC scale set | **Installed and verified** | repository-scoped scale set, minimum 0/maximum 1, tokenless service account, non-root runner image, and `workload=gha-runner` scheduling |
 | Live grounding round | **Executed** | run [`32621633590`](https://github.com/hellices/korvid-prompt-lab/actions/runs/32621633590) completed all 10 live evaluations and was correctly blocked by 15 hard safety failures |
+| AKS Ollama reflection round (`optimize-evaluate`) | **Executed** | run [`32629168092`](https://github.com/hellices/korvid-prompt-lab/actions/runs/32629168092) — twelve-call GEPA with `qwen3:0.6b` graded and in-cluster `ollama_chat/qwen3:14b` reflection; 10 live evaluations, aggregate 0.02, pass@3/@5 0, 13 hard safety failures. Best candidate unchanged from the seed and `promotion_eligible: false`, so nothing was published. See [`docs/grounding-rounds/2026-08-23-qwen3-0.6b-ollama-reflection.md`](docs/grounding-rounds/2026-08-23-qwen3-0.6b-ollama-reflection.md) |
 | `korvid-runners` scale set | **Unchanged** | Still registered to `hellices/korvid` (`githubConfigUrl: https://github.com/hellices/korvid`) |
 | `modeleval` node pool | **Idle** | count 0, provisioningState `Succeeded` |
 
