@@ -1,0 +1,31 @@
+githubConfigUrl: https://github.com/hellices/korvid-prompt-lab
+githubConfigSecret: prompt-lab-runners-github-app
+runnerScaleSetName: prompt-lab-runners
+minRunners: 0
+maxRunners: 1
+
+template:
+  metadata:
+    annotations:
+      karpenter.sh/do-not-disrupt: "true"
+  spec:
+    serviceAccountName: prompt-lab-runners-no-permission
+    automountServiceAccountToken: false
+    nodeSelector:
+      workload: gha-runner
+    tolerations:
+      - key: gha-runner
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+    containers:
+      - name: runner
+        image: acrpensionguard.azurecr.io/runner-base:prompt-lab-v1
+        command:
+          - /home/runner/run.sh
+        resources:
+          requests:
+            cpu: "1"
+            memory: 3Gi
+          limits:
+            memory: 5Gi
