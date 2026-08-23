@@ -156,3 +156,44 @@ executed the declaration and is **GREEN** with literal AST parsing.
 | Ruff | passed |
 | mypy | passed for 35 source files |
 | Shell syntax and workflow YAML | passed |
+
+---
+
+# Same-AKS Task 5 Pre-merge Validation
+
+## Read-only checks
+
+| Check | Result |
+|-------|--------|
+| `hellices/korvid-prompt-lab` default branch | `main` |
+| `hellices/korvid-prompt-lab` admin access | `true` |
+| `modeleval` node count | `0` |
+| `modeleval` provisioning state | `Succeeded` |
+| `runner-base:prompt-lab-v1` ACR image | present — digest `sha256:5c8105400a9f6035a8fb7f7a06e6f81277af45584a148a0af6437bef259bae56`, lastUpdateTime `2026-08-23T04:13:18Z` |
+| `prompt-lab-runners` ARC scale set | absent (not installed — GitHub App env inputs unset) |
+| `aks-grounding` Environment | absent (not installed — GitHub App env inputs unset) |
+| `korvid-runners` githubConfigUrl | `https://github.com/hellices/korvid` (unchanged) |
+
+## Repository validation
+
+| Check | Result |
+|-------|--------|
+| `pytest -q` (KORVID_SOURCE_ROOT set) | **656 passed, 6 skipped** in 186 s |
+| `ruff check .` | **All checks passed** |
+| `mypy --python-version 3.12 src tests` | **Success: no issues found in 36 source files** |
+| `bash -n scripts/*.sh` | **OK** |
+| YAML parse `.github/workflows/*.yml` | **OK** (`grounding-round.yml`) |
+
+## Deployment boundary
+
+- ACR image `runner-base:prompt-lab-v1` was built and pushed (ch1s succeeded, digest above).
+- `aks-grounding` Environment and `prompt-lab-runners` ARC scale set are **not installed**: `KORVID_APP_ID`, `KORVID_APP_PRIVATE_KEY_FILE`, `ARC_GITHUB_APP_ID`, `ARC_GITHUB_APP_INSTALLATION_ID`, and `ARC_GITHUB_APP_PRIVATE_KEY_FILE` are all unset. Load them from the operator's secret manager, then run `scripts/configure-grounding-access.sh` and `scripts/install-prompt-lab-runner.sh`.
+- Live grounding round intentionally waits for default-branch merge: `grounding-round.yml` dispatches only from `main`.
+
+## Remaining prerequisites
+
+1. Operator provides: `KORVID_APP_ID`, `KORVID_APP_PRIVATE_KEY_FILE`
+2. Operator provides: `ARC_GITHUB_APP_ID`, `ARC_GITHUB_APP_INSTALLATION_ID`, `ARC_GITHUB_APP_PRIVATE_KEY_FILE`
+3. Run `scripts/configure-grounding-access.sh` (Step 3)
+4. Run `scripts/install-prompt-lab-runner.sh` (Step 4)
+5. Merge PR to `main` and dispatch `grounding-round.yml` (Steps 7–8)

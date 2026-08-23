@@ -797,6 +797,17 @@ to be `Succeeded` with zero or one node, the Ollama deployment to still select
 `prompt-lab-runners` and upload exactly
 `prompt-lab/artifacts/grounding-round/safe-evidence/`.
 
+### Deployment boundary (as of feat/prompt-lab-mvp)
+
+| Component | State | Notes |
+|---|---|---|
+| `runner-base:prompt-lab-v1` ACR image | **Built and pushed** | digest `sha256:5c8105400a9f6035a8fb7f7a06e6f81277af45584a148a0af6437bef259bae56`, pushed 2026-08-23T04:13:18Z |
+| `aks-grounding` GitHub Environment | **Not installed** | Requires `KORVID_APP_ID` and `KORVID_APP_PRIVATE_KEY_FILE` — load from the operator's secret manager before running `scripts/configure-grounding-access.sh` |
+| `prompt-lab-runners` ARC scale set | **Not installed** | Requires `ARC_GITHUB_APP_ID`, `ARC_GITHUB_APP_INSTALLATION_ID`, and `ARC_GITHUB_APP_PRIVATE_KEY_FILE` — load from the operator's secret manager before running `scripts/install-prompt-lab-runner.sh` |
+| Live grounding round | **Waiting for merge** | `grounding-round.yml` executes only from the default branch (`if: github.ref == 'refs/heads/main'`); dispatch after PR merge |
+| `korvid-runners` scale set | **Unchanged** | Still registered to `hellices/korvid` (`githubConfigUrl: https://github.com/hellices/korvid`) |
+| `modeleval` node pool | **Idle** | count 0, provisioningState `Succeeded` |
+
 ### Dispatching a grounding round
 
 Navigate to **Actions → Grounding Round → Run workflow** (default branch only)

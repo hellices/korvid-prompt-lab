@@ -65,3 +65,50 @@ Ruff + mypy: clean.
 | `tests/test_grounding_infrastructure.py` | Require `--client-version`, forbid `--kubectl-version` |
 | `infra/arc/runner/Dockerfile` | `--kubectl-version` → `--client-version` |
 | `docs/superpowers/plans/2026-08-23-same-aks-runner-grounding.md` | Same flag fix in code block and test snippet |
+
+---
+
+# Same-AKS Task 5 — Pre-merge Validation (2026-08-23)
+
+## Read-only state checks
+
+| Check | Result |
+|-------|--------|
+| `hellices/korvid-prompt-lab` default branch | `main` |
+| admin access | `true` |
+| `modeleval` count | `0` |
+| `modeleval` provisioningState | `Succeeded` |
+| `runner-base:prompt-lab-v1` ACR image digest | `sha256:5c8105400a9f6035a8fb7f7a06e6f81277af45584a148a0af6437bef259bae56` |
+| ACR image lastUpdateTime | `2026-08-23T04:13:18Z` |
+| `prompt-lab-runners` ARC release | absent |
+| `aks-grounding` Environment | absent |
+| `korvid-runners` githubConfigUrl | `https://github.com/hellices/korvid` (unchanged) |
+
+## Repository validation
+
+| Check | Result |
+|-------|--------|
+| pytest (KORVID_SOURCE_ROOT=/Users/hwang-inhwan/workspace/kube) | 656 passed, 6 skipped |
+| ruff check . | All checks passed |
+| mypy --python-version 3.12 src tests | no issues found in 36 source files |
+| bash -n scripts/*.sh | OK |
+| YAML parse .github/workflows/*.yml | OK |
+
+## Deployment boundary
+
+- **Deployed:** ACR image `runner-base:prompt-lab-v1` built and pushed (ch1s fix applied: `--client-version` not `--kubectl-version`).
+- **Not installed:** `aks-grounding` Environment and `prompt-lab-runners` ARC scale set — all GitHub App env inputs (`KORVID_APP_ID`, `KORVID_APP_PRIVATE_KEY_FILE`, `ARC_GITHUB_APP_ID`, `ARC_GITHUB_APP_INSTALLATION_ID`, `ARC_GITHUB_APP_PRIVATE_KEY_FILE`) are unset.
+- **Blocked by design:** Live grounding round waits for default-branch merge (`grounding-round.yml` dispatches from `main` only).
+
+## Remaining prerequisites
+
+1. `KORVID_APP_ID` + `KORVID_APP_PRIVATE_KEY_FILE` → `scripts/configure-grounding-access.sh`
+2. `ARC_GITHUB_APP_ID` + `ARC_GITHUB_APP_INSTALLATION_ID` + `ARC_GITHUB_APP_PRIVATE_KEY_FILE` → `scripts/install-prompt-lab-runner.sh`
+3. Merge to `main`
+4. Dispatch `grounding-round.yml` from `main`
+
+## Verdict
+
+**DONE_WITH_CONCERNS**
+
+All pre-merge, credential-free checks pass. Three remaining prerequisites are operator-credential-gated (Steps 3–4) and a fourth is merge-gated (Steps 7–8). No cloud or GitHub mutation was performed.
