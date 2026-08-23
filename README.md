@@ -602,10 +602,41 @@ consume model-compute before the `modeleval` node pool is touched.
 
 ### Required GitHub configuration
 
+#### Bootstrap: `scripts/configure-grounding-access.sh`
+
+One idempotent orchestrator provisions everything below — the Entra identity,
+the federated credential, both custom Azure roles and their assignments, and
+the protected Environment with its variables and secrets:
+
+```bash
+export KORVID_APP_ID=123456
+export KORVID_APP_PRIVATE_KEY_FILE=~/secrets/korvid-app.pem   # readable PEM file
+
+# optional, optimize-evaluate rounds only (both or neither)
+export GROUNDING_REFLECTION_MODEL='openai/gpt-4.1-mini'
+export GROUNDING_REFLECTION_CREDENTIAL_FILE=~/secrets/reflection.key
+
+scripts/configure-grounding-access.sh
+```
+
+It requires an authenticated `gh` and `az` plus `jq`, `kubectl`, and
+`kubelogin`, and it re-runs safely: every step asks Azure or GitHub what
+already exists before it creates, replaces, or updates anything. The
+subscription and tenant are discovered from the signed-in `az` account, so no
+identifier is passed in or printed, and secret values reach GitHub only as
+stdin streamed from a file — never as a command-line argument. Tracing is
+never enabled.
+
+The script fails closed before touching the cloud when `KORVID_APP_ID` is
+missing, when a key file is unreadable or empty, or when only one half of the
+reflection pair is supplied; it fails before assigning anything when
+`az aks nodepool show` does not return the `modeleval` agent-pool resource id.
+
 #### Environment
 
-Create a repository Environment named **`aks-grounding`** and require at least
-one manual reviewer before the job may run.
+The Environment is named **`aks-grounding`**. The bootstrap script creates or
+updates it with the authenticated GitHub user as a required reviewer, so a
+round cannot consume model compute without an explicit human approval.
 
 #### Repository variables (`vars.*`)
 
@@ -619,6 +650,10 @@ one manual reviewer before the job may run.
 | `KORVID_APP_ID` | GitHub App id used to check out `hellices/korvid` read-only |
 | `GROUNDING_REFLECTION_MODEL` | *(Environment-scoped, `aks-grounding` only)* LiteLLM model string for the reflection optimizer; absent for evaluate-only rounds |
 
+The first six are exactly what `scripts/configure-grounding-access.sh` sets on
+every run; `GROUNDING_REFLECTION_MODEL` is written only when the optional
+reflection pair is supplied.
+
 Variables are never printed by workflow steps. They reach scripts through
 `env:` references and are read at runtime.
 
@@ -628,6 +663,9 @@ Variables are never printed by workflow steps. They reach scripts through
 | --- | --- |
 | `KORVID_APP_PRIVATE_KEY` | RSA private key for the GitHub App (PEM, newlines intact) |
 | `GROUNDING_REFLECTION_CREDENTIAL` | *(Environment-scoped, `aks-grounding` only)* API key for the reflection model; present only for `optimize-evaluate` rounds |
+
+Both secrets are written by streaming a readable file into `gh secret set` on
+stdin, so no key value is ever visible in a process listing or shell history.
 
 #### GitHub App — read-only Korvid checkout
 
@@ -642,6 +680,49 @@ The App id goes in `vars.KORVID_APP_ID`; the private key goes in
 A fine-grained read-only PAT is an acceptable bootstrap fallback, but a GitHub
 App is the documented target: PATs have a per-user rate limit, rotate manually,
 and are harder to scope to a single repository.
+
+#### Azure authorization boundary
+
+The workflow authenticates with GitHub OIDC — there is no client secret. The
+federated credential on the Entra application `korvid-prompt-lab-grounding`
+accepts exactly one subject:
+
+```text
+repo:hellices/korvid-prompt-lab:environment:aks-grounding
+```
+
+A credential that has drifted from that subject, issuer, or the
+`api://AzureADTokenExchange` audience is deleted and re-created, so a token
+minted from any other branch, tag, or environment is rejected.
+
+Because the cluster runs Microsoft Entra authentication with Azure RBAC for
+Kubernetes authorization, the identity is authorized by Azure role assignments
+and **not** by a Kubernetes `RoleBinding`. Three assignments, each at its own
+scope, are the complete grant:
+
+| Role | Scope | Why |
+| --- | --- | --- |
+| `Korvid Prompt Lab Grounding Kubernetes Access` (custom, `infra/azure/grounding-kubernetes-role.json.tpl`) | `<aks-id>/namespaces/ollama` | Read deployments, endpoints, pods, and services and open a pod port-forward in the Ollama namespace only |
+| `Korvid Prompt Lab Grounding Node Pool Scaler` (custom) | exact id returned by `az aks nodepool show … --name modeleval --query id` | Read and scale only the `modeleval` GPU pool |
+| `Azure Kubernetes Service Cluster User Role` (built-in) | the AKS cluster | `az aks get-credentials` and nothing else |
+
+The Kubernetes role carries only these DataActions:
+
+```text
+Microsoft.ContainerService/managedClusters/apps/deployments/read
+Microsoft.ContainerService/managedClusters/endpoints/read
+Microsoft.ContainerService/managedClusters/pods/read
+Microsoft.ContainerService/managedClusters/pods/write
+Microsoft.ContainerService/managedClusters/services/read
+```
+
+`pods/write` is what authorizes the port-forward subresource; there is no
+`portforward/action` DataAction on AKS. Secrets, service accounts, `exec`,
+roles, role bindings, and every resource outside `ollama` stay out of reach.
+The template ships with an `__SUBSCRIPTION_SCOPE__` placeholder that the
+bootstrap script renders with the discovered subscription into a mode-`0600`
+file inside a `mktemp -d` directory removed by an `EXIT` trap; an unexpanded
+placeholder is a hard failure rather than something `az` is asked to swallow.
 
 #### ARC runner label
 
