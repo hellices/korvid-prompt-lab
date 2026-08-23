@@ -28,6 +28,7 @@ The cluster already has the required compute separation:
 | Model scheduling | `purpose=korvid-model-eval`, `workload=ollama:NoSchedule` |
 | Model service | `ollama/ollama`, port `11434` |
 | Cluster identity | system-assigned identity, OIDC and Workload Identity enabled |
+| Kubernetes authorization | Microsoft Entra authentication with Azure RBAC enabled |
 
 `korvid-runners` is registered to `https://github.com/hellices/korvid`.
 Repository-scoped ARC runner scale sets cannot accept jobs from
@@ -144,13 +145,22 @@ The workflow identity receives only the permissions required to:
 3. scale only `modeleval` between zero and one.
 
 It must not have permission to create/delete clusters, node pools, or unrelated
-resource-group resources. Kubernetes authorization obtained through AKS login
-is restricted to the `ollama` namespace operations needed for Service,
-Endpoint, Pod, and port-forward access.
+resource-group resources. Because this cluster has Azure RBAC for Kubernetes
+authorization enabled, an Entra identity is not authorized through a
+Kubernetes `RoleBinding`. Use a custom Azure role assignment at the exact AKS
+resource ID with `/namespaces/ollama` appended, resolved dynamically with
+`az aks show --query id`, and include only these DataActions:
 
-If Azure's built-in roles are broader than this boundary, use a custom Azure
-role scoped to the `modeleval` node-pool resource plus a narrowly scoped
-Kubernetes role/binding.
+- `Microsoft.ContainerService/managedClusters/services/read`
+- `Microsoft.ContainerService/managedClusters/endpoints/read`
+- `Microsoft.ContainerService/managedClusters/pods/read`
+- `Microsoft.ContainerService/managedClusters/pods/write`
+- `Microsoft.ContainerService/managedClusters/apps/deployments/read`
+
+`pods/write` is required by the Kubernetes port-forward subresource; the role
+must not include Secrets, service accounts, exec, roles, role bindings, or
+resources outside `ollama`. Use a separate custom management-plane role,
+assigned at the `modeleval` agent-pool resource, for agent-pool read/write.
 
 ## Workflow Changes
 
