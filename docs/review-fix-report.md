@@ -197,3 +197,84 @@ executed the declaration and is **GREEN** with literal AST parsing.
 3. Run `scripts/configure-grounding-access.sh` (Step 3)
 4. Run `scripts/install-prompt-lab-runner.sh` (Step 4)
 5. Merge PR to `main` and dispatch `grounding-round.yml` (Steps 7–8)
+
+---
+
+# First Remote Grounding Round
+
+**Date:** 2026-08-23
+**Prompt Lab revision:** `ed0b3c0592e63e83d914e617c65c8681f12f2f9f`
+**Korvid revision:** `fc7eece2adb66a5b2a18d378bdfd7503ddbdd2ca`
+**Model:** `qwen3:0.6b`
+**Round type:** evaluate-only
+
+## OIDC preflight correction
+
+The initial workflow run
+[`32620932840`](https://github.com/hellices/korvid-prompt-lab/actions/runs/32620932840)
+reached the dedicated ARC runner but failed at Azure login. GitHub issued an
+Environment OIDC subject using its current `sub_claim_prefix`, which includes
+immutable owner and repository IDs, while the Entra federated credential still
+used the older name-only subject.
+
+`scripts/configure-grounding-access.sh` now reads
+`repos/hellices/korvid-prompt-lab/actions/oidc/customization/sub`, requires the
+default subject policy, validates that the prefix identifies this repository,
+and binds Entra to `<sub_claim_prefix>:environment:aks-grounding`. Re-running
+the bootstrap replaced the drifted credential. The grounding infrastructure
+test suite passes with **136 tests** after this correction.
+
+The preflight failure occurred before the node-pool lifecycle or evaluation
+steps. No safe-evidence artifact was produced for that run.
+
+## Live evaluation result
+
+Workflow run
+[`32621633590`](https://github.com/hellices/korvid-prompt-lab/actions/runs/32621633590)
+successfully completed OIDC login, both exact-SHA checkouts, Python setup, AKS
+scale-up, Ollama readiness, all ten live evaluation repetitions, safe-evidence
+upload, and cleanup. Its final workflow conclusion is **failure by policy**:
+the authoritative evaluator detected hard safety failures, so the candidate
+was intentionally not promotion-eligible.
+
+| Metric | Result |
+|---|---:|
+| Aggregate score | `0.0` |
+| Model score (`qwen3:0.6b`) | `0.0` |
+| pass@3 | `0.0` |
+| pass@5 | `0.0` |
+| Live runs | `10` |
+| Systemic failures | `0` |
+| Hard safety failures | `15` |
+| `write_before_fresh_read` | `10` |
+| `wrong_target_write` | `5` |
+| Promotion eligible | `false` |
+
+## Safe-evidence audit
+
+GitHub uploaded exactly one artifact named `safe-evidence` (artifact
+`9488695746`, 10,304 bytes, 30-day retention). Its manifest contains:
+
+- `evaluation-summary.json`
+- `round-summary.json`
+- `round-summary.md`
+- ten files under `responses/`, one redacted protocol-v2 projection per live
+  repetition
+
+All JSON files parse successfully. Every response projection has an empty
+`answer`, a null `error`, aggregate journal counters/checkpoint names only, and
+no raw journal events or audit records. The artifact contains no symlinks and
+no `request.json`, `audit.jsonl`, kubeconfig, raw log, Kubernetes manifest,
+credential, optimizer state, or GEPA state. A credential-pattern scan found no
+private keys, bearer tokens, API keys, passwords, or kubeconfig key material.
+
+## Compute lifecycle
+
+- The ephemeral runner scheduled on `aks-runners-9qb9x`, which carries the
+  `workload=gha-runner` placement.
+- Ollama scheduled separately on the `modeleval` node
+  `aks-modeleval-31248830-vmss00000c`.
+- The workflow scaled `modeleval` from 0 to 1 and restored it to
+  `count=0`, `provisioningState=Succeeded`.
+- After completion, the ARC runner namespace had zero runner pods and zero
+  pending/running ephemeral runners. The repository listener remained Ready.

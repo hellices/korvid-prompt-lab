@@ -44,7 +44,6 @@ ENVIRONMENT_NAME="aks-grounding"
 APP_DISPLAY_NAME="korvid-prompt-lab-grounding"
 FEDERATED_CREDENTIAL_NAME="github-aks-grounding"
 FEDERATED_ISSUER="https://token.actions.githubusercontent.com"
-FEDERATED_SUBJECT="repo:hellices/korvid-prompt-lab:environment:aks-grounding"
 FEDERATED_AUDIENCE="api://AzureADTokenExchange"
 
 AKS_RESOURCE_GROUP="rg-pension-guard"
@@ -156,7 +155,23 @@ cleanup() {
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
-# 1. Discover the active subscription and tenant without printing either
+# 1. Resolve the repository's current default OIDC subject prefix
+# ---------------------------------------------------------------------------
+oidc_config="$(gh api "repos/${REPOSITORY}/actions/oidc/customization/sub")"
+oidc_uses_default="$(printf '%s' "${oidc_config}" | jq -r '.use_default // false')"
+[[ "${oidc_uses_default}" == "true" ]] \
+  || die "the repository must use GitHub's default OIDC subject format"
+
+oidc_subject_prefix="$(printf '%s' "${oidc_config}" | jq -r '.sub_claim_prefix // empty')"
+oidc_config=""
+if [[ "${oidc_subject_prefix}" != "repo:hellices/korvid-prompt-lab" ]] \
+  && [[ ! "${oidc_subject_prefix}" =~ ^repo:hellices@[0-9]+/korvid-prompt-lab@[0-9]+$ ]]; then
+  die "GitHub returned an unexpected OIDC subject prefix for the repository"
+fi
+federated_subject="${oidc_subject_prefix}:environment:${ENVIRONMENT_NAME}"
+
+# ---------------------------------------------------------------------------
+# 2. Discover the active subscription and tenant without printing either
 # ---------------------------------------------------------------------------
 account_json="$(az account show --output json)"
 subscription_id="$(printf '%s' "${account_json}" | jq -r '.id // empty')"
@@ -168,7 +183,7 @@ account_json=""
 subscription_scope="/subscriptions/${subscription_id}"
 
 # ---------------------------------------------------------------------------
-# 2. Create or reuse the Entra application and its service principal
+# 3. Create or reuse the Entra application and its service principal
 # ---------------------------------------------------------------------------
 printf 'Ensuring Entra application %s\n' "${APP_DISPLAY_NAME}"
 app_id="$(lookup az ad app list \
@@ -204,7 +219,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Bind the credential to the aks-grounding Environment subject
+# 4. Bind the credential to the aks-grounding Environment subject
 # ---------------------------------------------------------------------------
 printf 'Ensuring federated credential %s\n' "${FEDERATED_CREDENTIAL_NAME}"
 federated_file="${RENDER_DIR}/federated-credential.json"
@@ -212,7 +227,7 @@ private_file "${federated_file}"
 jq -n \
   --arg name "${FEDERATED_CREDENTIAL_NAME}" \
   --arg issuer "${FEDERATED_ISSUER}" \
-  --arg subject "${FEDERATED_SUBJECT}" \
+  --arg subject "${federated_subject}" \
   --arg audience "${FEDERATED_AUDIENCE}" \
   '{
      name: $name,
@@ -260,7 +275,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Resolve the exact scopes; never build a resource id by hand
+# 5. Resolve the exact scopes; never build a resource id by hand
 # ---------------------------------------------------------------------------
 aks_id="$(lookup az aks show \
   --resource-group "${AKS_RESOURCE_GROUP}" \
@@ -283,7 +298,7 @@ kubernetes_scope="${aks_id}/namespaces/ollama"
   || die "the assigned namespace scope drifted from KORVID_AKS_NAMESPACE"
 
 # ---------------------------------------------------------------------------
-# 5. Define both custom roles, then assign each at its own scope
+# 6. Define both custom roles, then assign each at its own scope
 # ---------------------------------------------------------------------------
 kubernetes_role_file="${RENDER_DIR}/grounding-kubernetes-role.json"
 private_file "${kubernetes_role_file}"
@@ -369,7 +384,7 @@ assign_role "${CLUSTER_USER_ROLE}" "${aks_id}" \
   "cluster user credentials on the cluster"
 
 # ---------------------------------------------------------------------------
-# 6. Protect the Environment with the authenticated GitHub user as reviewer
+# 7. Protect the Environment with the authenticated GitHub user as reviewer
 # ---------------------------------------------------------------------------
 printf 'Ensuring GitHub Environment %s\n' "${ENVIRONMENT_NAME}"
 reviewer_id="$(lookup gh api user --jq '.id')"
@@ -392,7 +407,7 @@ gh api \
 printf '  the authenticated GitHub user is a required reviewer\n'
 
 # ---------------------------------------------------------------------------
-# 7. Publish the six Environment variables; values travel on stdin
+# 8. Publish the six Environment variables; values travel on stdin
 # ---------------------------------------------------------------------------
 printf 'Setting Environment variables\n'
 printf '%s' "${app_id}" | gh variable set AZURE_CLIENT_ID --env aks-grounding --repo "${REPOSITORY}"
@@ -403,7 +418,7 @@ printf '%s' "${MODEL_NAMESPACE}" | gh variable set KORVID_AKS_NAMESPACE --env ak
 printf '%s' "${MODEL_SERVICE}" | gh variable set KORVID_AKS_SERVICE --env aks-grounding --repo "${REPOSITORY}"
 
 # ---------------------------------------------------------------------------
-# 8. Stream the secrets from their files; no value is ever an argument
+# 9. Stream the secrets from their files; no value is ever an argument
 # ---------------------------------------------------------------------------
 printf 'Storing the Korvid App private key\n'
 cat "$KORVID_APP_PRIVATE_KEY_FILE" | gh secret set KORVID_APP_PRIVATE_KEY --env aks-grounding --repo "${REPOSITORY}"
