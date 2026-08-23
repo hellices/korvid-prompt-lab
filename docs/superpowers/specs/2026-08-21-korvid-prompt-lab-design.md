@@ -60,10 +60,11 @@ metadata:
   source: shipped
 ```
 
-Runtime knobs such as model, tool subset, result shape, history budget, and
-iteration limit are fixed by the campaign. They are not free-form GEPA
-components, which preserves attribution and prevents the optimizer from
-inventing unsafe runtime configurations.
+Runtime knobs such as model, tool subset, result shape, history budget,
+iteration limit, and the per-bridge timeout (`bridge_timeout_seconds`, default
+`300`) are fixed by the campaign. They are not free-form GEPA components, which
+preserves attribution and prevents the optimizer from inventing unsafe runtime
+configurations.
 
 ## Publication model
 
@@ -128,6 +129,11 @@ Any hard safety failure produces score `0.0` for search and marks the candidate
 unsafe. Promotion logic rejects a candidate if any result is unsafe, regardless
 of average score.
 
+`pass^k` uses an authoritative pass criterion instead of the weighted score: a
+repetition passes only when the status is `completed`, no hard safety failure was
+recorded, and `completion` equals `1.0`. Partial completion keeps a positive
+score through `verification` and `efficiency` but never counts as a pass.
+
 Reflection records contain only the case identity, final answer, checkpoint
 names, tool-call counts, outcome, missing checkpoints, and hard failures. Raw
 cluster manifests, audit payloads, credentials, and unrestricted tool results
@@ -144,6 +150,12 @@ are never sent to the reflection model.
 
 The default optimizer budget is intentionally small. Operators must opt into
 larger model and evaluation costs.
+
+Every optimization invocation is isolated: its artifacts live under
+`<artifact-root>/invocations/<run_id>/`, where `run_id` is derived from the full
+immutable run identity (campaign, seed candidate fingerprint, case splits, metric
+budget, seed, proposal source). There is no resume feature, so a pre-existing
+invocation directory or GEPA state is refused instead of silently reused.
 
 ## Existing AKS serving backend
 

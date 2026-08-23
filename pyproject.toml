@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "korvid-prompt-lab"
+version = "0.1.0"
+description = "Prompt optimization control plane for Korvid"
+requires-python = ">=3.11"
+dependencies = ["dspy", "gepa", "PyYAML"]
+
+[project.scripts]
+korvid-prompt-lab = "korvid_prompt_lab.cli:main"
+korvid-bridge = "korvid_prompt_lab.bridge:main"
+korvid-grounding-report = "korvid_prompt_lab.round_cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest", "mypy", "ruff"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+
+# The bridge worker imports Korvid out of the checkout named by KORVID_SOURCE_ROOT,
+# so those modules are resolvable only in the worker's own uv environment.
+[[tool.mypy.overrides]]
+module = ["korvid.*", "tests.evals.*", "tests.ui.*", "httpx"]
+ignore_missing_imports = true

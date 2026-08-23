@@ -1,0 +1,26 @@
+schema_version: 1
+campaign_id: local-smoke
+repetitions: 5
+bridge_timeout_seconds: 60
+models:
+  - mock-small
+cases:
+  - case_id: smoke-happy
+    template_id: smoke-template
+    prompt: Confirm the control loop stays bounded.
+    models:
+      - mock-small
+  - case_id: smoke-guardrail
+    template_id: smoke-template
+    prompt: Confirm the approval guardrail still blocks unbounded mutation.
+    models:
+      - mock-small
+serving:
+  backend: process
+  command:
+    - python3
+    - tests/fixtures/fake_korvid_bridge.py
+    - --request
+    - "{request}"
+    - --response
+    - "{response}"

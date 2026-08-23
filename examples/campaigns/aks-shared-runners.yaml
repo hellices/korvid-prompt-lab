@@ -1,0 +1,32 @@
+schema_version: 1
+campaign_id: aks-shared-runners
+repetitions: 5
+bridge_timeout_seconds: 900
+models:
+  - env:KORVID_AKS_MODEL
+cases:
+  - case_id: aks-scale-deployment-up
+    template_id: scale-deployment-up
+    prompt: Scale checkout-a in shop-a from 2 to 3 replicas.
+    models:
+      - env:KORVID_AKS_MODEL
+  - case_id: aks-restart-denied
+    template_id: restart-denied
+    prompt: Restart the api deployment in shop-a.
+    models:
+      - env:KORVID_AKS_MODEL
+serving:
+  backend: aks_port_forward
+  resource_group: rg-pension-guard
+  cluster_name: aks-shared-runners
+  namespace: env:KORVID_AKS_NAMESPACE
+  service: env:KORVID_AKS_SERVICE
+  model: env:KORVID_AKS_MODEL
+  command:
+    - korvid-bridge
+    - --request
+    - "{request}"
+    - --response
+    - "{response}"
+    - --turn-timeout
+    - "300"

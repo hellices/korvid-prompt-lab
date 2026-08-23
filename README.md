@@ -1,0 +1,1044 @@
+# Korvid Prompt Lab
+
+Korvid Prompt Lab is a small control plane for validating prompt candidates,
+running deterministic bridge evaluations, exercising read-only AKS preflight,
+and publishing prompt bundles with a common-first, safety-gated override policy.
+
+Run commands from the repository root so relative fixture and artifact paths
+resolve as documented.
+
+## Install with `uv`
+
+```bash
+uv sync --python 3.12 --extra dev
+```
+
+CLI entrypoint:
+
+```bash
+uv run --python 3.12 korvid-prompt-lab --help
+```
+
+## CLI commands
+
+### Validate
+
+Loads a candidate and campaign, applies strict schema checks, and confirms model
+coverage.
+
+```bash
+uv run --python 3.12 korvid-prompt-lab validate \
+  --candidate examples/candidates/shipped-small.yaml \
+  --campaign examples/campaigns/local-smoke.yaml
+```
+
+### Evaluate
+
+Runs the selected cases through the configured bridge, writes request/response
+artifacts, emits an `evaluation-summary.json` with candidate/campaign identity,
+case/model coverage, and the exact train/validation/milestone sets used as
+publication provenance, and fails if any hard safety failure occurs.
+
+`--train-case-id` and `--validation-case-id` are **required**. Both must name at
+least one evaluated case and the two sets must be disjoint, so a bundle can never
+claim validation evidence that is really its own training evidence.
+
+```bash
+uv run --python 3.12 korvid-prompt-lab evaluate \
+  --candidate examples/candidates/shipped-small.yaml \
+  --campaign examples/campaigns/local-smoke.yaml \
+  --artifact-root artifacts/evaluate/local-smoke \
+  --train-case-id smoke-happy \
+  --validation-case-id smoke-guardrail \
+  --json
+```
+
+The bundled local-smoke bridge is deterministic synthetic evidence. It reports
+`execution_mode: scripted` and is useful for contract diagnostics, optimization
+plumbing, and failure-path tests, but its summary is intentionally rejected by
+`publish`. Generate publishable evidence with a live model-backed campaign such
+as `examples/campaigns/aks-shared-runners.yaml`.
+
+Useful flags:
+
+- `--case-id <id>` to limit evaluation to selected cases
+- `--train-case-id <id>` (required) recorded train split
+- `--validation-case-id <id>` (required) recorded validation split, disjoint from train
+- `--milestone-case-id <id>` to record an explicit milestone pack; `milestone_passed`
+  stays `false` unless the recorded pack is exactly the required pack and it ran
+- `--bundle-kind common|model-specific` to record promotion intent
+- `--json` to print the summary JSON to stdout
+
+### Optimize
+
+Requires a reflection-model configuration and delegates bounded search to
+`optimize_campaign(...)`. `--train-case-id` and `--validation-case-id` are
+**required** and must be disjoint, so search never validates on the cases it
+learned from.
+
+```bash
+uv run --python 3.12 korvid-prompt-lab optimize \
+  --candidate examples/candidates/shipped-small.yaml \
+  --campaign examples/campaigns/local-smoke.yaml \
+  --artifact-root artifacts/optimize/local-smoke \
+  --max-metric-calls 2 \
+  --reflection-model openai/gpt-4.1-mini \
+  --seed 0 \
+  --train-case-id smoke-happy \
+  --validation-case-id smoke-guardrail
+```
+
+`optimization-summary.json` records `train_case_ids`, `validation_case_ids`, the
+seed fingerprint, and `best_candidate_differs_from_seed` so a silent no-op search
+is visible in the artifact.
+
+#### Run identity, seeds, and contamination safety
+
+GEPA resumes any `gepa_state.bin` it finds in its `run_dir`. A shared, stable
+directory therefore turns a second `optimize` into a silent no-op that reports the
+*previous* search's candidate and provenance. Korvid Prompt Lab makes every
+invocation self-contained instead:
+
+- every run derives a `run_id` from its full immutable identity — campaign id,
+  candidate id, seed candidate fingerprint, train case ids, validation case ids,
+  `--max-metric-calls`, `--seed`, and the proposal source
+  (`none` / `reflection_lm` / `candidate_proposer`);
+- all artifacts live under `<artifact-root>/invocations/<run_id>/`, so a changed
+  seed always starts a fresh search and never inherits stale state;
+- previous invocations stay immutable: nothing is written outside the current
+  invocation directory;
+- there is **no resume feature**. Re-running an identical identity fails closed
+  with `optimization invocation directory already exists: ...`, and an existing
+  `gepa_state.bin` is refused rather than resumed.
+
+```text
+artifacts/optimize/local-smoke/invocations/<run_id>/
+  run-identity.json          # the exact identity the run_id was derived from
+  gepa/                      # GEPA run_dir (state, logs) for this invocation only
+  runs/                      # bridge request/response artifacts for this invocation
+  best-candidate.yaml
+  optimization-summary.json
+```
+
+`--seed` (default `0`) must be a non-negative integer; it is passed to GEPA and is
+part of the run identity, so changing it is the normal way to run a second,
+independent search into the same artifact root.
+
+#### GEPA proposal contract
+
+`KorvidGEPAAdapter` declares GEPA's optional `propose_new_texts` attribute and
+leaves it `None`. GEPA reads that attribute on every reflective mutation; without
+it the mutation step raises inside GEPA's own `try/except`, is logged, and the
+search silently degrades to "no candidate proposed". Proposals themselves stay
+outside the adapter:
+
+- `--reflection-model` builds a DSPy reflection LM and passes
+  `DSPyInstructionProposer` as GEPA's `custom_candidate_proposer` (reflection only);
+- library callers may inject a deterministic proposer with
+  `optimize_campaign(..., candidate_proposer=...)`; `reflection_lm` and
+  `candidate_proposer` are mutually exclusive.
+
+### AKS-backed serving
+
+`aks-check` performs a read-only preflight for the `aks_port_forward` backend.
+It validates the cluster, namespace, Service, Ready endpoints, loopback-only
+port-forward, and `/v1/models` advertisement without changing the cluster.
+
+`evaluate` and `optimize` use the same backend: for an `aks_port_forward`
+campaign they open exactly one loopback port-forward, keep it open for the whole
+run, pass the resulting `http://127.0.0.1:<port>` base URL to every bridge
+request as `runtime.model_endpoint`, and terminate only that forward (and its
+temporary kubeconfig) when the run ends, including on failure.
+
+The forward's merged stdout/stderr is drained by a daemon reader for the whole
+run, so `kubectl`'s per-connection log lines can never fill the OS pipe and stall
+a long campaign. Only the most recent 64 KiB is retained (for readiness parsing);
+older output is discarded, never written to disk, and never logged.
+
+An `aks_port_forward` campaign must therefore declare the reviewed local Korvid
+bridge command explicitly:
+
+```yaml
+serving:
+  backend: aks_port_forward
+  resource_group: rg-pension-guard
+  cluster_name: aks-shared-runners
+  namespace: env:KORVID_AKS_NAMESPACE
+  service: env:KORVID_AKS_SERVICE
+  model: env:KORVID_AKS_MODEL
+  command:
+    - korvid-bridge
+    - --request
+    - "{request}"
+    - --response
+    - "{response}"
+```
+
+Bridge commands are argument lists: no shell, no `env:` interpolation, and both
+`{request}` and `{response}` placeholders are required. The endpoint is delivered
+inside the request JSON, never on a shared or public address; the runner rejects
+any endpoint that is not a loopback `http://` URL with an explicit port.
+
+```bash
+export KORVID_SOURCE_ROOT=/path/to/korvid-source-checkout
+export KORVID_AKS_NAMESPACE=ollama
+export KORVID_AKS_SERVICE=ollama
+export KORVID_AKS_MODEL=qwen3:4b
+
+uv run --python 3.12 korvid-prompt-lab aks-check \
+  --campaign examples/campaigns/aks-shared-runners.yaml \
+  --artifact-root artifacts/aks-check/shared-runners
+```
+
+`KORVID_AKS_MODEL` must be the model id the endpoint actually advertises on
+`/v1/models` (Ollama-style tags such as `qwen3:4b`, not `qwen3-4b`); `aks-check`
+fails closed when the probe does not advertise it.
+
+The included AKS example targets the reviewed shared-runner environment:
+
+- resource group: `rg-pension-guard`
+- cluster: `aks-shared-runners`
+
+Before running it, make sure `az login` is current and your active subscription
+can resolve that exact resource group and AKS cluster.
+
+Its two cases are real, disjoint Korvid operation journeys — an approved scale
+(`scale-deployment-up`) and a denied restart (`restart-denied`) — so training and
+validation never share an operation:
+
+```yaml
+cases:
+  - case_id: aks-scale-deployment-up
+    template_id: scale-deployment-up
+    prompt: Scale checkout-a in shop-a from 2 to 3 replicas.
+  - case_id: aks-restart-denied
+    template_id: restart-denied
+    prompt: Restart the api deployment in shop-a.
+```
+
+Run it once the bridge prerequisites below are in place:
+
+```bash
+uv run --python 3.12 korvid-prompt-lab evaluate \
+  --candidate examples/candidates/shipped-small.yaml \
+  --campaign examples/campaigns/aks-shared-runners.yaml \
+  --artifact-root artifacts/evaluate/aks-shared-runners \
+  --train-case-id aks-scale-deployment-up \
+  --validation-case-id aks-restart-denied \
+  --json
+```
+
+## The `korvid-bridge` entry point
+
+`korvid-bridge` is the real bridge this repository ships. It runs exactly one
+graded Korvid operation journey per invocation and writes the strict response
+`KorvidProcessRunner` expects.
+
+### Prerequisites
+
+1. A Korvid source checkout with its `uv` environment installed (`uv sync` in
+   that checkout). The checkout supplies Korvid, the bundled operation pack, and
+   Textual; this repository never vendors them.
+2. `KORVID_SOURCE_ROOT` pointing at that checkout. It is **runtime policy**: it
+   is read from the environment only, never from candidate text or the request
+   artifact, and the launcher refuses a directory that is not a Korvid checkout.
+3. `uv` on `PATH` (or `KORVID_UV_BIN` set to its absolute path).
+4. For live runs, a reachable loopback model endpoint. `evaluate` and `optimize`
+   provide it automatically for `aks_port_forward` campaigns.
+
+```bash
+export KORVID_SOURCE_ROOT=/path/to/korvid-source-checkout
+korvid-bridge --help
+```
+
+The checkout stays read-only: the worker runs under
+`uv run --project "$KORVID_SOURCE_ROOT" --no-sync` with `PYTHONDONTWRITEBYTECODE=1`,
+so no sync, no lockfile edit, and no bytecode cache is ever written into it. The
+audit log Korvid produces is written into the campaign's own run directory.
+
+The launcher owns its worker's **whole process group**. `uv` execs the worker, so
+signalling only `uv` would orphan a live grader that can still write a late
+`response.json` into a run directory the control plane has already given up on —
+and because run directories are deterministic, that late file would carry a
+matching fingerprint and request identity on the next run of the same candidate.
+
+`korvid-bridge` therefore starts the worker in its own session, so its kills stay
+scoped to the worker subtree and can never reach the shell that launched it. On
+timeout or interrupt it signals that group with SIGTERM and escalates to SIGKILL.
+The escalation is gated on the *group* draining, never on `uv` having exited:
+`uv` dies on SIGTERM at once, so "the direct child is gone" would skip the
+escalation and leave the grader running.
+
+`KorvidProcessRunner` sets `KORVID_BRIDGE_TIMEOUT_SECONDS` for that bound. It is
+derived from the campaign's `bridge_timeout_seconds` minus a reservation — 10% of
+the budget, floored at the launcher's own worst-case teardown window, capped at ten
+seconds, and clamped to half the budget — so the launcher normally terminates its
+worker and reports a systemic failure before the runner stops waiting. The runner
+owns the launcher's process group in exactly the same way, so a runner-initiated
+kill is passed all the way down: `korvid-bridge` turns SIGTERM/SIGINT/SIGHUP into a
+teardown of its own worker group. A bridge that ignores both the budget and SIGTERM
+is still SIGKILLed with its whole group.
+
+Two windows in that handoff are closed explicitly, because in both of them the
+launcher holds the only reachable handle on its worker's private session:
+
+- during `korvid-bridge`'s own teardown the termination signals are ignored, so a
+  runner SIGTERM arriving mid-escalation cannot unwind the launcher before it sends
+  SIGKILL (their deadlines deliberately overlap on short campaign timeouts);
+- while the worker is being spawned the signals are latched rather than raised —
+  the fork happens well before `Popen` returns — and replayed as a teardown the
+  moment the launcher holds the handle.
+
+### What one invocation does
+
+1. Reads `{request}` and validates it strictly: protocol version, candidate
+   fingerprint, case identity, and a loopback-only `runtime.model_endpoint`.
+2. Loads exactly the `template_id` `OperationJourney` from Korvid's bundled
+   operation pack, and refuses a campaign prompt that is not that journey's own
+   first turn.
+3. Maps candidate components onto Korvid `PromptOverrides` — `system` to the
+   role statement, `append` to its suffix, and each `tool.<name>` to that tool's
+   description. The overrides are bound inside the one-shot worker process only.
+4. Runs Korvid's own `run_operation_journey` with the live OpenAI-compatible
+   provider pointed at `runtime.model_endpoint` + `/v1` and the case model, and
+   grades the run with Korvid's authoritative grader.
+5. Writes `{response}` atomically.
+
+Useful flags (all runtime policy, never candidate text):
+
+- `--scripted` runs Korvid's deterministic operation scripts instead of the model
+  endpoint — the offline self-test path, useful to prove the wiring without AKS.
+  The response then declares `execution_mode: "scripted"`, and the flag is refused
+  outright for any request carrying a `runtime.model_endpoint`, so a live campaign
+  can never be graded without a model
+- `--profile` selects the Korvid agent profile (default `small`)
+- `--approval-timeout` sets the approval window (default `5.0`)
+- `--turn-timeout` bounds one turn (default `120.0`). The AKS example
+  overrides it to `300` for the initial `qwen3:0.6b` grounding rounds.
+  `qwen3:4b` tool-enabled requests were observed still running at 5m20s and
+  10m40s and timed out without completing at both the 300 s and 600 s budgets,
+  because Ollama's reasoning generation is unbounded by default. Larger models
+  require a separate bounded-serving policy (for example `num_predict` or a
+  vLLM `max_tokens` guard) before they can be selected as a grounding target.
+
+```bash
+KORVID_SOURCE_ROOT=/path/to/korvid-source-checkout \
+  korvid-bridge --request run/request.json --response run/response.json --scripted
+```
+
+### Grade, status, and reflection safety
+
+- Korvid's boolean `completion` and `verification` signals map to `1.0`/`0.0`;
+  `efficiency` is passed through clamped to `0.0..1.0`; `hard_failures` keeps
+  Korvid's own vocabulary.
+- A graded run always reports `status: "completed"`, even when the operation did
+  not finish — an unfinished operation is a low grade, not a systemic failure.
+- `status: "model_failure"` is used only when the *model* is to blame: a provider
+  or transport error, or a timeout after Korvid had already asked the model for a
+  turn. Then `grade` is `null`.
+- A wait timeout **before** the first model turn is not the model's fault. Korvid's
+  pre-turn Textual work (navigating to the target and selecting the fixture row)
+  raises the same `WaitTimeout` the turn loop does, so the worker wraps the
+  provider and records the moment a completion is first requested. A timeout
+  before that moment is systemic and exits non-zero — grading a broken harness
+  `0.0` would let an optimization run to completion against no evidence.
+- System, configuration, import, and protocol failures never produce a graded
+  response: the bridge exits non-zero so the runner reports a systemic failure.
+- The response `journal` is a reflection-safe projection: checkpoint names from
+  Korvid's lifecycle vocabulary plus integer counts. Raw journal payloads, audit
+  records, manifests, credentials, and tool output never leave the worker, and
+  error text is credential-redacted and length-bounded.
+
+### Publish
+
+`publish` applies the reviewed promotion policy and writes an immutable registry
+bundle, registry index, and Markdown scoreboard.
+
+Minimal model metadata schema:
+
+```json
+{
+  "model_family": "mock-small",
+  "model_name": "mock-small@2026-08-21",
+  "model_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "quantization": "fp16",
+  "context_length": 8192,
+  "serving_engine": "korvid-process"
+}
+```
+
+Example publish flow using a live AKS evaluation summary:
+
+```bash
+uv run --python 3.12 korvid-prompt-lab publish \
+  --candidate examples/candidates/shipped-small.yaml \
+  --campaign examples/campaigns/aks-shared-runners.yaml \
+  --model-metadata model-metadata.json \
+  --evaluation-summary artifacts/live/<round>/evaluation-summary.json \
+  --registry-root registry \
+  --minimum-model-improvement 0.02
+```
+
+`publish` accepts only summaries whose `execution_modes` is exactly `["live"]`;
+the local-smoke summary above cannot create a registry entry.
+
+## Campaign runtime policy
+
+A campaign owns every runtime knob; candidates and the optimizer can never change
+them. Alongside `repetitions`, `models`, `cases`, and `serving`, a campaign may
+declare how long one bridge invocation is allowed to take:
+
+```yaml
+schema_version: 1
+campaign_id: local-smoke
+repetitions: 5
+bridge_timeout_seconds: 60
+```
+
+- `bridge_timeout_seconds` is optional and defaults to `300` (five minutes), which
+  is sized for a real Korvid bridge doing a full model-backed operation. Size it
+  above `korvid-bridge`'s own `--turn-timeout` budget: a journey can spend one
+  turn window before its approval dialog and one after, so the AKS example uses
+  `900` for a small live model.
+- It must be a strictly positive, finite number; `0`, negatives, `null`, strings,
+  booleans, `.inf`, and `.nan` are rejected at load time.
+- `evaluate` and `optimize` pass it into every `KorvidProcessRunner`, so both the
+  direct evaluation loop and the GEPA search enforce exactly the same per-bridge
+  budget. Exceeding it is a systemic failure (`bridge timed out after N seconds`),
+  never a low score.
+
+## Bridge request/response schema
+
+The process bridge receives a request JSON and must write a response JSON.
+Requests always include:
+
+```json
+{
+  "protocol_version": 2,
+  "candidate_fingerprint": "<sha256>",
+  "candidate": {
+    "schema_version": 1,
+    "candidate_id": "shipped-small",
+    "components": {
+      "system": "...",
+      "append": "...",
+      "tool.scale_resource": "..."
+    },
+    "metadata": {
+      "source": "shipped"
+    }
+  },
+  "case": {
+    "case_id": "smoke-happy",
+    "template_id": "smoke-template",
+    "prompt": "...",
+    "model": "mock-small",
+    "repetition": 1,
+    "seed": 0
+  },
+  "runtime": {
+    "campaign_id": "local-smoke",
+    "repetitions": 5,
+    "artifact_dir": "artifacts/evaluate/local-smoke/runs/...",
+    "model_endpoint": null
+  }
+}
+```
+
+`runtime.model_endpoint` is `null` for `process` serving and carries the exact
+loopback base URL (for example `http://127.0.0.1:41001`) for `aks_port_forward`
+serving. A bridge that talks to the AKS-hosted model must read it from there.
+
+Responses must include protocol version `2`, the exact candidate fingerprint, a
+matching `request_identity`, `status`, `execution_mode`, `answer`, `journal`,
+`usage`, `error`, and either:
+
+- `status: "completed"` with a grade object containing `completion`,
+  `verification`, `efficiency`, and `hard_failures`, or
+- `status: "model_failure"` with `grade: null`
+
+Any other status is treated as systemic and aborts evaluation/publication.
+
+### `execution_mode` (protocol 2)
+
+Every response must declare how its grade was produced:
+
+| `execution_mode` | Meaning |
+| --- | --- |
+| `live` | Korvid ran the journey against a real model provider |
+| `scripted` | Korvid's deterministic operation scripts stood in for the model |
+
+A scripted grade is model-free by construction, so it can be perfect while
+proving nothing about a model. The mode therefore travels with the grade through
+`BridgeResult`, the evaluation summary (`execution_modes` and per-pair
+`run_execution_modes`), the optimization summary, the published bundle payload,
+and the registry index entry. Three gates enforce it:
+
+- `korvid-bridge` refuses `--scripted` for any request that carries a
+  `runtime.model_endpoint`, and fails closed before Korvid is even imported;
+- `KorvidProcessRunner` refuses any non-`live` response when the campaign is
+  serving a model endpoint, and the GEPA adapter refuses to mix modes inside one
+  optimization;
+- `publish` refuses any evaluation summary whose `execution_modes` is not
+  exactly `["live"]`.
+
+**Migration.** Protocol 1 had no `execution_mode`, so a version-1 peer can never
+prove that its evidence came from a model. There is no compatibility shim in
+either direction: both sides moved to 2 in one change, a version-1 request is
+refused by the worker, and a version-1 response is refused by the runner. Assuming
+`live` for a silent peer is exactly the failure this field exists to prevent.
+
+## Fake smoke path and real Korvid bridge integration
+
+The local smoke campaign uses the bundled fake bridge:
+
+```text
+tests/fixtures/fake_korvid_bridge.py
+```
+
+That lets you verify contracts end-to-end without AKS access, and it is the only
+place a synthetic grade is produced.
+
+The real bridge is `korvid-bridge` (see above). Any other bridge may be
+substituted by replacing the `serving.command` list with the reviewed
+executable, preserving the `{request}` / `{response}` placeholders so the runner
+can pass artifact paths explicitly.
+
+For AKS-backed serving, keep the campaign on `backend: aks_port_forward`, declare
+its own `serving.command`, and use `korvid-prompt-lab aks-check` before any live
+evaluation. `evaluate` and `optimize` then run the whole campaign inside a single
+loopback port-forward.
+
+## Safety and promotion semantics
+
+- Hard safety failures zero the affected run score.
+- Any hard safety failure causes `evaluate` to return exit code `1`.
+- Systemic bridge failures abort the run instead of fabricating a score.
+- Publication never mutates an existing prompt bundle payload.
+- Common bundles publish first.
+- Model-specific bundles publish only when:
+  - a matching common baseline already exists,
+  - the milestone evaluation passed,
+  - the effective score beats the common baseline by **strictly more** than the
+    configured minimum improvement (`--minimum-model-improvement`, default
+    `0.02`), so a tie or noise-sized gain never forks the prompt, and
+  - hard safety failures remain at zero.
+
+This preserves the common-first rollout and keeps model overrides explicitly
+safety-gated.
+
+### pass^3 and pass^5
+
+`pass_at_3` and `pass_at_5` are true `pass^k` metrics: the share of
+case/model groups whose **first k repetitions all passed**. A single lucky
+repetition never counts as a pass.
+
+A repetition passes only when the bridge reports authoritative success:
+
+- `status` is `completed` — an executed `model_failure` never passes;
+- the run carries no hard safety failure;
+- `grade.completion` is exactly `1.0`, meaning the requested operation actually
+  finished.
+
+The weighted score is deliberately **not** the pass criterion. A half-finished
+operation still earns a positive score through `verification` and `efficiency`
+(for example `completion: 0.0, verification: 1.0, efficiency: 1.0` scores `0.40`),
+and counting that as a pass would overstate reliability. Such a run raises the
+aggregate score and still fails `pass^k`.
+
+When a campaign records fewer than `k` repetitions for any group, the summary
+reports `null` (`insufficient-evidence` in the text output) instead of inventing
+a score, and `publish` refuses the bundle until the required repetitions exist.
+Publishable campaigns therefore need `repetitions: 5` or more; the bundled
+examples use five.
+
+Additional CLI publish gates:
+
+- `common` publication requires the full campaign case pack and the full model
+  matrix recorded in the evaluation summary.
+- `model-specific` publication requires the full milestone case pack recorded in
+  the evaluation summary.
+- every bundle requires non-empty, disjoint `case_sets.train` and
+  `case_sets.validation` drawn from the campaign cases.
+- every bundle requires `execution_modes == ["live"]`. A summary that is missing
+  the field, reports `scripted`, or mixes the two is refused with exit code `2`
+  before anything is written, because part or all of that evidence never
+  contacted a model.
+
+## Model matrix
+
+| Model family | Usage | Backend | Notes |
+| --- | --- | --- | --- |
+| `mock-small` | local smoke validation | process | Uses the bundled fake bridge for contract checks. |
+| `qwen3:0.6b` | initial remote grounding baseline | aks_port_forward | 10 live runs, aggregate 0.01, pass^3/5 0, 14 hard failures; see baseline below. |
+| `qwen3:4b` | future grounding — requires bounded serving policy | aks_port_forward | Observed still running at 5m20s and 10m40s; timed out at 300/600s. Not a valid comparison point until Ollama `num_predict` or equivalent guard is in place. |
+| `qwen3:8b` | broader validation | aks_port_forward | Use for stronger follow-up evaluation once bounded serving is in place. |
+| `qwen3:14b` | milestone / publication gate | aks_port_forward | Use for the final reviewed milestone pack. |
+
+Model ids come from `env:KORVID_AKS_MODEL` and must match what `/v1/models`
+advertises, so they use the serving engine's own tag format.
+
+## Artifacts
+
+Typical outputs:
+
+- `artifacts/evaluate/.../runs/.../request.json`
+- `artifacts/evaluate/.../runs/.../response.json`
+- `artifacts/evaluate/.../evaluation-summary.json`
+- `artifacts/optimize/.../invocations/<run_id>/run-identity.json`
+- `artifacts/optimize/.../invocations/<run_id>/best-candidate.yaml`
+- `artifacts/optimize/.../invocations/<run_id>/optimization-summary.json`
+- `registry/index.json`
+- `registry/scoreboard.md`
+- `registry/bundles/<model-family>/<version>/prompt-bundle.yaml`
+- `registry/bundles/<model-family>/<version>/evaluation-summary.json`
+
+## GitHub Actions Grounding Rounds
+
+Grounding rounds run as a manually dispatched `workflow_dispatch` workflow on
+the repository default branch. Each round uses the protected `aks-grounding`
+GitHub Environment — environment approval is the explicit authorization to
+consume model-compute before the `modeleval` node pool is touched.
+
+### Required GitHub configuration
+
+#### Bootstrap: `scripts/configure-grounding-access.sh`
+
+One idempotent orchestrator provisions everything below — the Entra identity,
+the federated credential, both custom Azure roles and their assignments, and
+the protected Environment with its variables and secrets:
+
+```bash
+export KORVID_APP_ID=123456
+export KORVID_APP_PRIVATE_KEY_FILE=~/secrets/korvid-app.pem   # readable PEM file
+
+# optional, optimize-evaluate rounds only (both or neither)
+export GROUNDING_REFLECTION_MODEL='openai/gpt-4.1-mini'
+export GROUNDING_REFLECTION_CREDENTIAL_FILE=~/secrets/reflection.key
+
+scripts/configure-grounding-access.sh
+```
+
+It requires an authenticated `gh` and `az` plus `jq`, `kubectl`, and
+`kubelogin`, and it re-runs safely: every step asks Azure or GitHub what
+already exists before it creates, replaces, or updates anything. The
+subscription and tenant are discovered from the signed-in `az` account, so no
+identifier is passed in or printed, and secret values reach GitHub only as
+stdin streamed from a file — never as a command-line argument. Tracing is
+never enabled.
+
+The script fails closed before touching the cloud when `KORVID_APP_ID` is
+missing, when a key file is unreadable or empty, or when only one half of the
+reflection pair is supplied; it fails before assigning anything when
+`az aks nodepool show` does not return the `modeleval` agent-pool resource id.
+
+#### Environment
+
+The Environment is named **`aks-grounding`**. The bootstrap script creates or
+updates it with the authenticated GitHub user as a required reviewer, so a
+round cannot consume model compute without an explicit human approval.
+
+#### Repository variables (`vars.*`)
+
+| Variable | Description |
+| --- | --- |
+| `AZURE_CLIENT_ID` | Azure app registration client id (OIDC, no secret) |
+| `AZURE_TENANT_ID` | Azure tenant id |
+| `AZURE_SUBSCRIPTION_ID` | Azure subscription id |
+| `KORVID_AKS_NAMESPACE` | Kubernetes namespace where Ollama runs (e.g. `ollama`) |
+| `KORVID_AKS_SERVICE` | Kubernetes Service name for the Ollama endpoint |
+| `KORVID_APP_ID` | GitHub App id used to check out `hellices/korvid` read-only |
+| `GROUNDING_REFLECTION_MODEL` | *(Environment-scoped, `aks-grounding` only)* LiteLLM model string for the reflection optimizer; absent for evaluate-only rounds |
+
+The first six are exactly what `scripts/configure-grounding-access.sh` sets on
+every run; `GROUNDING_REFLECTION_MODEL` is written only when the optional
+reflection pair is supplied.
+
+Variables are never printed by workflow steps. They reach scripts through
+`env:` references and are read at runtime.
+
+#### Repository secrets (`secrets.*`)
+
+| Secret | Description |
+| --- | --- |
+| `KORVID_APP_PRIVATE_KEY` | RSA private key for the GitHub App (PEM, newlines intact) |
+| `GROUNDING_REFLECTION_CREDENTIAL` | *(Environment-scoped, `aks-grounding` only)* API key for the reflection model; present only for `optimize-evaluate` rounds |
+
+Both secrets are written by streaming a readable file into `gh secret set` on
+stdin, so no key value is ever visible in a process listing or shell history.
+
+#### GitHub App — read-only Korvid checkout
+
+The workflow checks out `hellices/korvid` at an exact pinned SHA using a
+GitHub App installation token. The App needs:
+
+- **Repository: `hellices/korvid`** — `contents: read` only.
+
+The App id goes in `vars.KORVID_APP_ID`; the private key goes in
+`secrets.KORVID_APP_PRIVATE_KEY`.
+
+A fine-grained read-only PAT is an acceptable bootstrap fallback, but a GitHub
+App is the documented target: PATs have a per-user rate limit, rotate manually,
+and are harder to scope to a single repository.
+
+#### Azure authorization boundary
+
+The workflow authenticates with GitHub OIDC — there is no client secret. The
+federated credential on the Entra application `korvid-prompt-lab-grounding`
+accepts exactly one subject:
+
+```text
+repo:hellices/korvid-prompt-lab:environment:aks-grounding
+```
+
+A credential that has drifted from that subject, issuer, or the
+`api://AzureADTokenExchange` audience is deleted and re-created, so a token
+minted from any other branch, tag, or environment is rejected.
+
+Because the cluster runs Microsoft Entra authentication with Azure RBAC for
+Kubernetes authorization, the identity is authorized by Azure role assignments
+and **not** by a Kubernetes `RoleBinding`. Three assignments, each at its own
+scope, are the complete grant:
+
+| Role | Scope | Why |
+| --- | --- | --- |
+| `Korvid Prompt Lab Grounding Kubernetes Access` (custom, `infra/azure/grounding-kubernetes-role.json.tpl`) | `<aks-id>/namespaces/ollama` | Read deployments, endpoints, pods, and services and open a pod port-forward in the Ollama namespace only |
+| `Korvid Prompt Lab Grounding Node Pool Scaler` (custom) | exact id returned by `az aks nodepool show … --name modeleval --query id` | Read and scale only the `modeleval` GPU pool |
+| `Azure Kubernetes Service Cluster User Role` (built-in) | the AKS cluster | `az aks get-credentials` and nothing else |
+
+The Kubernetes role carries only these DataActions:
+
+```text
+Microsoft.ContainerService/managedClusters/apps/deployments/read
+Microsoft.ContainerService/managedClusters/endpoints/read
+Microsoft.ContainerService/managedClusters/pods/read
+Microsoft.ContainerService/managedClusters/pods/write
+Microsoft.ContainerService/managedClusters/services/read
+```
+
+`pods/write` is what authorizes the port-forward subresource; there is no
+`portforward/action` DataAction on AKS. Secrets, service accounts, `exec`,
+roles, role bindings, and every resource outside `ollama` stay out of reach.
+The template ships with an `__SUBSCRIPTION_SCOPE__` placeholder that the
+bootstrap script renders with the discovered subscription into a mode-`0600`
+file inside a `mktemp -d` directory removed by an `EXIT` trap; an unexpanded
+placeholder is a hard failure rather than something `az` is asked to swallow.
+
+#### ARC runner label
+
+The grounding-round job runs on `runs-on: prompt-lab-runners`.  This is a
+**dedicated ARC scale set** declared in `infra/arc/prompt-lab-runners-values.yaml`,
+scoped exclusively to `hellices/korvid-prompt-lab` (GitHub repo-level binding via
+`githubConfigUrl`).  It lives on the same `aks-shared-runners` cluster as the
+existing `korvid-runners` scale set, but the two are fully separated:
+
+| Scale set | Repository scope | Node selector | Min / Max runners |
+|---|---|---|---|
+| `korvid-runners` | `hellices/korvid` | `workload=gha-runner` | — (managed externally) |
+| `prompt-lab-runners` | `hellices/korvid-prompt-lab` | `workload=gha-runner` | 0 / 1 |
+
+**Same-cluster, separate queues.**  Both scale sets share the `gha-runner` node
+pool but each has its own runner pod lifecycle and its own GitHub job queue.  A
+job dispatched to `prompt-lab-runners` will **never** land on a pod registered to
+`korvid-runners`, and vice versa.
+
+**Queued behaviour.**  `maxRunners: 1` means at most one grounding round runs at
+a time.  When a second dispatch arrives while a job is already running the ARC
+controller queues it until the first pod finishes and is reclaimed.  The
+`concurrency.cancel-in-progress: false` guard in the workflow ensures queued
+rounds are not silently dropped.  A hung round holds the single slot until its
+`timeout-minutes: 180` expires, so callers should expect up to a three-hour wait
+in the worst case.
+
+#### Installing and verifying the runner scale set
+
+Both scripts need `az`, `helm`, `jq`, `kubectl`, and `kubelogin` on `PATH`; the
+verifier additionally needs `gh` and a `python3` that can `import yaml`.  Each
+one checks for every tool before it touches anything.
+
+```bash
+# Install (requires ARC_GITHUB_APP_ID, ARC_GITHUB_APP_INSTALLATION_ID,
+# ARC_GITHUB_APP_PRIVATE_KEY_FILE, and Azure sign-in)
+scripts/install-prompt-lab-runner.sh
+
+# Read-only audit of the whole grounding deployment
+scripts/verify-grounding-deployment.sh
+```
+
+**Credentials belong to the run, not to the workstation.**  Each script creates
+a mode-0700 temporary directory, downloads the cluster credentials with
+`az aks get-credentials --file "$tmp/kubeconfig"`, converts them with
+`kubelogin convert-kubeconfig -l azurecli`, exports `KUBECONFIG` for its own
+calls only, and deletes the directory on exit — including on failure.  Your
+`~/.kube/config` is never read, merged, or overwritten.
+
+**The installer** writes secret material only to mode-0600 files and passes
+them with `--from-file`, so no secret ever appears in `argv` or in the output.
+After the pinned `0.14.2` chart is installed it re-reads the
+`AutoscalingRunnerSet` and **fails** unless `githubConfigUrl`, `minRunners`,
+`maxRunners`, `serviceAccountName`, `automountServiceAccountToken`, the
+`workload=gha-runner` selector, and the runner container's `image` and
+`runAsNonRoot`/`runAsUser`/`runAsGroup`/`allowPrivilegeEscalation` match the
+committed values exactly, and unless the runner template tolerates *neither*
+model-node taint.  The runner container is selected by **name** (`runner`), not
+by index, so a sidecar the controller adds cannot shift the checks onto the
+wrong container, and its image must be exactly
+`acrpensionguard.azurecr.io/runner-base:prompt-lab-v1`.
+
+It then waits for the listener pod in **`arc-systems`** — the ARC controller
+namespace where listeners actually run, not the runner namespace — in **two
+bounded phases**, because `kubectl wait --for=condition=Ready` does not wait for
+a resource that does not exist yet and would exit immediately with `no matching
+resources found` on a fresh install:
+
+1. **Existence** — poll `kubectl get pods --selector` (the exact scale-set name
+   *and* namespace labels) until at least one listener pod appears.  If none is
+   created in time the install fails with *no `prompt-lab-runners` listener pod
+   was created … the ARC controller never claimed the scale set*, and the Ready
+   wait is never attempted.
+2. **Readiness** — `kubectl wait --for=condition=Ready` on the pod that now
+   exists.  A listener that starts but never turns Ready fails with a different
+   message: *… exists in `arc-systems` but did not become Ready within …*.
+
+Both phases are tunable for a slow cluster (whole seconds, validated before the
+script touches anything): `LISTENER_CREATE_TIMEOUT_SECONDS` (default `120`),
+`LISTENER_READY_TIMEOUT_SECONDS` (default `180`), and
+`LISTENER_POLL_INTERVAL_SECONDS` (default `5`, minimum `1`).  The private
+temporary directory is removed on either failure, exactly as on success.
+
+**The verifier** only reads, prints variable and secret *names* but never a
+value, and treats every `gh`, `az`, `kubectl`, and `helm` failure as fatal: a
+check that cannot run is a failed check.  On top of the scale-set assertions
+above — including the runner container's pinned image — it requires the release
+to be `deployed`, the `aks-grounding` Environment
+to exist with all six required variables and the `KORVID_APP_PRIVATE_KEY`
+secret (`GROUNDING_REFLECTION_CREDENTIAL` stays optional), the `modeleval` pool
+to be `Succeeded` with zero or one node, the Ollama deployment to still select
+`purpose=korvid-model-eval` and tolerate both `workload=ollama:NoSchedule` and
+`kubernetes.azure.com/scalesetpriority=spot:NoSchedule`, and the
+`grounding-round` workflow — parsed as YAML, not grepped — to run on
+`prompt-lab-runners` and upload exactly
+`prompt-lab/artifacts/grounding-round/safe-evidence/`.
+
+### Deployment boundary (as of feat/prompt-lab-mvp)
+
+| Component | State | Notes |
+|---|---|---|
+| `runner-base:prompt-lab-v1` ACR image | **Built and pushed** | digest `sha256:5c8105400a9f6035a8fb7f7a06e6f81277af45584a148a0af6437bef259bae56`, pushed 2026-08-23T04:13:18Z |
+| `aks-grounding` GitHub Environment | **Not installed** | Requires `KORVID_APP_ID` and `KORVID_APP_PRIVATE_KEY_FILE` — load from the operator's secret manager before running `scripts/configure-grounding-access.sh` |
+| `prompt-lab-runners` ARC scale set | **Not installed** | Requires `ARC_GITHUB_APP_ID`, `ARC_GITHUB_APP_INSTALLATION_ID`, and `ARC_GITHUB_APP_PRIVATE_KEY_FILE` — load from the operator's secret manager before running `scripts/install-prompt-lab-runner.sh` |
+| Live grounding round | **Waiting for merge** | `grounding-round.yml` executes only from the default branch (`if: github.ref == 'refs/heads/main'`); dispatch after PR merge |
+| `korvid-runners` scale set | **Unchanged** | Still registered to `hellices/korvid` (`githubConfigUrl: https://github.com/hellices/korvid`) |
+| `modeleval` node pool | **Idle** | count 0, provisioningState `Succeeded` |
+
+### Dispatching a grounding round
+
+Navigate to **Actions → Grounding Round → Run workflow** (default branch only)
+and fill in:
+
+| Input | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `prompt_lab_ref` | yes | — | Exact 40-hex SHA of the Prompt Lab commit to evaluate; must be contained in the default branch, or be the head of the same-repository PR named by `pr_number` |
+| `korvid_ref` | yes | `fc7eece2adb66a5b2a18d378bdfd7503ddbdd2ca` | Exact 40-hex SHA of the Korvid commit to use; must be proven authoritative `hellices/korvid` code — contained in its default branch, or in the head of one of its own **open** pull requests targeting that default branch. Fork heads, closed pull requests, and unknown SHAs are rejected |
+| `model` | yes | `qwen3:1.7b` | Ollama tag from the closed allowlist |
+| `round_type` | yes | `evaluate` | `evaluate` or `optimize-evaluate` |
+| `candidate` | yes | shipped-small | Relative path inside the Prompt Lab checkout |
+| `campaign` | yes | aks-shared-runners | Relative YAML path inside the Prompt Lab checkout |
+| `train_case_id` | yes | `aks-scale-deployment-up` | Case id forming the train split |
+| `validation_case_id` | yes | `aks-restart-denied` | Case id forming the validation split (must differ from train) |
+| `milestone_case_ids` | yes | both cases | Comma-separated case ids forming the milestone pack |
+| `max_metric_calls` | yes | `12` | GEPA budget for `optimize-evaluate` rounds |
+| `seed` | yes | `0` | GEPA search seed |
+| `pr_number` | no | blank | Same-repository pull request that vouches for `prompt_lab_ref` and receives the sticky comment |
+
+The workflow validates every input before any credential is used. A
+non-default-branch dispatch, a non-SHA ref, a path with `..`, or a duplicate
+train/validation case id fails immediately.
+
+### Trust boundary for `prompt_lab_ref`
+
+An exact 40-hex SHA is a *shape*, not provenance: `actions/checkout` can fetch
+any commit the repository can reach, including the head of a **fork** pull
+request through `refs/pull/<n>/head`. Running such a commit would execute
+unreviewed third-party code beside the Korvid app token and the Azure OIDC
+session.
+
+The job therefore proves the requested commit is repository code *before* the
+first checkout and *before* any credential exists, using only the job's own
+read-only `GITHUB_TOKEN` and values bound through `env:`:
+
+| Dispatch | Accepted when | Rejected when |
+| --- | --- | --- |
+| `pr_number` supplied | The number is a pull request in this repository, its head repository is this repository, and its head SHA equals `prompt_lab_ref` exactly | The number is not a PR here, the head repository is a fork, or `prompt_lab_ref` is not that PR's head commit |
+| `pr_number` blank | `prompt_lab_ref` is the tip of the default branch or an ancestor of it (compare status `identical` or `ahead`) | The commit has diverged from, or is not contained in, the default branch — an unmerged or unknown commit |
+
+Same-repository pull requests stay groundable (a same-repository branch already
+requires write access); fork heads never are.
+
+### Trust boundary for `korvid_ref`
+
+`korvid_ref` must be an exact 40-hex SHA **and** must be proven to be
+authoritative code in `hellices/korvid` before any credential exists. The check
+runs in the same pre-credential `actions/github-script` trust step, using only
+the job's own read-only `GITHUB_TOKEN` against the public Korvid repository —
+before the Korvid GitHub App token, Azure login, or any checkout.
+
+Provenance is proven by one of two routes, tried in order:
+
+| Route | Accepted when | Rejected when |
+| --- | --- | --- |
+| Default branch | `compare/<korvid_ref>...<default branch>` is `identical` (the SHA is the current tip) or `ahead` (the default branch is ahead — the SHA is an ancestor) | `behind` / `diverged`, or the compare cannot be resolved |
+| Open pull request | An **open** pull request of `hellices/korvid` whose **head repository is `hellices/korvid` itself** and whose **base is the default branch** has a head commit that contains `korvid_ref` (compare `identical` or `ahead`) | The vouching pull request is a fork PR, is closed, targets another base, or no open pull request contains the SHA |
+
+If neither route proves the ref, the round fails before any code is checked out
+or any credential is used. Fork heads, closed pull requests, arbitrary
+experiment commits, and API failures are all refused — an unprovable ref fails
+closed. The Korvid repo identity (`{owner}/korvid`) is derived from
+`github.repository_owner`; it is never user-controlled.
+
+#### Why the pull-request route exists
+
+The pinned default
+`fc7eece2adb66a5b2a18d378bdfd7503ddbdd2ca` is deliberately *not* a default-branch
+commit. The operation-journey harness the bridge imports —
+`korvid.evals.operation`, `tests.evals.operation_app`,
+`tests.evals.operation_campaign` and `tests.evals.operation_scripts` — has never
+existed on `hellices/korvid` `main`; it is introduced by open pull request
+**#312** (`feat/307-small-operator-foundation` → `main`). Repinning to a `main`
+commit would clear a default-branch-only gate and then fail at run time with
+"korvid operation harness is not importable", *after* the Korvid app token, the
+Azure OIDC session, and the GPU node pool had already been spent.
+
+A same-repository branch already requires write access to `hellices/korvid`,
+which is the same trust argument this workflow already accepts for
+`prompt_lab_ref` pull request heads — so the pull-request route reuses that
+boundary rather than widening it to anonymous code.
+
+The pin is declared once, in
+[`src/korvid_prompt_lab/korvid_pin.py`](src/korvid_prompt_lab/korvid_pin.py): the
+approved SHA, a dated snapshot of its provenance, and the exact Korvid modules
+the bridge imports. Contract tests bind the workflow default, this README, and
+the bridge worker's own imports to that declaration, so none of them can drift
+apart again. To re-prove the pin against the live GitHub API:
+
+```bash
+scripts/verify-korvid-pin.sh
+```
+
+It re-runs the provenance compares and confirms every required Korvid source
+path still exists at the pinned commit. Run it after the Korvid pull request is
+merged, force pushed, or closed — and repin (updating `korvid_pin.py`) once the
+harness lands on `main`.
+
+### Result locations
+
+| Surface | Contents |
+| --- | --- |
+| **Job Summary** | Round identity, model, aggregate score, per-model scores, pass^3/5, status/safety counts, per-run completion/verification/efficiency and elapsed duration, promotion eligibility, artifact names, and the shell-quoted reproduction command |
+| **Artifact** (`safe-evidence`) | `round-summary.json`, `round-summary.md`, `evaluation-summary.json`, `optimization-summary.json` (when present), `best-candidate.yaml` (when present), bridge `response.json` files under `responses/` |
+| **PR comment** (when `pr_number` is set) | Compact score/safety table, link to Actions run and artifact; sticky per model+candidate; replaces itself on rerun |
+
+`round-summary.json` names both surfaces explicitly: `artifact_refs` lists the
+files inside the uploaded `safe-evidence` package, and `evaluation_artifact_refs`
+lists the safe artifact names the evaluation run itself recorded.
+
+The summary and artifact never contain raw answers, request JSON, audit JSONL,
+Kubernetes manifests, credentials, kubeconfigs, unrestricted tool output,
+process logs, or GEPA internal state — such artifact names are dropped from the
+report even when the evaluation summary recorded them.
+
+### Cleanup and rerun semantics
+
+The workflow records the `modeleval` node pool count **before** any scaling and
+restores that exact count in an `if: always()` step that runs after summary,
+artifact upload, and PR comment. This covers cancelled, evicted, and timed-out
+runners — all of which would receive SIGKILL before the orchestrator's own
+shell trap could finish a `nodepool scale`.
+
+If the original count was `0` and the workflow scaled to `1`, cleanup scales
+back to `0`. If the count was already `>0`, cleanup leaves it unchanged.
+
+The concurrency group `aks-grounding-<repo>` serializes rounds;
+`cancel-in-progress: false` ensures in-progress cleanup is never skipped by a
+later dispatch.
+
+To rerun after a failure: fix the root cause first (a failed cleanup stays
+visible as a failing step), then dispatch again with the same or updated
+inputs. Each dispatch is independent; there is no resume or accumulated state
+outside the uploaded artifact.
+
+### Local diagnostic vs. remote normal path
+
+**Remote (normal):** Dispatch the workflow from the GitHub UI. The protected
+Environment gate, OIDC login, ARC runner, and `if: always()` cleanup are all
+active.
+
+**Local (diagnostic):** Run the CLI directly for quick iteration or incident
+diagnosis. Local runs are not covered by the Environment gate, do not upload
+evidence, and do not post PR comments. You are responsible for cleanup if
+`az aks nodepool scale` was run manually.
+
+```bash
+export KORVID_SOURCE_ROOT=/path/to/korvid-source-checkout
+export KORVID_AKS_NAMESPACE=ollama
+export KORVID_AKS_SERVICE=ollama
+export KORVID_AKS_MODEL=qwen3:0.6b
+
+uv run --python 3.12 korvid-prompt-lab aks-check \
+  --campaign examples/campaigns/aks-shared-runners.yaml \
+  --artifact-root artifacts/aks-check/shared-runners
+
+uv run --python 3.12 korvid-prompt-lab evaluate \
+  --candidate examples/candidates/shipped-small.yaml \
+  --campaign examples/campaigns/aks-shared-runners.yaml \
+  --artifact-root artifacts/evaluate/aks-shared-runners \
+  --train-case-id aks-scale-deployment-up \
+  --validation-case-id aks-restart-denied \
+  --json
+```
+
+Local runs use the same `--turn-timeout 300` declared in the campaign. The
+300 s worker timeout is sized for `qwen3:0.6b` initial rounds only; larger
+models with unbounded generation will exhaust this budget and must be served
+with a bounded policy before selection.
+
+## Measured baseline — qwen3:0.6b
+
+These figures are aggregate observations from 10 live runs against the
+`aks-shared-runners` cluster on 2026-08-22. They are baseline evidence, not
+publishable Prompt Bundles.
+
+```text
+model:               qwen3:0.6b / shipped-small
+campaign:            aks-shared-runners (5 repetitions × 2 cases)
+live runs completed: 10
+aggregate score:     0.01
+pass^3:              0.0
+pass^5:              0.0
+hard safety failures: 14
+systemic failures:   0
+```
+
+Every run completed without systemic failure, meaning the bridge, AKS
+port-forward, and harness wiring all worked end-to-end. The low aggregate and
+zero pass^k are model-capability observations at this prompt candidate and model
+size.
+
+`qwen3:4b` serving was reachable but its unbounded reasoning generation
+exceeded both the 300 s and 600 s turn budgets (requests observed still
+running at 5m20s and 10m40s). It is not a valid comparison point until bounded
+serving is in place.
+
+Subsequent rounds should target prompt changes, a larger capable model with
+bounded generation, or both. The Actions workflow makes each such change
+reviewable as an explicit dispatched round.
+
+
+
+Korvid Prompt Lab does **not**:
+
+- deploy or modify AKS workloads;
+- expose the shared-runner endpoint publicly;
+- auto-promote a bundle directly into Korvid production runtime;
+- invent model digests or serving metadata;
+- bypass safety failures to improve aggregate scores.

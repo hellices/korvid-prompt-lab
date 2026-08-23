@@ -1,0 +1,807 @@
+name: Grounding Round
+
+# Trust boundary
+# --------------
+# This definition executes from the repository default branch only.  The Prompt
+# Lab revision that actually runs is the reviewed commit named by the required
+# `prompt_lab_ref` input, which must be an exact 40-hex commit SHA *and* must be
+# proven to be repository code before anything is checked out: either the head
+# commit of a same-repository pull request named by `pr_number`, or a commit the
+# trusted default branch contains.  Fork pull request heads are refused.
+# `korvid_ref` is proven the same way against the authoritative Korvid
+# repository: it must be contained in that repository's default branch, or in
+# the head of one of its own OPEN pull requests targeting that default branch.
+# Fork heads are refused there too.
+# Dispatch inputs are validated and the ref's provenance is established before
+# any credential is used, and no input is ever interpolated into shell or
+# JavaScript source text: values reach scripts only through `env:` and are read
+# at runtime.
+
+"on":
+  workflow_dispatch:
+    inputs:
+      prompt_lab_ref:
+        description: "Prompt Lab commit SHA to ground (exact 40-hex commit SHA)"
+        required: true
+        type: string
+      korvid_ref:
+        description: "Korvid commit SHA to check out (exact 40-hex commit SHA, proven authoritative before any credential)"
+        required: true
+        type: string
+        # The operation-journey harness the bridge imports is not on the Korvid
+        # default branch yet, so this pin is a commit of the open pull request
+        # that introduces it.  `src/korvid_prompt_lab/korvid_pin.py` is the
+        # reviewed declaration of this SHA, its provenance, and the bridge
+        # dependencies it must contain; `scripts/verify-korvid-pin.sh` re-proves
+        # both against the live GitHub API.
+        default: "fc7eece2adb66a5b2a18d378bdfd7503ddbdd2ca"
+      model:
+        description: "Ollama model tag to evaluate"
+        type: choice
+        options:
+          - "qwen3:0.6b"
+          - "qwen3:1.7b"
+          - "qwen3:4b"
+          - "qwen3:8b"
+          - "qwen3:14b"
+        default: "qwen3:1.7b"
+      round_type:
+        description: "Round type"
+        type: choice
+        options:
+          - "evaluate"
+          - "optimize-evaluate"
+        default: "evaluate"
+      candidate:
+        description: "Path to candidate YAML (relative to the Prompt Lab checkout)"
+        required: true
+        type: string
+        default: "examples/candidates/shipped-small.yaml"
+      campaign:
+        description: "Path to campaign YAML (relative to the Prompt Lab checkout)"
+        required: true
+        type: string
+        default: "examples/campaigns/aks-shared-runners.yaml"
+      train_case_id:
+        description: "Campaign case id forming the train split"
+        required: true
+        type: string
+        default: "aks-scale-deployment-up"
+      validation_case_id:
+        description: "Campaign case id forming the validation split (must differ from train)"
+        required: true
+        type: string
+        default: "aks-restart-denied"
+      milestone_case_ids:
+        description: "Comma-separated campaign case ids forming the milestone pack"
+        required: true
+        type: string
+        default: "aks-scale-deployment-up,aks-restart-denied"
+      max_metric_calls:
+        description: "GEPA metric-call budget for optimize-evaluate rounds"
+        required: true
+        type: number
+        default: 12
+      seed:
+        description: "GEPA search seed (non-negative integer)"
+        required: true
+        type: number
+        default: 0
+      pr_number:
+        description: "Pull request number for the sticky comment (leave blank to skip)"
+        required: false
+        type: number
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+concurrency:
+  group: aks-grounding-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  grounding:
+    name: Grounding round
+    runs-on: prompt-lab-runners
+    environment: aks-grounding
+    # Without this the job inherits the 360-minute default; behind a
+    # repository-wide `cancel-in-progress: false` group a hung round would hold a
+    # GPU node — and every later round — for six hours.
+    timeout-minutes: 180
+
+    env:
+      # One artifact root, derived once.  `artifacts/` is gitignored, so live
+      # evidence never lands in a tracked path, and every consumer below refers
+      # to this same safe-evidence directory.
+      GROUNDING_ARTIFACT_ROOT: ${{ github.workspace }}/prompt-lab/artifacts/grounding-round
+      GROUNDING_SAFE_EVIDENCE_DIR: ${{ github.workspace }}/prompt-lab/artifacts/grounding-round/safe-evidence
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Validate every dispatch input before any credential is used
+      # -----------------------------------------------------------------------
+      - name: Validate dispatch inputs
+        shell: bash
+        env:
+          WORKFLOW_REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PROMPT_LAB_REF: ${{ inputs.prompt_lab_ref }}
+          KORVID_REF: ${{ inputs.korvid_ref }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          CANDIDATE: ${{ inputs.candidate }}
+          CAMPAIGN: ${{ inputs.campaign }}
+          ROUND_TYPE: ${{ inputs.round_type }}
+          TRAIN_CASE_ID: ${{ inputs.train_case_id }}
+          VALIDATION_CASE_ID: ${{ inputs.validation_case_id }}
+          MILESTONE_CASE_IDS: ${{ inputs.milestone_case_ids }}
+          MAX_METRIC_CALLS: ${{ inputs.max_metric_calls }}
+          SEED: ${{ inputs.seed }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ "$WORKFLOW_REF_NAME" != "$DEFAULT_BRANCH" ]]; then
+            echo "::error::grounding rounds must be dispatched from the default branch"
+            exit 1
+          fi
+
+          if [[ ! "$PROMPT_LAB_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::prompt_lab_ref must be an exact 40-hex commit SHA, not a branch or tag"
+            exit 1
+          fi
+
+          if [[ ! "$KORVID_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::korvid_ref must be an exact 40-hex commit SHA, not a branch or tag"
+            exit 1
+          fi
+
+          if [[ -n "$PR_NUMBER" && ! "$PR_NUMBER" =~ ^[1-9][0-9]{0,9}$ ]]; then
+            echo "::error::pr_number must be a positive integer or blank"
+            exit 1
+          fi
+
+          if [[ ! "$CANDIDATE" =~ ^[A-Za-z0-9._/-]+$ ]] \
+            || [[ "$CANDIDATE" == /* ]] \
+            || [[ "$CANDIDATE" == *".."* ]]; then
+            echo "::error::candidate must be a relative path inside the Prompt Lab checkout"
+            exit 1
+          fi
+
+          if [[ ! "$CAMPAIGN" =~ ^[A-Za-z0-9._/-]+\.(yaml|yml)$ ]] \
+            || [[ "$CAMPAIGN" == /* ]] \
+            || [[ "$CAMPAIGN" == *".."* ]]; then
+            echo "::error::campaign must be a relative YAML path inside the Prompt Lab checkout"
+            exit 1
+          fi
+
+          case "$ROUND_TYPE" in
+            evaluate|optimize-evaluate) ;;
+            *) echo "::error::unsupported round type"; exit 1 ;;
+          esac
+
+          # Case ids reach the orchestrator as argv, so the vocabulary is closed:
+          # no whitespace, globs, option-looking values, or path traversal.  Each
+          # value is matched literally — never through eval or indirection.
+          case_id_pattern='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+          if [[ ! "$TRAIN_CASE_ID" =~ $case_id_pattern ]]; then
+            echo "::error::train_case_id must be a single case id matching $case_id_pattern"
+            exit 1
+          fi
+
+          if [[ ! "$VALIDATION_CASE_ID" =~ $case_id_pattern ]]; then
+            echo "::error::validation_case_id must be a single case id matching $case_id_pattern"
+            exit 1
+          fi
+
+          if [[ "$TRAIN_CASE_ID" == "$VALIDATION_CASE_ID" ]]; then
+            echo "::error::train and validation case ids must be disjoint"
+            exit 1
+          fi
+
+          if [[ ! "$MILESTONE_CASE_IDS" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(,[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]]; then
+            echo "::error::milestone_case_ids must be a comma-separated list of case ids"
+            exit 1
+          fi
+
+          if [[ ! "$MAX_METRIC_CALLS" =~ ^[1-9][0-9]{0,4}$ ]]; then
+            echo "::error::max_metric_calls must be a positive integer"
+            exit 1
+          fi
+
+          if [[ ! "$SEED" =~ ^[0-9]{1,9}$ ]]; then
+            echo "::error::seed must be a non-negative integer"
+            exit 1
+          fi
+
+      # -----------------------------------------------------------------------
+      # 2. Prove the requested Prompt Lab commit is trusted repository code
+      #
+      # A 40-hex SHA is a *shape*, not provenance: `actions/checkout` can fetch
+      # any commit this repository can reach, including the head of a fork pull
+      # request through `refs/pull/<n>/head`.  Checking such a commit out would
+      # execute unreviewed third-party code beside the Korvid app token and the
+      # Azure OIDC session, so provenance is proven here — before the first
+      # checkout and before any credential exists — using only the job's own
+      # read-only GITHUB_TOKEN.  Every value reaches the script through `env:`.
+      #
+      # Accepted: the head commit of a pull request whose head repository is
+      # this repository (a same-repository branch already requires write
+      # access), or a commit contained in the trusted default branch.
+      # Rejected: fork heads, a ref that is not the named pull request's head,
+      # and any commit that the default branch does not contain.
+      # -----------------------------------------------------------------------
+      - name: Verify the Prompt Lab commit is trusted
+        id: trust
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        env:
+          PROMPT_LAB_REF: ${{ inputs.prompt_lab_ref }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          KORVID_REF: ${{ inputs.korvid_ref }}
+          KORVID_REPO: ${{ github.repository_owner }}/korvid
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const ref = (process.env.PROMPT_LAB_REF || '').trim();
+            const rawPrNumber = (process.env.PR_NUMBER || '').trim();
+            const expectedRepository = (process.env.EXPECTED_REPOSITORY || '').trim();
+            const defaultBranch = (process.env.DEFAULT_BRANCH || '').trim();
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            if (!/^[0-9a-f]{40}$/.test(ref)) {
+              core.setFailed('prompt_lab_ref must be an exact 40-hex commit SHA, not a branch or tag');
+              return;
+            }
+            if (expectedRepository.toLowerCase() !== (owner + '/' + repo).toLowerCase()) {
+              core.setFailed('the workflow repository could not be established');
+              return;
+            }
+            if (!defaultBranch) {
+              core.setFailed('the repository default branch could not be established');
+              return;
+            }
+
+            if (rawPrNumber) {
+              if (!/^[1-9][0-9]{0,9}$/.test(rawPrNumber)) {
+                core.setFailed('pr_number must be a positive integer or blank');
+                return;
+              }
+              const prNumber = Number(rawPrNumber);
+
+              let pull;
+              try {
+                const response = await github.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: prNumber,
+                });
+                pull = response.data;
+              } catch (error) {
+                core.setFailed('pr_number ' + prNumber + ' is not a pull request in ' + expectedRepository);
+                return;
+              }
+
+              const head = (pull && pull.head) || {};
+              const headRepository = (head.repo && head.repo.full_name) || '';
+              if (headRepository.toLowerCase() !== expectedRepository.toLowerCase()) {
+                core.setFailed(
+                  'pull request ' + prNumber + ' has head repository ' +
+                  (headRepository || 'unknown') + '; only ' + expectedRepository +
+                  ' commits are grounded, so fork pull requests are refused'
+                );
+                return;
+              }
+              if (head.sha !== ref) {
+                core.setFailed(
+                  'prompt_lab_ref is not the head commit of pull request ' + prNumber
+                );
+                return;
+              }
+
+              core.info('prompt_lab_ref is the head of same-repository pull request ' + prNumber);
+            } else {
+              let comparison;
+              try {
+                const response = github.rest.repos.compareCommitsWithBasehead
+                  ? await github.rest.repos.compareCommitsWithBasehead({
+                      owner,
+                      repo,
+                      basehead: ref + '...' + defaultBranch,
+                    })
+                  : await github.rest.repos.compareCommits({
+                      owner,
+                      repo,
+                      base: ref,
+                      head: defaultBranch,
+                    });
+                comparison = response.data;
+              } catch (error) {
+                core.setFailed('prompt_lab_ref is not a commit in ' + expectedRepository);
+                return;
+              }
+
+              const status = (comparison && comparison.status) || '';
+              if (status !== 'identical' && status !== 'ahead') {
+                core.setFailed(
+                  'prompt_lab_ref is neither the tip of ' + defaultBranch +
+                  ' nor an ancestor of it (compare status: ' + (status || 'unknown') +
+                  '); supply pr_number to ground a same-repository pull request head'
+                );
+                return;
+              }
+
+              core.info('prompt_lab_ref is contained in ' + defaultBranch);
+            }
+
+            // ---------------------------------------------------------------
+            // Verify korvid_ref provenance against the authoritative Korvid
+            // repository using the same read-only job token, before any
+            // checkout, app token, or Azure session exists.
+            // ---------------------------------------------------------------
+            const korvidRef = (process.env.KORVID_REF || '').trim();
+            const korvidRepo = (process.env.KORVID_REPO || '').trim();
+
+            if (!/^[0-9a-f]{40}$/.test(korvidRef)) {
+              core.setFailed('korvid_ref must be an exact 40-hex commit SHA, not a branch or tag');
+              return;
+            }
+            if (!korvidRepo) {
+              core.setFailed('the Korvid repository could not be established');
+              return;
+            }
+
+            const korvidParts = korvidRepo.split('/');
+            const korvidOwner = korvidParts[0];
+            const korvidRepoName = korvidParts[1];
+            if (!korvidOwner || !korvidRepoName) {
+              core.setFailed('the Korvid repository identity is malformed: ' + korvidRepo);
+              return;
+            }
+
+            let korvidDefaultBranch;
+            try {
+              const repoResp = await github.rest.repos.get({ owner: korvidOwner, repo: korvidRepoName });
+              korvidDefaultBranch = (repoResp.data && repoResp.data.default_branch) || '';
+            } catch (error) {
+              core.setFailed('could not reach the authoritative Korvid repository ' + korvidRepo);
+              return;
+            }
+            if (!korvidDefaultBranch) {
+              core.setFailed('could not determine the default branch of ' + korvidRepo);
+              return;
+            }
+
+            let korvidComparison;
+            try {
+              const resp = github.rest.repos.compareCommitsWithBasehead
+                ? await github.rest.repos.compareCommitsWithBasehead({
+                    owner: korvidOwner,
+                    repo: korvidRepoName,
+                    basehead: korvidRef + '...' + korvidDefaultBranch,
+                  })
+                : await github.rest.repos.compareCommits({
+                    owner: korvidOwner,
+                    repo: korvidRepoName,
+                    base: korvidRef,
+                    head: korvidDefaultBranch,
+                  });
+              korvidComparison = resp.data;
+            } catch (error) {
+              korvidComparison = null;
+            }
+
+            const korvidStatus = (korvidComparison && korvidComparison.status) || '';
+            if (korvidStatus === 'identical' || korvidStatus === 'ahead') {
+              core.info('korvid_ref is contained in ' + korvidDefaultBranch + ' of ' + korvidRepo);
+            } else {
+              // The operation-journey harness Prompt Lab grounds against is not on the
+              // Korvid default branch yet, so default-branch containment alone would
+              // reject every runnable Korvid revision.  A commit still under review in
+              // the *authoritative* repository is therefore also accepted — but only
+              // when an OPEN pull request whose head repository is that same
+              // authoritative repository, and whose base is its default branch,
+              // contains it.  A same-repository branch already requires write access;
+              // fork heads, closed pull requests, and commits no such branch contains
+              // stay refused, and an unprovable ref still fails closed below.
+              let korvidPulls = [];
+              try {
+                const pullsResp = await github.rest.pulls.list({
+                  owner: korvidOwner,
+                  repo: korvidRepoName,
+                  state: 'open',
+                  base: korvidDefaultBranch,
+                  per_page: 100,
+                });
+                korvidPulls = (pullsResp && pullsResp.data) || [];
+              } catch (error) {
+                korvidPulls = [];
+              }
+
+              let vouchingPull = 0;
+              for (const pull of korvidPulls) {
+                const pullHead = (pull && pull.head) || {};
+                const pullBase = (pull && pull.base) || {};
+                const pullHeadRepository = (pullHead.repo && pullHead.repo.full_name) || '';
+                if (pullHeadRepository.toLowerCase() !== korvidRepo.toLowerCase()) {
+                  continue;
+                }
+                if (pullBase.ref !== korvidDefaultBranch) {
+                  continue;
+                }
+                const pullHeadSha = String(pullHead.sha || '');
+                if (!/^[0-9a-f]{40}$/.test(pullHeadSha)) {
+                  continue;
+                }
+
+                let pullComparison;
+                try {
+                  const resp = github.rest.repos.compareCommitsWithBasehead
+                    ? await github.rest.repos.compareCommitsWithBasehead({
+                        owner: korvidOwner,
+                        repo: korvidRepoName,
+                        basehead: korvidRef + '...' + pullHeadSha,
+                      })
+                    : await github.rest.repos.compareCommits({
+                        owner: korvidOwner,
+                        repo: korvidRepoName,
+                        base: korvidRef,
+                        head: pullHeadSha,
+                      });
+                  pullComparison = resp.data;
+                } catch (error) {
+                  continue;
+                }
+
+                const pullStatus = (pullComparison && pullComparison.status) || '';
+                if (pullStatus === 'identical' || pullStatus === 'ahead') {
+                  vouchingPull = pull.number;
+                  break;
+                }
+              }
+
+              if (!vouchingPull) {
+                core.setFailed(
+                  'korvid_ref is neither contained in ' + korvidDefaultBranch + ' of ' +
+                  korvidRepo + ' (compare status: ' + (korvidStatus || 'unknown') +
+                  ') nor contained in the head of an open ' + korvidRepo +
+                  ' pull request targeting ' + korvidDefaultBranch +
+                  '; fork pull requests, closed pull requests, unknown commits, and API' +
+                  ' failures are all refused'
+                );
+                return;
+              }
+
+              core.info(
+                'korvid_ref is contained in open same-repository pull request ' +
+                vouchingPull + ' of ' + korvidRepo + ' targeting ' + korvidDefaultBranch
+              );
+            }
+
+      # -----------------------------------------------------------------------
+      # 3. Check out the approved Prompt Lab commit (read-only GITHUB_TOKEN)
+      # -----------------------------------------------------------------------
+      - name: Checkout Prompt Lab
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          ref: ${{ inputs.prompt_lab_ref }}
+          path: prompt-lab
+          persist-credentials: false
+
+      # -----------------------------------------------------------------------
+      # 4. Obtain a Korvid app token downscoped to read-only contents
+      # -----------------------------------------------------------------------
+      - name: Get Korvid app token
+        id: korvid-token
+        uses: actions/create-github-app-token@df432ceedc7162793a195dd1713ff69aefc7379e  # v2.0.6
+        with:
+          app-id: ${{ vars.KORVID_APP_ID }}
+          private-key: ${{ secrets.KORVID_APP_PRIVATE_KEY }}
+          repositories: korvid
+          permission-contents: read
+
+      # -----------------------------------------------------------------------
+      # 5. Check out the pinned Korvid revision
+      # -----------------------------------------------------------------------
+      - name: Checkout Korvid at pinned ref
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: ${{ github.repository_owner }}/korvid
+          ref: ${{ inputs.korvid_ref }}
+          token: ${{ steps.korvid-token.outputs.token }}
+          path: korvid
+          persist-credentials: false
+
+      # -----------------------------------------------------------------------
+      # 6. Azure OIDC login (no client secret)
+      # -----------------------------------------------------------------------
+      - name: Azure login (OIDC)
+        uses: azure/login@a65d910e8af852a8061c627c456678983e180302  # v2.2.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # -----------------------------------------------------------------------
+      # 7. Python toolchain
+      # -----------------------------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc  # v6.4.3
+        with:
+          version: "latest"
+
+      # -----------------------------------------------------------------------
+      # 8. Install Prompt Lab into an environment outside both checkouts
+      # -----------------------------------------------------------------------
+      - name: Install Prompt Lab
+        working-directory: prompt-lab
+        shell: bash
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/prompt-lab-uv-env
+        run: |
+          set -Eeuo pipefail
+          uv venv --python 3.12 "$UV_PROJECT_ENVIRONMENT"
+          uv pip install --python "$UV_PROJECT_ENVIRONMENT/bin/python" .
+          test -x "$UV_PROJECT_ENVIRONMENT/bin/korvid-prompt-lab"
+          test -x "$UV_PROJECT_ENVIRONMENT/bin/korvid-grounding-report"
+          printf '%s\n' "$UV_PROJECT_ENVIRONMENT/bin" >> "$GITHUB_PATH"
+
+      # -----------------------------------------------------------------------
+      # 9. Provision the Korvid uv environment out of tree
+      #
+      # The bridge launches its worker with `uv run --project <korvid> --no-sync`,
+      # which needs a complete environment for that checkout.  The checkout stays
+      # read-only: the environment is built at an absolute path under the runner
+      # temp directory, the lockfile is never rewritten, and the step fails if
+      # provisioning modified a single tracked file.
+      # -----------------------------------------------------------------------
+      - name: Provision Korvid uv environment out of tree
+        working-directory: korvid
+        shell: bash
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/korvid-uv-env
+        run: |
+          set -Eeuo pipefail
+          uv sync --python 3.12 --frozen --dev --all-extras --no-editable
+          test -x "$UV_PROJECT_ENVIRONMENT/bin/python"
+          test ! -e .venv
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "::error::provisioning modified the read-only Korvid checkout"
+            git status --porcelain
+            exit 1
+          fi
+
+      # -----------------------------------------------------------------------
+      # 10. Verify required CLI tools before node-pool operations
+      # -----------------------------------------------------------------------
+      - name: Verify required CLI tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for tool in az kubectl kubelogin uv; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::required tool not found: $tool"
+              exit 1
+            fi
+          done
+
+      # -----------------------------------------------------------------------
+      # 11. Record the original modeleval node count
+      #
+      # Captured as a step output *before* anything can scale the pool, so the
+      # always() cleanup step at the end restores the exact original count even
+      # when the runner is cancelled, evicted, or hits the job timeout — none of
+      # which give the orchestrator's shell trap time to finish `nodepool scale`.
+      # -----------------------------------------------------------------------
+      - name: Record original modeleval node count
+        id: modeleval
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          count="$(az aks nodepool show \
+            --resource-group rg-pension-guard \
+            --cluster-name aks-shared-runners \
+            --name modeleval \
+            --query count \
+            --output tsv)"
+          case "$count" in
+            0|1) ;;
+            *) echo "::error::unexpected modeleval node count: $count"; exit 1 ;;
+          esac
+          echo "original modeleval node count: $count"
+          printf 'original-count=%s\n' "$count" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # 12. Run the grounding orchestrator
+      # -----------------------------------------------------------------------
+      - name: Run grounding round
+        working-directory: prompt-lab
+        shell: bash
+        timeout-minutes: 150
+        env:
+          GROUNDING_MODEL: ${{ inputs.model }}
+          GROUNDING_CANDIDATE: ${{ inputs.candidate }}
+          GROUNDING_CAMPAIGN: ${{ inputs.campaign }}
+          GROUNDING_ROUND_TYPE: ${{ inputs.round_type }}
+          GROUNDING_TRAIN_CASE_ID: ${{ inputs.train_case_id }}
+          GROUNDING_VALIDATION_CASE_ID: ${{ inputs.validation_case_id }}
+          GROUNDING_MILESTONE_CASE_IDS: ${{ inputs.milestone_case_ids }}
+          GROUNDING_MAX_METRIC_CALLS: ${{ inputs.max_metric_calls }}
+          GROUNDING_SEED: ${{ inputs.seed }}
+          # Reflection credentials exist only for optimize rounds; an
+          # evaluate-only round never materialises them.
+          GROUNDING_REFLECTION_MODEL: ${{ inputs.round_type == 'optimize-evaluate' && vars.GROUNDING_REFLECTION_MODEL || '' }}
+          GROUNDING_REFLECTION_CREDENTIAL: ${{ inputs.round_type == 'optimize-evaluate' && secrets.GROUNDING_REFLECTION_CREDENTIAL || '' }}
+          KORVID_SOURCE_ROOT: ${{ github.workspace }}/korvid
+          # The campaign resolves models/serving.namespace/serving.service/
+          # serving.model through `env:` references; without these three
+          # load_campaign() raises and every subcommand exits 2.
+          KORVID_AKS_MODEL: ${{ inputs.model }}
+          KORVID_AKS_NAMESPACE: ${{ vars.KORVID_AKS_NAMESPACE }}
+          KORVID_AKS_SERVICE: ${{ vars.KORVID_AKS_SERVICE }}
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/korvid-uv-env
+          PROMPT_LAB_REVISION: ${{ inputs.prompt_lab_ref }}
+          KORVID_REVISION: ${{ inputs.korvid_ref }}
+          WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash scripts/run-grounding-round.sh
+
+      # -----------------------------------------------------------------------
+      # 13. Append the safe round summary to the Job Summary
+      # -----------------------------------------------------------------------
+      - name: Append round summary to Job Summary
+        if: always() && hashFiles('prompt-lab/artifacts/grounding-round/safe-evidence/round-summary.md') != ''
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat "$GROUNDING_SAFE_EVIDENCE_DIR/round-summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      # -----------------------------------------------------------------------
+      # 14. Upload only the safe-evidence package (never raw live artifacts)
+      # -----------------------------------------------------------------------
+      - name: Upload safe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: safe-evidence
+          path: prompt-lab/artifacts/grounding-round/safe-evidence/
+          retention-days: 30
+          if-no-files-found: error
+
+      # -----------------------------------------------------------------------
+      # 15. Sticky PR comment (optional, only when pr_number is provided)
+      # -----------------------------------------------------------------------
+      - name: Update sticky PR comment
+        if: always() && inputs.pr_number != '' && hashFiles('prompt-lab/artifacts/grounding-round/safe-evidence/round-summary.md') != ''
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        env:
+          GROUNDING_MODEL: ${{ inputs.model }}
+          GROUNDING_CANDIDATE: ${{ inputs.candidate }}
+          GROUNDING_PR_NUMBER: ${{ inputs.pr_number }}
+          GROUNDING_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GROUNDING_SUMMARY_PATH: ${{ env.GROUNDING_SAFE_EVIDENCE_DIR }}/round-summary.md
+        with:
+          script: |
+            const fs = require('fs');
+
+            const model = process.env.GROUNDING_MODEL || '';
+            const candidate = process.env.GROUNDING_CANDIDATE || '';
+            const runUrl = process.env.GROUNDING_RUN_URL || '';
+            const summaryPath = process.env.GROUNDING_SUMMARY_PATH || '';
+            const rawPrNumber = (process.env.GROUNDING_PR_NUMBER || '').trim();
+
+            if (!/^[1-9][0-9]{0,9}$/.test(rawPrNumber)) {
+              core.setFailed('pr_number must be a positive integer');
+              return;
+            }
+            const prNumber = Number(rawPrNumber);
+
+            // Only a pull request in this repository may be commented on, so a
+            // dispatch can never point round evidence at an arbitrary issue.
+            try {
+              await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+            } catch (error) {
+              core.setFailed('pr_number ' + prNumber + ' is not a pull request in this repository');
+              return;
+            }
+
+            const marker = '<!-- korvid-grounding:' + model + ':' + candidate + ' -->';
+
+            let summaryBody = '';
+            if (summaryPath && fs.existsSync(summaryPath)) {
+              summaryBody = fs.readFileSync(summaryPath, 'utf8');
+            } else {
+              core.info('round-summary.md not found; skipping PR comment');
+              return;
+            }
+
+            const body = [
+              marker,
+              '',
+              summaryBody,
+              '',
+              '---',
+              '[View workflow run](' + runUrl + ')',
+            ].join('\n');
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+
+            const existing = comments.find((comment) => comment.body && comment.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body,
+              });
+            }
+
+      # -----------------------------------------------------------------------
+      # 16. Restore the recorded modeleval node count (design lifecycle step 12)
+      #
+      # The orchestrator's shell trap covers an orderly exit, but a cancelled or
+      # evicted runner SIGKILLs it about ten seconds in — far short of the
+      # minutes `nodepool scale` takes — so the pool would stay at one node.
+      # This step is idempotent: it only ever scales back to the recorded
+      # original count, never up, and leaves a pre-existing node untouched.  It
+      # runs last so summary, upload, and comment publish evidence first, and it
+      # carries no continue-on-error, so a failed cleanup stays visible.
+      # -----------------------------------------------------------------------
+      - name: Restore modeleval node count
+        if: always()
+        shell: bash
+        env:
+          ORIGINAL_NODE_COUNT: ${{ steps.modeleval.outputs.original-count }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "$ORIGINAL_NODE_COUNT" ]]; then
+            echo "modeleval count was never recorded (the round ended before Azure login); nothing to restore"
+            exit 0
+          fi
+
+          if [[ "$ORIGINAL_NODE_COUNT" != "0" ]]; then
+            echo "modeleval had $ORIGINAL_NODE_COUNT node(s) before this round; leaving it untouched"
+            exit 0
+          fi
+
+          current="$(az aks nodepool show \
+            --resource-group rg-pension-guard \
+            --cluster-name aks-shared-runners \
+            --name modeleval \
+            --query count \
+            --output tsv)"
+
+          if [[ "$current" == "0" ]]; then
+            echo "modeleval is already back at its original count of 0"
+            exit 0
+          fi
+
+          echo "restoring modeleval from $current to its original count of 0"
+          az aks nodepool scale \
+            --resource-group rg-pension-guard \
+            --cluster-name aks-shared-runners \
+            --name modeleval \
+            --node-count 0
