@@ -209,7 +209,7 @@ def test_grounding_workflow_has_protected_manual_arc_contract() -> None:
     )
 
     job = grounding_job(workflow)
-    assert job["runs-on"] == "korvid-runners"
+    assert job["runs-on"] == "prompt-lab-runners"
     assert job["environment"] == "aks-grounding"
     assert workflow["concurrency"]["cancel-in-progress"] is False
     assert workflow["permissions"] == {

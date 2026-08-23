@@ -83,3 +83,36 @@ def test_prompt_lab_runner_image_pins_required_tools_and_non_root_user() -> None
     assert "--kubelogin-version v0.2.19" in body
     assert "COPY --from=uv /uv /uvx /usr/local/bin/" in body
     assert body.rstrip().endswith("USER runner")
+
+
+# ---------------------------------------------------------------------------
+# Task 2: Grounding-round workflow routes to the Prompt Lab runner scale set
+# ---------------------------------------------------------------------------
+WORKFLOW = ROOT / ".github/workflows/grounding-round.yml"
+
+
+def test_grounding_workflow_routes_to_prompt_lab_runners() -> None:
+    """The grounding-round job must run on prompt-lab-runners, not korvid-runners."""
+    wf = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    runs_on = wf["jobs"]["grounding"]["runs-on"]
+    assert runs_on == "prompt-lab-runners", (
+        f"Expected 'prompt-lab-runners' but got {runs_on!r}. "
+        "Update .github/workflows/grounding-round.yml runs-on."
+    )
+
+
+def test_grounding_workflow_preserves_environment_and_concurrency() -> None:
+    """Environment and concurrency settings must be preserved after runner change."""
+    wf = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    assert wf["jobs"]["grounding"]["environment"] == "aks-grounding"
+    assert wf["jobs"]["grounding"]["timeout-minutes"] == 180
+    assert wf["concurrency"]["cancel-in-progress"] is False
+
+
+def test_grounding_workflow_preserves_permissions() -> None:
+    """Top-level permissions must remain unchanged."""
+    wf = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    perms = wf["permissions"]
+    assert perms["contents"] == "read"
+    assert perms["id-token"] == "write"
+    assert perms["pull-requests"] == "write"

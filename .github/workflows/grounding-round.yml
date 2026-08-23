@@ -104,7 +104,7 @@ concurrency:
 jobs:
   grounding:
     name: Grounding round
-    runs-on: korvid-runners
+    runs-on: prompt-lab-runners
     environment: aks-grounding
     # Without this the job inherits the 360-minute default; behind a
     # repository-wide `cancel-in-progress: false` group a hung round would hold a

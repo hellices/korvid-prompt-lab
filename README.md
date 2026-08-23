@@ -645,9 +645,29 @@ and are harder to scope to a single repository.
 
 #### ARC runner label
 
-The job runs on `runs-on: korvid-runners`. This is the existing Actions Runner
-Controller scale set in `aks-shared-runners`. No changes to the scale set
-are needed; the label must match the ARC `runnerGroupName` exactly.
+The grounding-round job runs on `runs-on: prompt-lab-runners`.  This is a
+**dedicated ARC scale set** declared in `infra/arc/prompt-lab-runners-values.yaml`,
+scoped exclusively to `hellices/korvid-prompt-lab` (GitHub repo-level binding via
+`githubConfigUrl`).  It lives on the same `aks-shared-runners` cluster as the
+existing `korvid-runners` scale set, but the two are fully separated:
+
+| Scale set | Repository scope | Node selector | Min / Max runners |
+|---|---|---|---|
+| `korvid-runners` | `hellices/korvid` | `workload=gha-runner` | — (managed externally) |
+| `prompt-lab-runners` | `hellices/korvid-prompt-lab` | `workload=gha-runner` | 0 / 1 |
+
+**Same-cluster, separate queues.**  Both scale sets share the `gha-runner` node
+pool but each has its own runner pod lifecycle and its own GitHub job queue.  A
+job dispatched to `prompt-lab-runners` will **never** land on a pod registered to
+`korvid-runners`, and vice versa.
+
+**Queued behaviour.**  `maxRunners: 1` means at most one grounding round runs at
+a time.  When a second dispatch arrives while a job is already running the ARC
+controller queues it until the first pod finishes and is reclaimed.  The
+`concurrency.cancel-in-progress: false` guard in the workflow ensures queued
+rounds are not silently dropped.  A hung round holds the single slot until its
+`timeout-minutes: 180` expires, so callers should expect up to a three-hour wait
+in the worst case.
 
 ### Dispatching a grounding round
 
