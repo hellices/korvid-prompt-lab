@@ -1143,6 +1143,39 @@ def test_reflection_credential_file_must_be_readable(access: AccessHarness) -> N
     assert run.calls == []
 
 
+def test_ollama_reflection_model_is_stored_without_a_credential(
+    access: AccessHarness,
+) -> None:
+    run = access.run(GROUNDING_REFLECTION_MODEL="ollama_chat/qwen3:14b")
+
+    assert_succeeded(run)
+    assert run.variable("GROUNDING_REFLECTION_MODEL") == "ollama_chat/qwen3:14b"
+    assert run.secret_names() == ["KORVID_APP_PRIVATE_KEY"]
+
+
+def test_ollama_reflection_rejects_an_unnecessary_credential_file(
+    access: AccessHarness,
+) -> None:
+    run = access.run(
+        GROUNDING_REFLECTION_MODEL="ollama_chat/qwen3:14b",
+        GROUNDING_REFLECTION_CREDENTIAL_FILE=str(access.reflection_file),
+    )
+
+    assert run.returncode != 0
+    assert "must not be set for Ollama reflection" in run.output
+    assert run.calls == []
+
+
+def test_hosted_reflection_model_without_a_credential_file_still_fails_closed(
+    access: AccessHarness,
+) -> None:
+    run = access.run(GROUNDING_REFLECTION_MODEL="openai/gpt-4.1-mini")
+
+    assert run.returncode != 0
+    assert "GROUNDING_REFLECTION_CREDENTIAL_FILE is required" in run.output
+    assert run.calls == []
+
+
 # ---------------------------------------------------------------------------
 # Task 4: install and verify the Prompt Lab runner scale set
 #

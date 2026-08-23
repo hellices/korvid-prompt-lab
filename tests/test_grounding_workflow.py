@@ -863,6 +863,9 @@ def test_grounding_workflow_scopes_reflection_credentials_to_optimize_rounds() -
     assert "secrets.GROUNDING_REFLECTION_CREDENTIAL" in credential_expr, (
         "the reflection credential must come from the protected Environment secrets"
     )
+    assert "startsWith(vars.GROUNDING_REFLECTION_MODEL, 'ollama/')" in credential_expr
+    assert "startsWith(vars.GROUNDING_REFLECTION_MODEL, 'ollama_chat/')" in credential_expr
+    assert credential_expr.count("!") >= 2
     for expr in (model_expr, credential_expr):
         assert "inputs.round_type == 'optimize-evaluate'" in expr, (
             "reflection credentials must not be materialised for evaluate-only rounds"
