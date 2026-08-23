@@ -612,9 +612,10 @@ the protected Environment with its variables and secrets:
 export KORVID_APP_ID=123456
 export KORVID_APP_PRIVATE_KEY_FILE=~/secrets/korvid-app.pem   # readable PEM file
 
-# optional, optimize-evaluate rounds only (both or neither)
+# optional: optimize-evaluate rounds with a hosted provider (both or neither)
 export GROUNDING_REFLECTION_MODEL='openai/gpt-4.1-mini'
 export GROUNDING_REFLECTION_CREDENTIAL_FILE=~/secrets/reflection.key
+# for ollama/ollama_chat providers, set only GROUNDING_REFLECTION_MODEL — no credential file
 
 scripts/configure-grounding-access.sh
 ```
@@ -629,8 +630,10 @@ never enabled.
 
 The script fails closed before touching the cloud when `KORVID_APP_ID` is
 missing, when a key file is unreadable or empty, or when only one half of the
-reflection pair is supplied; it fails before assigning anything when
-`az aks nodepool show` does not return the `modeleval` agent-pool resource id.
+hosted-provider reflection pair is supplied (the pair requirement does not
+apply to `ollama`/`ollama_chat` providers, which need no credential); it fails
+before assigning anything when `az aks nodepool show` does not return the
+`modeleval` agent-pool resource id.
 
 #### Environment
 
@@ -651,8 +654,9 @@ round cannot consume model compute without an explicit human approval.
 | `GROUNDING_REFLECTION_MODEL` | *(Environment-scoped, `aks-grounding` only)* LiteLLM model string for the reflection optimizer; absent for evaluate-only rounds |
 
 The first six are exactly what `scripts/configure-grounding-access.sh` sets on
-every run; `GROUNDING_REFLECTION_MODEL` is written only when the optional
-reflection pair is supplied.
+every run; `GROUNDING_REFLECTION_MODEL` is written only when a reflection model
+is supplied (hosted providers also require `GROUNDING_REFLECTION_CREDENTIAL`;
+`ollama`/`ollama_chat` providers require only the model variable).
 
 Variables are never printed by workflow steps. They reach scripts through
 `env:` references and are read at runtime.
@@ -662,7 +666,7 @@ Variables are never printed by workflow steps. They reach scripts through
 | Secret | Description |
 | --- | --- |
 | `KORVID_APP_PRIVATE_KEY` | RSA private key for the GitHub App (PEM, newlines intact) |
-| `GROUNDING_REFLECTION_CREDENTIAL` | *(Environment-scoped, `aks-grounding` only)* API key for the reflection model; present only for `optimize-evaluate` rounds |
+| `GROUNDING_REFLECTION_CREDENTIAL` | *(Environment-scoped, `aks-grounding` only)* API key for the reflection model; required for `optimize-evaluate` rounds with hosted providers (`openai/`, `anthropic/`, `gemini/`, etc.); **not set and not needed** when `GROUNDING_REFLECTION_MODEL` uses an `ollama` or `ollama_chat` prefix |
 
 Both secrets are written by streaming a readable file into `gh secret set` on
 stdin, so no key value is ever visible in a process listing or shell history.
@@ -883,8 +887,16 @@ the same environment.
 
 The workflow constructs the cluster-local base URL from the `KORVID_AKS_SERVICE`
 and `KORVID_AKS_NAMESPACE` environment variables — the same pair that identify
-the main evaluation service — so no additional networking configuration is
-needed when the reflection model runs in the same namespace.
+the main evaluation service — and passes it to LiteLLM as:
+
+```
+OLLAMA_API_BASE=http://<KORVID_AKS_SERVICE>.<KORVID_AKS_NAMESPACE>.svc.cluster.local:11434
+```
+
+No additional networking configuration is needed when the reflection model runs
+in the same namespace, and `OLLAMA_API_BASE` must **not** be persisted as a
+GitHub secret or variable — it is derived at runtime from the two variables
+already in scope.
 
 ### Trust boundary for `prompt_lab_ref`
 
