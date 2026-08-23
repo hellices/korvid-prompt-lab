@@ -777,17 +777,40 @@ them with `--from-file`, so no secret ever appears in `argv` or in the output.
 After the pinned `0.14.2` chart is installed it re-reads the
 `AutoscalingRunnerSet` and **fails** unless `githubConfigUrl`, `minRunners`,
 `maxRunners`, `serviceAccountName`, `automountServiceAccountToken`, the
-`workload=gha-runner` selector, and the runner container's
+`workload=gha-runner` selector, and the runner container's `image` and
 `runAsNonRoot`/`runAsUser`/`runAsGroup`/`allowPrivilegeEscalation` match the
 committed values exactly, and unless the runner template tolerates *neither*
-model-node taint.  It then waits for the listener pod in **`arc-systems`** — the
-ARC controller namespace where listeners actually run, not the runner
-namespace.
+model-node taint.  The runner container is selected by **name** (`runner`), not
+by index, so a sidecar the controller adds cannot shift the checks onto the
+wrong container, and its image must be exactly
+`acrpensionguard.azurecr.io/runner-base:prompt-lab-v1`.
+
+It then waits for the listener pod in **`arc-systems`** — the ARC controller
+namespace where listeners actually run, not the runner namespace — in **two
+bounded phases**, because `kubectl wait --for=condition=Ready` does not wait for
+a resource that does not exist yet and would exit immediately with `no matching
+resources found` on a fresh install:
+
+1. **Existence** — poll `kubectl get pods --selector` (the exact scale-set name
+   *and* namespace labels) until at least one listener pod appears.  If none is
+   created in time the install fails with *no `prompt-lab-runners` listener pod
+   was created … the ARC controller never claimed the scale set*, and the Ready
+   wait is never attempted.
+2. **Readiness** — `kubectl wait --for=condition=Ready` on the pod that now
+   exists.  A listener that starts but never turns Ready fails with a different
+   message: *… exists in `arc-systems` but did not become Ready within …*.
+
+Both phases are tunable for a slow cluster (whole seconds, validated before the
+script touches anything): `LISTENER_CREATE_TIMEOUT_SECONDS` (default `120`),
+`LISTENER_READY_TIMEOUT_SECONDS` (default `180`), and
+`LISTENER_POLL_INTERVAL_SECONDS` (default `5`, minimum `1`).  The private
+temporary directory is removed on either failure, exactly as on success.
 
 **The verifier** only reads, prints variable and secret *names* but never a
 value, and treats every `gh`, `az`, `kubectl`, and `helm` failure as fatal: a
 check that cannot run is a failed check.  On top of the scale-set assertions
-above it requires the release to be `deployed`, the `aks-grounding` Environment
+above — including the runner container's pinned image — it requires the release
+to be `deployed`, the `aks-grounding` Environment
 to exist with all six required variables and the `KORVID_APP_PRIVATE_KEY`
 secret (`GROUNDING_REFLECTION_CREDENTIAL` stays optional), the `modeleval` pool
 to be `Succeeded` with zero or one node, the Ollama deployment to still select

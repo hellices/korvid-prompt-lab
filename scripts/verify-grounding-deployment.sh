@@ -44,6 +44,9 @@ EXPECTED_SERVICE_ACCOUNT="prompt-lab-runners-no-permission"
 EXPECTED_NODE_SELECTOR="gha-runner"
 EXPECTED_RUN_AS_USER="1001"
 EXPECTED_RUN_AS_GROUP="1001"
+# The reviewed runner image.  Anything else means the live scale set would run
+# code that never went through the image review.
+EXPECTED_RUNNER_IMAGE="acrpensionguard.azurecr.io/runner-base:prompt-lab-v1"
 
 WORKFLOW_FILE="${REPO_ROOT}/.github/workflows/grounding-round.yml"
 SAFE_EVIDENCE_DIR="prompt-lab/artifacts/grounding-round/safe-evidence"
@@ -183,6 +186,7 @@ assert_container_field '.securityContext.runAsNonRoot' "true"
 assert_container_field '.securityContext.runAsUser' "${EXPECTED_RUN_AS_USER}"
 assert_container_field '.securityContext.runAsGroup' "${EXPECTED_RUN_AS_GROUP}"
 assert_container_field '.securityContext.allowPrivilegeEscalation' "false"
+assert_container_field '.image' "${EXPECTED_RUNNER_IMAGE}"
 
 # The runner must tolerate neither taint the model nodes carry.
 model_tolerations="$(runner_field '

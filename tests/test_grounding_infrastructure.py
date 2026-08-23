@@ -1132,6 +1132,8 @@ CHART_VERSION = "0.14.2"
 CHART_REFERENCE = "oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set"
 RUNNER_SECRET_NAME = "prompt-lab-runners-github-app"
 GITHUB_CONFIG_URL = "https://github.com/hellices/korvid-prompt-lab"
+#: The reviewed runner image.  Both scripts must pin exactly this reference.
+RUNNER_IMAGE = "acrpensionguard.azurecr.io/runner-base:prompt-lab-v1"
 
 MODEL_NODE_POOL = "modeleval"
 OLLAMA_NAMESPACE = "ollama"
@@ -1242,6 +1244,12 @@ RUNNER_SET_DRIFT = [
         True,
         "allowPrivilegeEscalation",
     ),
+    pytest.param(
+        "spec.template.spec.containers.0.image",
+        "acrpensionguard.azurecr.io/runner-base:latest",
+        RUNNER_IMAGE,
+        id="runner-image",
+    ),
 ]
 
 
@@ -1284,6 +1292,13 @@ def test_deployment_scripts_wait_for_the_listener_in_the_controller_namespace() 
     body = INSTALLER.read_text(encoding="utf-8")
     assert "arc-systems" in body
     assert "arc-runners-prompt-lab" in body
+
+
+def test_deployment_scripts_pin_the_reviewed_runner_image_literally() -> None:
+    """A release running an unreviewed image is the drift that matters most."""
+    for script in (INSTALLER, VERIFIER):
+        body = script.read_text(encoding="utf-8")
+        assert RUNNER_IMAGE in body, f"{script.name} does not pin the reviewed runner image"
 
 
 # ---------------------------------------------------------------------------
@@ -1391,6 +1406,31 @@ kubeconfig_mode="$(file_mode "${KUBECONFIG}")"
 grep -q 'kubelogin-converted' "${KUBECONFIG}" \
   || die "kubectl ran before kubelogin convert-kubeconfig"
 
+LISTENER_POD="pod/prompt-lab-runners-6f8b7c9d-listener"
+
+# The ARC controller creates the listener pod some time *after* the release is
+# installed.  ``listener-appear-after`` is how many more queries answer "no
+# resources"; each existence query consumes one.
+listener_pending() {
+  local pending=0
+  if [[ -f "${state}/listener-appear-after" ]]; then
+    pending="$(cat "${state}/listener-appear-after")"
+  fi
+  printf '%s' "$pending"
+}
+
+listener_exists() {
+  [[ "$(listener_pending)" -le 0 ]]
+}
+
+listener_consume_query() {
+  local pending
+  pending="$(listener_pending)"
+  if (( pending > 0 )); then
+    printf '%s' "$(( pending - 1 ))" >"${state}/listener-appear-after"
+  fi
+}
+
 namespace="$(opt_value --namespace "$@")"
 if [[ -z "$namespace" ]]; then namespace="$(opt_value -n "$@")"; fi
 output="$(opt_value --output "$@")"
@@ -1432,6 +1472,24 @@ case "$p0" in
   get)
     record "" "$@"
     case "$p1" in
+      pod|pods|po)
+        [[ "$namespace" == "arc-systems" ]] \
+          || die "listener pods listed in namespace '${namespace}': ARC listeners run in arc-systems"
+        [[ "$selector" == *"actions.github.com/scale-set-name=prompt-lab-runners"* ]] \
+          || die "listener query without the scale-set-name selector: '${selector}'"
+        [[ "$selector" == *"actions.github.com/scale-set-namespace=arc-runners-prompt-lab"* ]] \
+          || die "listener query without the scale-set-namespace selector: '${selector}'"
+        [[ "$output" == "name" ]] \
+          || die "unsupported output for a listener existence query: '${output}'"
+        fail_if_requested "kubectl-listener-get"
+        if listener_exists; then
+          printf '%s\n' "${LISTENER_POD}"
+        else
+          listener_consume_query
+          printf 'No resources found in arc-systems namespace.\n' >&2
+        fi
+        exit 0
+        ;;
       autoscalingrunnersets.actions.github.com|autoscalingrunnerset)
         [[ "$namespace" == "arc-runners-prompt-lab" ]] \
           || die "AutoscalingRunnerSet read from namespace '${namespace}'"
@@ -1525,8 +1583,19 @@ case "$p0" in
       || die "listener wait without the scale-set-namespace selector: '${selector}'"
     [[ "$*" == *"--for=condition=Ready"* ]] || die "listener wait without a Ready condition"
     [[ "$*" == *"--timeout="* ]] || die "listener wait without a timeout"
+    # Real kubectl does not wait for a resource that does not exist yet: a
+    # condition wait whose selector matches nothing exits 1 immediately.
+    if ! listener_exists; then
+      listener_consume_query
+      printf 'error: no matching resources found\n' >&2
+      exit 1
+    fi
     fail_if_requested "listener-wait"
-    printf 'pod/prompt-lab-runners-6f8b-listener condition met\n'
+    if [[ -f "${state}/listener-never-ready" ]]; then
+      printf 'error: timed out waiting for the condition on pods/prompt-lab-runners-6f8b7c9d-listener\n' >&2
+      exit 1
+    fi
+    printf '%s condition met\n' "${LISTENER_POD}"
     ;;
   *)
     record "" "$@"
@@ -1676,6 +1745,14 @@ class DeployRun(AccessRun):
     def tools(self) -> list[str]:
         return [call["tool"] for call in self.calls]
 
+    def call_positions(self, tool: str, *tokens: str) -> list[int]:
+        """Indices of the matching calls inside this run's ordered call log."""
+        return [
+            index
+            for index, call in enumerate(self.calls)
+            if call["tool"] == tool and all(token in call["argv"] for token in tokens)
+        ]
+
     def stdin_text(self, call: dict[str, Any]) -> str:
         path = call.get("stdin") or ""
         assert path, f"call carried no stdin: {call['argv']}"
@@ -1731,6 +1808,7 @@ class DeployHarness:
         self.set_environment_secrets(["KORVID_APP_PRIVATE_KEY"])
         self.set_node_pool(count=0, provisioning_state="Succeeded")
         self.set_release_status("deployed")
+        self.set_listener()
 
     # -- state seeding ----------------------------------------------------
     @property
@@ -1775,6 +1853,20 @@ class DeployHarness:
 
     def set_release_status(self, status: str) -> None:
         (self.state / "release-status").write_text(status, encoding="utf-8")
+
+    def set_listener(self, *, appear_after: int = 0, never_ready: bool = False) -> None:
+        """Model the listener lifecycle the ARC controller drives.
+
+        ``appear_after`` is how many listener queries answer "no resources"
+        before the pod exists, so ``appear_after=2`` is a fresh install where
+        the controller has not created the listener yet.
+        """
+        (self.state / "listener-appear-after").write_text(str(appear_after), encoding="utf-8")
+        marker = self.state / "listener-never-ready"
+        if never_ready:
+            marker.write_text("", encoding="utf-8")
+        elif marker.exists():
+            marker.unlink()
 
     def fail(self, key: str) -> None:
         (self.state / f"fail-{key}").write_text("", encoding="utf-8")
@@ -2001,6 +2093,134 @@ def test_installer_fails_when_the_listener_never_becomes_ready(deploy: DeployHar
     assert "listener" in run.output
 
 
+def test_installer_waits_for_the_listener_to_be_created_before_waiting_for_ready(
+    deploy: DeployHarness,
+) -> None:
+    """A fresh install has no listener pod when helm returns.
+
+    ``kubectl wait --for=condition=Ready`` does not wait for a resource that
+    does not exist yet: a selector matching nothing exits 1 immediately with
+    "no matching resources found".  The install must therefore wait for the
+    listener to appear first, then wait for it to become Ready.
+    """
+    deploy.set_listener(appear_after=2)
+
+    run = deploy.install(
+        LISTENER_CREATE_TIMEOUT_SECONDS="30",
+        LISTENER_POLL_INTERVAL_SECONDS="1",
+    )
+    assert_succeeded(run)
+
+    existence = run.call_positions("kubectl", "get", "pods")
+    assert len(existence) >= 3, "the installer gave up before the listener could appear"
+    ready = run.call_positions("kubectl", "wait")
+    assert len(ready) == 1
+    assert max(existence) < ready[0], "the Ready wait ran before the listener existed"
+
+    for call in run.calls_with("kubectl", "get", "pods"):
+        argv = call["argv"]
+        assert argv[argv.index("--namespace") + 1] == ARC_CONTROLLER_NAMESPACE
+        selector = argv[argv.index("--selector") + 1]
+        assert f"actions.github.com/scale-set-name={RELEASE_NAME}" in selector
+        assert f"actions.github.com/scale-set-namespace={RUNNER_NAMESPACE}" in selector
+
+    assert "listener" in run.output
+
+
+def test_installer_reports_a_listener_that_is_never_created(deploy: DeployHarness) -> None:
+    """Never-created is a different failure from created-but-not-Ready."""
+    deploy.set_listener(appear_after=10_000)
+
+    run = deploy.install(
+        LISTENER_CREATE_TIMEOUT_SECONDS="2",
+        LISTENER_POLL_INTERVAL_SECONDS="1",
+    )
+    assert run.returncode != 0
+    assert f"no {RELEASE_NAME} listener pod was created" in run.output
+    assert "did not become Ready" not in run.output
+    assert run.calls_with("kubectl", "wait") == [], (
+        "the installer waited on a Ready condition for a pod that never existed"
+    )
+    assert len(run.calls_with("kubectl", "get", "pods")) >= 2, "the existence wait was not bounded"
+    assert list(deploy.tmpdir.iterdir()) == []
+    assert deploy.operator_kubeconfig.read_text(encoding="utf-8") == OPERATOR_KUBECONFIG_MARKER
+
+
+def test_installer_distinguishes_a_listener_that_is_created_but_never_ready(
+    deploy: DeployHarness,
+) -> None:
+    deploy.set_listener(appear_after=1, never_ready=True)
+
+    run = deploy.install(
+        LISTENER_CREATE_TIMEOUT_SECONDS="30",
+        LISTENER_POLL_INTERVAL_SECONDS="1",
+    )
+    assert run.returncode != 0
+    assert "did not become Ready" in run.output
+    assert "was created" not in run.output, "a not-Ready listener was reported as never created"
+    assert len(run.calls_with("kubectl", "wait")) == 1
+    assert list(deploy.tmpdir.iterdir()) == []
+    assert deploy.operator_kubeconfig.read_text(encoding="utf-8") == OPERATOR_KUBECONFIG_MARKER
+
+
+def test_installer_rejects_a_listener_timeout_that_is_not_a_number(
+    deploy: DeployHarness,
+) -> None:
+    """A typo'd bound must be named, not silently arithmetic-evaluated to 0."""
+    run = deploy.install(LISTENER_CREATE_TIMEOUT_SECONDS="two minutes")
+    assert run.returncode != 0
+    assert "LISTENER_CREATE_TIMEOUT_SECONDS" in run.output
+    assert run.calls == [], "the installer called out before validating its bounds"
+
+
+def test_installer_rejects_a_zero_listener_poll_interval(deploy: DeployHarness) -> None:
+    """A zero interval would hammer the API server for the whole create timeout."""
+    run = deploy.install(LISTENER_POLL_INTERVAL_SECONDS="0")
+    assert run.returncode != 0
+    assert "LISTENER_POLL_INTERVAL_SECONDS" in run.output
+    assert run.calls == []
+
+
+def test_a_ready_wait_without_a_listener_pod_fails_like_real_kubectl(
+    deploy: DeployHarness,
+) -> None:
+    """Guard: the fresh-install tests above are not vacuous."""
+    assert _JQ is not None
+    deploy.set_listener(appear_after=1)
+    kubeconfig = deploy.root / "ready-guard-kubeconfig"
+    kubeconfig.write_text("kubelogin-converted: azurecli\n", encoding="utf-8")
+    kubeconfig.chmod(0o600)
+    process = subprocess.run(
+        [
+            "bash",
+            str(deploy.bin / "kubectl"),
+            "--namespace",
+            ARC_CONTROLLER_NAMESPACE,
+            "wait",
+            "pod",
+            "--selector",
+            (
+                f"actions.github.com/scale-set-name={RELEASE_NAME},"
+                f"actions.github.com/scale-set-namespace={RUNNER_NAMESPACE}"
+            ),
+            "--for=condition=Ready",
+            "--timeout=180s",
+        ],
+        env={
+            "PATH": f"{deploy.bin}:{Path(_JQ).parent}:{_SYSTEM_PATH}",
+            "HOME": str(deploy.home),
+            "KUBECONFIG": str(kubeconfig),
+            "FAKE_STATE_DIR": str(deploy.state),
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert process.returncode != 0
+    assert "no matching resources found" in process.stderr
+
+
 def test_a_listener_wait_outside_the_controller_namespace_is_rejected(
     deploy: DeployHarness,
 ) -> None:
@@ -2222,6 +2442,41 @@ def test_deployment_scripts_require_a_container_named_runner(deploy: DeployHarne
     verify = deploy.verify()
     assert verify.returncode != 0
     assert "no container named 'runner'" in verify.output
+
+
+def test_deployment_scripts_read_the_runner_image_by_name_not_by_index(
+    deploy: DeployHarness,
+) -> None:
+    """A container the controller prepends must not shift the image check."""
+    document = deploy.runner_set
+    containers = document["spec"]["template"]["spec"]["containers"]
+    assert containers[0]["name"] == "runner"
+    containers.insert(0, {"name": "init-dind", "image": "docker:27-dind"})
+    deploy.set_runner_set(document)
+
+    assert_succeeded(deploy.install())
+    assert_succeeded(deploy.verify())
+
+
+def test_deployment_scripts_reject_a_runner_container_on_an_unreviewed_image(
+    deploy: DeployHarness,
+) -> None:
+    """Even at the right index, a drifted image must fail both scripts."""
+    document = deploy.runner_set
+    containers = document["spec"]["template"]["spec"]["containers"]
+    containers.insert(0, {"name": "init-dind", "image": RUNNER_IMAGE})
+    containers[1]["image"] = "acrpensionguard.azurecr.io/runner-base:v1"
+    deploy.set_runner_set(document)
+
+    install = deploy.install()
+    assert install.returncode != 0
+    assert RUNNER_IMAGE in install.output
+    assert "image" in install.output
+
+    verify = deploy.verify()
+    assert verify.returncode != 0
+    assert RUNNER_IMAGE in verify.output
+    assert "image" in verify.output
 
 
 def test_verifier_pins_the_live_ollama_node_selector(deploy: DeployHarness) -> None:

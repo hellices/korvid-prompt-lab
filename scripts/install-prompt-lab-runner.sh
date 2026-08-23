@@ -21,6 +21,13 @@
 #   ARC_GITHUB_APP_INSTALLATION_ID    GitHub App installation id
 #   ARC_GITHUB_APP_PRIVATE_KEY_FILE   path to a readable PEM private key file
 #
+# Optional environment (bounds on the listener wait, seconds):
+#   LISTENER_CREATE_TIMEOUT_SECONDS   how long the listener pod may take to be
+#                                     created by the controller   (default 120)
+#   LISTENER_READY_TIMEOUT_SECONDS    how long it may take to turn Ready once it
+#                                     exists                      (default 180)
+#   LISTENER_POLL_INTERVAL_SECONDS    existence poll interval      (default 5)
+#
 # Usage:  scripts/install-prompt-lab-runner.sh
 
 set -Eeuo pipefail
@@ -48,7 +55,16 @@ EXPECTED_SERVICE_ACCOUNT="prompt-lab-runners-no-permission"
 EXPECTED_NODE_SELECTOR="gha-runner"
 EXPECTED_RUN_AS_USER="1001"
 EXPECTED_RUN_AS_GROUP="1001"
-LISTENER_TIMEOUT="180s"
+# The reviewed runner image.  A release running anything else has not been
+# through the image review, so the install fails rather than registers it.
+EXPECTED_RUNNER_IMAGE="acrpensionguard.azurecr.io/runner-base:prompt-lab-v1"
+
+# The listener wait is two-phase and each phase is bounded separately, so a
+# controller that never claims the scale set is reported differently from a
+# listener that starts but never turns Ready.
+LISTENER_CREATE_TIMEOUT_SECONDS="${LISTENER_CREATE_TIMEOUT_SECONDS:-120}"
+LISTENER_READY_TIMEOUT_SECONDS="${LISTENER_READY_TIMEOUT_SECONDS:-180}"
+LISTENER_POLL_INTERVAL_SECONDS="${LISTENER_POLL_INTERVAL_SECONDS:-5}"
 
 VALUES_FILE="${REPO_ROOT}/infra/arc/prompt-lab-runners-values.yaml"
 SA_MANIFEST="${REPO_ROOT}/infra/arc/prompt-lab-runner-service-account.yaml"
@@ -74,8 +90,21 @@ require_command() {
   done
 }
 
+require_seconds() {
+  local name="$1" value="$2"
+  [[ "${value}" =~ ^[0-9]+$ ]] \
+    || die "${name} must be a whole number of seconds, got '${value}'"
+}
+
 # ── Preflight: nothing is mutated before this block completes ─────────────
 require_command az helm jq kubectl kubelogin
+
+require_seconds LISTENER_CREATE_TIMEOUT_SECONDS "${LISTENER_CREATE_TIMEOUT_SECONDS}"
+require_seconds LISTENER_READY_TIMEOUT_SECONDS "${LISTENER_READY_TIMEOUT_SECONDS}"
+require_seconds LISTENER_POLL_INTERVAL_SECONDS "${LISTENER_POLL_INTERVAL_SECONDS}"
+# A zero interval would hammer the API server for the whole create timeout.
+(( LISTENER_POLL_INTERVAL_SECONDS >= 1 )) \
+  || die "LISTENER_POLL_INTERVAL_SECONDS must be at least 1 second"
 
 : "${ARC_GITHUB_APP_ID:?ARC_GITHUB_APP_ID is required}"
 : "${ARC_GITHUB_APP_INSTALLATION_ID:?ARC_GITHUB_APP_INSTALLATION_ID is required}"
@@ -222,6 +251,7 @@ assert_container_field '.securityContext.runAsNonRoot' "true"
 assert_container_field '.securityContext.runAsUser' "${EXPECTED_RUN_AS_USER}"
 assert_container_field '.securityContext.runAsGroup' "${EXPECTED_RUN_AS_GROUP}"
 assert_container_field '.securityContext.allowPrivilegeEscalation' "false"
+assert_container_field '.image' "${EXPECTED_RUNNER_IMAGE}"
 
 # Runners must tolerate neither taint the model nodes carry, or a grounding
 # round could land its runner pod on the GPU node it is meant to drive.
@@ -238,11 +268,43 @@ ok "runner template tolerates no model-node taint"
 # ── Listener readiness in the ARC controller namespace ────────────────────
 section "Listener"
 
+LISTENER_SELECTOR="actions.github.com/scale-set-name=${RELEASE_NAME},actions.github.com/scale-set-namespace=${RUNNER_NAMESPACE}"
+
+# Phase 1 — existence.  `kubectl wait --for=condition=Ready` does not wait for
+# a resource that does not exist yet: a selector matching nothing exits
+# immediately with "no matching resources found".  On a fresh install the ARC
+# controller has not created the listener pod when helm returns, so waiting on
+# Ready first would fail seconds after a perfectly good install.
+listener_pods=""
+listener_created=false
+listener_deadline=$(( SECONDS + LISTENER_CREATE_TIMEOUT_SECONDS ))
+while true; do
+  if ! listener_pods="$(kubectl --namespace "${CONTROLLER_NAMESPACE}" get pods \
+    --selector "${LISTENER_SELECTOR}" \
+    --output name)"; then
+    die "cannot list listener pods in ${CONTROLLER_NAMESPACE}"
+  fi
+  if [[ -n "${listener_pods}" ]]; then
+    listener_created=true
+    break
+  fi
+  if (( SECONDS >= listener_deadline )); then
+    break
+  fi
+  sleep "${LISTENER_POLL_INTERVAL_SECONDS}"
+done
+
+[[ "${listener_created}" == true ]] \
+  || die "no ${RELEASE_NAME} listener pod was created in ${CONTROLLER_NAMESPACE} within ${LISTENER_CREATE_TIMEOUT_SECONDS}s: the ARC controller never claimed the scale set"
+ok "listener pod exists in ${CONTROLLER_NAMESPACE}: $(printf '%s' "${listener_pods}" | tr '\n' ' ')"
+
+# Phase 2 — readiness of the pod that now exists.  Only a genuine readiness
+# problem can be reported here, because the selector already matches.
 kubectl --namespace "${CONTROLLER_NAMESPACE}" wait pod \
-  --selector "actions.github.com/scale-set-name=${RELEASE_NAME},actions.github.com/scale-set-namespace=${RUNNER_NAMESPACE}" \
+  --selector "${LISTENER_SELECTOR}" \
   --for=condition=Ready \
-  --timeout="${LISTENER_TIMEOUT}" \
-  || die "the ${RELEASE_NAME} listener is not Ready in ${CONTROLLER_NAMESPACE}"
+  --timeout="${LISTENER_READY_TIMEOUT_SECONDS}s" \
+  || die "the ${RELEASE_NAME} listener pod exists in ${CONTROLLER_NAMESPACE} but did not become Ready within ${LISTENER_READY_TIMEOUT_SECONDS}s"
 ok "listener Ready in ${CONTROLLER_NAMESPACE}"
 
 printf '\ninstall-prompt-lab-runner: done ✓\n'

@@ -288,3 +288,185 @@ git diff --check
 4. **`configure-grounding-access.sh` uses a bare `mktemp -d`.** That is Task 3's
    code and out of scope here, but it inherits the BSD/macOS `TMPDIR` behaviour
    fixed in these two scripts.
+
+---
+
+# Same-AKS Task 4 — Final-Review Fixes (2026-08-23)
+
+**Branch:** `feat/prompt-lab-mvp`
+**Scope:** the two findings the final review raised against `d146273`.
+
+## Finding 1 — the listener wait could not survive a fresh install
+
+`kubectl wait --for=condition=Ready` does **not** wait for a resource that does
+not exist yet.  When its selector matches nothing it exits `1` immediately with
+`error: no matching resources found`.  On a fresh install the ARC controller has
+not created the listener pod when `helm ... --wait` returns, so the single-phase
+wait failed a perfectly good install seconds after the release was deployed —
+and reported it as "the listener is not Ready", which points the operator at the
+wrong problem.
+
+### Repair
+
+`scripts/install-prompt-lab-runner.sh` now waits in **two separately bounded
+phases**, both against the ARC controller namespace `arc-systems` and both using
+the exact scale-set selector
+`actions.github.com/scale-set-name=prompt-lab-runners,actions.github.com/scale-set-namespace=arc-runners-prompt-lab`:
+
+| Phase | Command | Bound | Failure |
+|---|---|---|---|
+| 1. existence | `kubectl --namespace arc-systems get pods --selector <both labels> --output name`, polled | `LISTENER_CREATE_TIMEOUT_SECONDS` (120) every `LISTENER_POLL_INTERVAL_SECONDS` (5) | `no prompt-lab-runners listener pod was created in arc-systems within Ns: the ARC controller never claimed the scale set` — the Ready wait is never attempted |
+| 2. readiness | `kubectl --namespace arc-systems wait pod --selector <both labels> --for=condition=Ready --timeout=Ns` | `LISTENER_READY_TIMEOUT_SECONDS` (180) | `the prompt-lab-runners listener pod exists in arc-systems but did not become Ready within Ns` |
+
+Explicit bounded polling was chosen over `kubectl wait --for=create`: `--for=create`
+needs kubectl ≥ 1.31 on the *operator's* workstation (the pinned 1.35.6 kubectl
+lives in the runner image, not on the workstation), and an older client answers
+`unrecognized condition: create` — a worse message than the two above.  All three
+bounds are validated as whole seconds before anything is touched
+(`LISTENER_POLL_INTERVAL_SECONDS` must be ≥ 1), so a typo is named rather than
+arithmetic-evaluated to `0`.  `trap cleanup EXIT` is untouched: the private
+temporary directory is removed and `~/.kube/config` is left byte-identical on
+both new failure paths, and both are asserted.
+
+## Finding 2 — neither script asserted the live runner container image
+
+The installer and the verifier read the live `AutoscalingRunnerSet` and compared
+ten fields, but never `.image`.  A release hand-edited (or rolled back) onto an
+unreviewed image passed both scripts.
+
+### Repair
+
+Both scripts now assert
+`.image == acrpensionguard.azurecr.io/runner-base:prompt-lab-v1` on the container
+**selected by name** (`select(.name == "runner") | first`), never by index — so a
+sidecar the controller prepends cannot shift the check onto the wrong container.
+
+## RED
+
+The fake `kubectl` gained a listener lifecycle: `listener-appear-after` counts how
+many queries answer "no resources" before the pod exists, `listener-never-ready`
+makes the Ready wait time out, and — the point of the exercise — the fake's
+`wait --for=condition=Ready` now fails with `error: no matching resources found`
+when no pod matches, exactly as real kubectl does.
+
+```bash
+uv run --python 3.12 pytest -q tests/test_grounding_infrastructure.py \
+  -k "listener or runner_image or image_by_name or unreviewed_image or reviewed_runner_image or container_named_runner or drift"
+```
+
+```
+7 failed, 30 passed, 95 deselected in 38.17s
+
+FAILED test_installer_waits_for_the_listener_to_be_created_before_waiting_for_ready
+  stderr: error: no matching resources found
+          install-prompt-lab-runner: the prompt-lab-runners listener is not Ready in arc-systems
+FAILED test_installer_reports_a_listener_that_is_never_created
+FAILED test_installer_distinguishes_a_listener_that_is_created_but_never_ready
+FAILED test_deployment_scripts_pin_the_reviewed_runner_image_literally
+FAILED test_installer_fails_when_the_installed_scale_set_drifts[runner-image]
+FAILED test_verifier_fails_when_the_scale_set_drifts[runner-image]
+FAILED test_deployment_scripts_reject_a_runner_container_on_an_unreviewed_image
+```
+
+The bound validation was driven the same way — the guard block was removed, the
+two tests observed RED, then restored:
+
+```bash
+uv run --python 3.12 pytest -q tests/test_grounding_infrastructure.py \
+  -k "listener_timeout_that_is_not_a_number or zero_listener_poll_interval"
+```
+
+```
+2 failed, 132 deselected in 3.59s
+FAILED test_installer_rejects_a_listener_timeout_that_is_not_a_number
+FAILED test_installer_rejects_a_zero_listener_poll_interval
+```
+
+## GREEN
+
+```bash
+uv run --python 3.12 pytest -q tests/test_grounding_infrastructure.py \
+  -k "listener or runner_image or image_by_name or unreviewed_image or reviewed_runner_image or container_named_runner or drift"
+```
+
+```
+37 passed, 95 deselected in 44.51s
+```
+
+```bash
+uv run --python 3.12 pytest -q tests/test_grounding_infrastructure.py
+```
+
+```
+134 passed in 124.17s (0:02:04)     # was 123
+```
+
+## Full verification
+
+```bash
+KORVID_SOURCE_ROOT=/Users/hwang-inhwan/workspace/kube uv run --python 3.12 pytest -q
+```
+
+```
+667 passed, 6 skipped in 214.66s (0:03:34)
+```
+
+```bash
+uv run --python 3.12 ruff check .
+uv run --python 3.12 mypy --python-version 3.12 src tests
+bash -n scripts/install-prompt-lab-runner.sh scripts/verify-grounding-deployment.sh
+uv run --python 3.12 python -c "import yaml; ..."   # values, service account, workflow
+git diff --check
+```
+
+```
+All checks passed!
+Success: no issues found in 36 source files
+(no output — both scripts parse cleanly)
+infra/arc/prompt-lab-runners-values.yaml OK
+infra/arc/prompt-lab-runner-service-account.yaml OK
+.github/workflows/grounding-round.yml OK
+(no output — no whitespace errors)
+```
+
+## Behaviour the eleven new tests pin
+
+| Property | Test |
+|---|---|
+| A listener absent for the first queries, then created, then Ready, installs cleanly; every existence query carries both scale-set labels in `arc-systems` and all of them precede the single Ready wait | `test_installer_waits_for_the_listener_to_be_created_before_waiting_for_ready` |
+| A listener that is never created fails with *no … listener pod was created*, never reaches the Ready wait, polls more than once, and still cleans up | `test_installer_reports_a_listener_that_is_never_created` |
+| A listener that exists but never turns Ready fails with *did not become Ready*, not with the never-created message | `test_installer_distinguishes_a_listener_that_is_created_but_never_ready` |
+| The fake models real kubectl: a Ready wait with no matching pod exits non-zero with `no matching resources found` | `test_a_ready_wait_without_a_listener_pod_fails_like_real_kubectl` |
+| A non-numeric bound, or a zero poll interval, is refused before the first cloud call | `test_installer_rejects_a_listener_timeout_that_is_not_a_number`, `test_installer_rejects_a_zero_listener_poll_interval` |
+| A drifted runner image fails **both** scripts | `test_installer_fails_when_the_installed_scale_set_drifts[runner-image]`, `test_verifier_fails_when_the_scale_set_drifts[runner-image]` |
+| A container prepended before `runner` neither breaks the image check nor lets a drifted runner image pass | `test_deployment_scripts_read_the_runner_image_by_name_not_by_index`, `test_deployment_scripts_reject_a_runner_container_on_an_unreviewed_image` |
+| Both scripts pin `runner-base:prompt-lab-v1` literally, so the reference cannot drift behind a variable | `test_deployment_scripts_pin_the_reviewed_runner_image_literally` |
+
+## Operator-visible changes
+
+- Three new optional environment knobs on the installer, documented in the
+  script header and in README §"Installing and verifying the runner scale set":
+  `LISTENER_CREATE_TIMEOUT_SECONDS` (120), `LISTENER_READY_TIMEOUT_SECONDS`
+  (180), `LISTENER_POLL_INTERVAL_SECONDS` (5, minimum 1).
+- Two distinct listener failure messages replace the single
+  "listener is not Ready".
+- Both scripts now fail on a runner image other than
+  `acrpensionguard.azurecr.io/runner-base:prompt-lab-v1`.
+
+## Concerns
+
+1. **Still no live run.**  Everything is proven against the fakes; nothing was
+   deployed or pushed.
+2. **The image is pinned by tag, not by digest.**  `prompt-lab-v1` can be
+   re-pushed in ACR, and neither script would notice.  Pinning
+   `sha256:5c8105400a9f6035a8fb7f7a06e6f81277af45584a148a0af6437bef259bae56`
+   would close that, but the committed values file uses the tag, so the two
+   would have to move together.
+3. **Only the `AutoscalingRunnerSet` template is checked.**  A running runner pod
+   whose image was mutated in flight (an admission webhook, a manual `kubectl
+   set image` on an ephemeral pod) is outside both scripts' reach; the template
+   is the object ARC reconciles from, so it is the right level, but it is not the
+   same as inspecting every live pod.
+4. **`LISTENER_CREATE_TIMEOUT_SECONDS` default of 120s** is a judgement call: a
+   cold `arc-systems` controller that is itself being scheduled could take
+   longer, in which case the operator raises the knob rather than editing code.
