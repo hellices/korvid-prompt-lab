@@ -638,7 +638,12 @@ jobs:
           # Reflection credentials exist only for optimize rounds; an
           # evaluate-only round never materialises them.
           GROUNDING_REFLECTION_MODEL: ${{ inputs.round_type == 'optimize-evaluate' && vars.GROUNDING_REFLECTION_MODEL || '' }}
-          GROUNDING_REFLECTION_CREDENTIAL: ${{ inputs.round_type == 'optimize-evaluate' && secrets.GROUNDING_REFLECTION_CREDENTIAL || '' }}
+          GROUNDING_REFLECTION_CREDENTIAL: >-
+            ${{ inputs.round_type == 'optimize-evaluate'
+                && !startsWith(vars.GROUNDING_REFLECTION_MODEL, 'ollama/')
+                && !startsWith(vars.GROUNDING_REFLECTION_MODEL, 'ollama_chat/')
+                && secrets.GROUNDING_REFLECTION_CREDENTIAL
+                || '' }}
           KORVID_SOURCE_ROOT: ${{ github.workspace }}/korvid
           # The campaign resolves models/serving.namespace/serving.service/
           # serving.model through `env:` references; without these three

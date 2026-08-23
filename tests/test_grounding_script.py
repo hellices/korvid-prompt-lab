@@ -68,7 +68,7 @@ _BASE_ENV: dict[str, str] = {
     "WORKFLOW_RUN_URL": "https://github.com/org/repo/actions/runs/1",
     "PROMPT_LAB_REVISION": "abc123",
     "KORVID_REVISION": "def456",
-    "GROUNDING_REFLECTION_MODEL": "qwen3:0.6b",
+    "GROUNDING_REFLECTION_MODEL": "openai/gpt-4.1-mini",
     "GROUNDING_REFLECTION_CREDENTIAL": "fake-token",
 }
 
@@ -340,6 +340,11 @@ def _make_fake_bin(
             fi
         else
             _record_args "$_subcommand" "$@"
+            if [[ "$_subcommand" == "optimize" ]]; then
+                printf 'optimize env OPENAI_API_KEY=%s\n' "${{OPENAI_API_KEY:+set}}" >> "$CALLS"
+                printf 'optimize env ANTHROPIC_API_KEY=%s\n' "${{ANTHROPIC_API_KEY:+set}}" >> "$CALLS"
+                printf 'optimize env OLLAMA_API_BASE=%s\n' "${{OLLAMA_API_BASE:-}}" >> "$CALLS"
+            fi
         fi
 
         _seen=""
@@ -740,6 +745,70 @@ def test_round_script_rejects_optimize_without_reflection_credential_before_any_
 
     assert result.returncode != 0
     assert "GROUNDING_REFLECTION_CREDENTIAL" in result.stderr
+    assert calls == []
+
+
+def test_round_script_ollama_reflection_needs_no_credential_and_uses_cluster_dns(
+    tmp_path: Path,
+) -> None:
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        evaluation_exit=0,
+        round_type="optimize-evaluate",
+        extra_env={
+            "GROUNDING_REFLECTION_MODEL": "ollama_chat/qwen3:14b",
+            "GROUNDING_REFLECTION_CREDENTIAL": "",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "optimize env OPENAI_API_KEY=" in calls
+    assert "optimize env ANTHROPIC_API_KEY=" in calls
+    assert (
+        "optimize env OLLAMA_API_BASE="
+        "http://ollama.ollama.svc.cluster.local:11434"
+    ) in calls
+
+
+def test_round_script_hosted_reflection_still_requires_credential(
+    tmp_path: Path,
+) -> None:
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        round_type="optimize-evaluate",
+        extra_env={
+            "GROUNDING_REFLECTION_MODEL": "openai/gpt-4.1-mini",
+            "GROUNDING_REFLECTION_CREDENTIAL": "",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "GROUNDING_REFLECTION_CREDENTIAL" in result.stderr
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["ollama_chat", "ollama_chat/", "ollama chat/qwen3:14b", "ollama_chat/qwen3:14b;env"],
+)
+def test_round_script_rejects_malformed_reflection_model_before_cloud(
+    tmp_path: Path,
+    model: str,
+) -> None:
+    result, calls = run_script(
+        tmp_path,
+        original_count=0,
+        round_type="optimize-evaluate",
+        extra_env={
+            "GROUNDING_REFLECTION_MODEL": model,
+            "GROUNDING_REFLECTION_CREDENTIAL": "",
+        },
+    )
+
+    assert result.returncode == 2
+    assert "invalid reflection model" in result.stderr
     assert calls == []
 
 

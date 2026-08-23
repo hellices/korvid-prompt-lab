@@ -22,7 +22,7 @@
 #
 # Additional required for optimize-evaluate:
 #   GROUNDING_REFLECTION_MODEL      — reflection LLM model identifier
-#   GROUNDING_REFLECTION_CREDENTIAL — API credential for reflection model
+#   GROUNDING_REFLECTION_CREDENTIAL — API credential for hosted reflection models
 #
 # The campaign resolves `models`, `serving.namespace`, `serving.service`, and
 # `serving.model` through `env:` references, so the KORVID_AKS_* variables are as
@@ -30,6 +30,10 @@
 # and every subcommand exits 2.
 
 set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/reflection-provider.sh
+source "${SCRIPT_DIR}/lib/reflection-provider.sh"
 
 # ---------------------------------------------------------------------------
 # Input validation
@@ -145,25 +149,29 @@ fi
 
 # Optimization credentials are validated here — before the pool is read, scaled,
 # or waited on — so a misconfigured round never costs cluster time.
-_reflection_cred_var=""
+_reflection_env=()
 if [[ "$GROUNDING_ROUND_TYPE" == "optimize-evaluate" ]]; then
   : "${GROUNDING_REFLECTION_MODEL:?GROUNDING_REFLECTION_MODEL is required for optimize-evaluate}"
-  : "${GROUNDING_REFLECTION_CREDENTIAL:?GROUNDING_REFLECTION_CREDENTIAL is required for optimize-evaluate}"
-
-  # Map the credential to the provider-standard environment variable so that
-  # dspy.LM picks it up from the environment — never pass secrets in argv.
-  _reflection_provider="${GROUNDING_REFLECTION_MODEL%%/*}"
-  if [[ "$_reflection_provider" == "$GROUNDING_REFLECTION_MODEL" ]]; then
-    _reflection_provider="openai"
+  if ! validate_reflection_model "$GROUNDING_REFLECTION_MODEL"; then
+    echo "invalid reflection model: $GROUNDING_REFLECTION_MODEL" >&2
+    exit 2
   fi
-  _reflection_provider_lc="$(printf '%s' "$_reflection_provider" | tr '[:upper:]' '[:lower:]')"
-  case "$_reflection_provider_lc" in
-    openai)         _reflection_cred_var="OPENAI_API_KEY" ;;
-    anthropic)      _reflection_cred_var="ANTHROPIC_API_KEY" ;;
-    cohere)         _reflection_cred_var="COHERE_API_KEY" ;;
-    gemini|google)  _reflection_cred_var="GEMINI_API_KEY" ;;
-    *)              _reflection_cred_var="OPENAI_API_KEY" ;;
-  esac
+
+  if reflection_requires_credential "$GROUNDING_REFLECTION_MODEL"; then
+    : "${GROUNDING_REFLECTION_CREDENTIAL:?GROUNDING_REFLECTION_CREDENTIAL is required for optimize-evaluate}"
+    _reflection_cred_var="$(reflection_credential_env_name "$GROUNDING_REFLECTION_MODEL")"
+    _reflection_env=("${_reflection_cred_var}=${GROUNDING_REFLECTION_CREDENTIAL}")
+  else
+    for _dns_label in "$KORVID_AKS_SERVICE" "$KORVID_AKS_NAMESPACE"; do
+      if (( ${#_dns_label} > 63 )) || [[ ! "$_dns_label" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+        echo "invalid Kubernetes DNS label for Ollama reflection: $_dns_label" >&2
+        exit 2
+      fi
+    done
+    _reflection_env=(
+      "OLLAMA_API_BASE=http://${KORVID_AKS_SERVICE}.${KORVID_AKS_NAMESPACE}.svc.cluster.local:11434"
+    )
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -316,8 +324,8 @@ if [[ "$GROUNDING_ROUND_TYPE" == "optimize-evaluate" ]]; then
     --validation-case-id "$GROUNDING_VALIDATION_CASE_ID"
   )
 
-  # optimize — never fall back to seed on failure; credential scoped to subprocess only
-  env "${_reflection_cred_var}=${GROUNDING_REFLECTION_CREDENTIAL}" korvid-prompt-lab "${_optimize_args[@]}"
+  # optimize — never fall back to seed on failure; provider env scoped to subprocess only
+  env "${_reflection_env[@]}" korvid-prompt-lab "${_optimize_args[@]}"
 
   # Resolve exactly one new best-candidate.yaml
   if ! _best_candidate="$(resolve_optimize_best_candidate "$_opt_artifact_root")"; then

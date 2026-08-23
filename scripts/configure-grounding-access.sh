@@ -23,9 +23,12 @@
 #   KORVID_APP_ID                GitHub App id for the read-only Korvid checkout
 #   KORVID_APP_PRIVATE_KEY_FILE  readable PEM file holding that App's key
 #
-# Optional, optimize-evaluate rounds only (both or neither)
+# Optional, optimize-evaluate rounds only
 #   GROUNDING_REFLECTION_MODEL            LiteLLM model string
-#   GROUNDING_REFLECTION_CREDENTIAL_FILE  readable file holding its API key
+#     Ollama (ollama/* or ollama_chat/*): model only, no credential needed
+#     Hosted providers (openai/*, anthropic/*, etc.): model + credential file
+#   GROUNDING_REFLECTION_CREDENTIAL_FILE  readable file holding API key
+#     Required for hosted providers; must NOT be set for Ollama models
 #
 # Secrets reach GitHub only as stdin streamed from a file, never as a command
 # line argument.  Progress is reported by name: no subscription, tenant,
@@ -37,6 +40,10 @@
 
 set -Eeuo pipefail
 umask 077
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/reflection-provider.sh
+source "${SCRIPT_DIR}/lib/reflection-provider.sh"
 
 REPOSITORY="hellices/korvid-prompt-lab"
 ENVIRONMENT_NAME="aks-grounding"
@@ -133,15 +140,26 @@ require_command gh az jq kubectl kubelogin
 
 REFLECTION_MODEL="${GROUNDING_REFLECTION_MODEL:-}"
 REFLECTION_CREDENTIAL_FILE="${GROUNDING_REFLECTION_CREDENTIAL_FILE:-}"
-if [[ -n "${REFLECTION_MODEL}" || -n "${REFLECTION_CREDENTIAL_FILE}" ]]; then
-  [[ -n "${REFLECTION_MODEL}" ]] \
-    || die "GROUNDING_REFLECTION_MODEL is required with GROUNDING_REFLECTION_CREDENTIAL_FILE"
-  [[ -n "${REFLECTION_CREDENTIAL_FILE}" ]] \
-    || die "GROUNDING_REFLECTION_CREDENTIAL_FILE is required with GROUNDING_REFLECTION_MODEL"
-  [[ -r "${REFLECTION_CREDENTIAL_FILE}" ]] \
-    || die "GROUNDING_REFLECTION_CREDENTIAL_FILE is not a readable file"
-  [[ -s "${REFLECTION_CREDENTIAL_FILE}" ]] \
-    || die "GROUNDING_REFLECTION_CREDENTIAL_FILE is empty"
+REFLECTION_REQUIRES_CREDENTIAL=false
+
+if [[ -n "$REFLECTION_CREDENTIAL_FILE" && -z "$REFLECTION_MODEL" ]]; then
+  die "GROUNDING_REFLECTION_MODEL is required with GROUNDING_REFLECTION_CREDENTIAL_FILE"
+fi
+
+if [[ -n "$REFLECTION_MODEL" ]]; then
+  validate_reflection_model "$REFLECTION_MODEL" \
+    || die "invalid reflection model: $REFLECTION_MODEL"
+  if reflection_requires_credential "$REFLECTION_MODEL"; then
+    REFLECTION_REQUIRES_CREDENTIAL=true
+    [[ -n "$REFLECTION_CREDENTIAL_FILE" ]] \
+      || die "GROUNDING_REFLECTION_CREDENTIAL_FILE is required with hosted GROUNDING_REFLECTION_MODEL"
+    [[ -r "$REFLECTION_CREDENTIAL_FILE" ]] \
+      || die "GROUNDING_REFLECTION_CREDENTIAL_FILE is not a readable file"
+    [[ -s "$REFLECTION_CREDENTIAL_FILE" ]] \
+      || die "GROUNDING_REFLECTION_CREDENTIAL_FILE is empty"
+  elif [[ -n "$REFLECTION_CREDENTIAL_FILE" ]]; then
+    die "GROUNDING_REFLECTION_CREDENTIAL_FILE must not be set for Ollama reflection"
+  fi
 fi
 
 [[ -r "${KUBERNETES_ROLE_TEMPLATE}" ]] \
@@ -423,10 +441,15 @@ printf '%s' "${MODEL_SERVICE}" | gh variable set KORVID_AKS_SERVICE --env aks-gr
 printf 'Storing the Korvid App private key\n'
 cat "$KORVID_APP_PRIVATE_KEY_FILE" | gh secret set KORVID_APP_PRIVATE_KEY --env aks-grounding --repo "${REPOSITORY}"
 
-if [[ -n "${REFLECTION_MODEL}" ]]; then
-  printf 'Storing the optimize-evaluate reflection model and credential\n'
-  printf '%s' "${REFLECTION_MODEL}" | gh variable set GROUNDING_REFLECTION_MODEL --env aks-grounding --repo "${REPOSITORY}"
-  cat "$GROUNDING_REFLECTION_CREDENTIAL_FILE" | gh secret set GROUNDING_REFLECTION_CREDENTIAL --env aks-grounding --repo "${REPOSITORY}"
+if [[ -n "$REFLECTION_MODEL" ]]; then
+  printf 'Storing the optimize-evaluate reflection model\n'
+  printf '%s' "$REFLECTION_MODEL" |
+    gh variable set GROUNDING_REFLECTION_MODEL --env aks-grounding --repo "$REPOSITORY"
+  if [[ "$REFLECTION_REQUIRES_CREDENTIAL" == "true" ]]; then
+    printf 'Storing the optimize-evaluate reflection credential\n'
+    cat "$REFLECTION_CREDENTIAL_FILE" |
+      gh secret set GROUNDING_REFLECTION_CREDENTIAL --env aks-grounding --repo "$REPOSITORY"
+  fi
 fi
 
 printf 'Grounding access is configured for the %s Environment.\n' "${ENVIRONMENT_NAME}"
