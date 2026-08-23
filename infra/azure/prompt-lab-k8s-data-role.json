@@ -1,0 +1,17 @@
+{
+  "Name": "Prompt Lab AKS Namespace Data Access",
+  "IsCustom": true,
+  "Description": "Grants Kubernetes API DataActions for port-forward, pod exec, and service discovery within the assigned namespace scope. Used by the Prompt Lab grounding workflow identity.",
+  "Actions": [],
+  "NotActions": [],
+  "DataActions": [
+    "Microsoft.ContainerService/managedClusters/pods/read",
+    "Microsoft.ContainerService/managedClusters/services/read",
+    "Microsoft.ContainerService/managedClusters/pods/portforward/action",
+    "Microsoft.ContainerService/managedClusters/services/portforward/action"
+  ],
+  "NotDataActions": [],
+  "AssignableScopes": [
+    "/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${AKS_RESOURCE_GROUP}/providers/Microsoft.ContainerService/managedClusters/${AKS_CLUSTER_NAME}"
+  ]
+}
