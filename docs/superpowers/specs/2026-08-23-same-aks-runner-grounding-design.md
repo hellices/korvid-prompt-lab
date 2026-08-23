@@ -49,7 +49,7 @@ Add a separate repository-scoped ARC scale set:
 | Runner placement | `nodeSelector: workload=gha-runner` |
 | Runner minimum | `0` |
 | Runner maximum | `1` initially |
-| Runner image | existing reviewed runner image, after prerequisite verification |
+| Runner image | `acrpensionguard.azurecr.io/runner-base:prompt-lab-v1` |
 | Kubernetes service account | no Kubernetes API permission |
 
 The runner and model workloads share the cluster network but not the compute
@@ -91,6 +91,12 @@ Runner pods:
 - receive no Kubernetes service-account token with useful permissions;
 - run one grounding job at a time;
 - are destroyed after the job.
+
+The current `runner-base:v1` image has Azure CLI, Git, Bash, jq, and Python
+3.12, but does not have `kubectl`, `kubelogin`, or `uv`. Build
+`runner-base:prompt-lab-v1` from that reviewed base and add exactly kubectl
+v1.35.6, kubelogin v0.2.19, and uv 0.10.9. The image build must verify all
+required commands and must run jobs as the existing non-root `runner` user.
 
 The initial maximum is one because the workflow has repository-wide
 non-cancelling concurrency and the model pool supports a single evaluation

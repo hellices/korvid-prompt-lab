@@ -28,6 +28,7 @@
 
 - Create `infra/arc/prompt-lab-runners-values.yaml`: declarative ARC scale-set values.
 - Create `infra/arc/prompt-lab-runner-service-account.yaml`: namespace and tokenless runner service account.
+- Create `infra/arc/runner/Dockerfile`: Prompt Lab runner image with pinned AKS tooling.
 - Create `infra/azure/grounding-kubernetes-role.json.tpl`: namespace-scoped Azure RBAC DataActions for Kubernetes API access.
 - Create `scripts/install-prompt-lab-runner.sh`: secret-safe ARC installation and readiness verification.
 - Create `scripts/configure-grounding-access.sh`: GitHub Environment, Azure OIDC, Azure role, and Kubernetes RBAC bootstrap.
@@ -39,16 +40,17 @@
 
 ---
 
-### Task 1: Declare the Prompt Lab ARC Scale Set
+### Task 1: Build Contract and ARC Scale-Set Declaration
 
 **Files:**
+- Create: `infra/arc/runner/Dockerfile`
 - Create: `infra/arc/prompt-lab-runners-values.yaml`
 - Create: `infra/arc/prompt-lab-runner-service-account.yaml`
 - Create: `tests/test_grounding_infrastructure.py`
 
 **Interfaces:**
-- Consumes: existing AKS label `workload=gha-runner`, image `acrpensionguard.azurecr.io/runner-base:v1`, ARC chart `gha-runner-scale-set` 0.14.2.
-- Produces: Helm values for release `prompt-lab-runners` and service account `prompt-lab-runners-no-permission`.
+- Consumes: existing AKS label `workload=gha-runner`, reviewed base image `acrpensionguard.azurecr.io/runner-base:v1`, ARC chart `gha-runner-scale-set` 0.14.2.
+- Produces: image contract `acrpensionguard.azurecr.io/runner-base:prompt-lab-v1`, Helm values for release `prompt-lab-runners`, and service account `prompt-lab-runners-no-permission`.
 
 - [ ] **Step 1: Write failing ARC configuration tests**
 
@@ -62,6 +64,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 VALUES = ROOT / "infra/arc/prompt-lab-runners-values.yaml"
 SERVICE_ACCOUNT = ROOT / "infra/arc/prompt-lab-runner-service-account.yaml"
+RUNNER_DOCKERFILE = ROOT / "infra/arc/runner/Dockerfile"
 
 
 def test_prompt_lab_runner_values_are_repo_scoped_and_serial() -> None:
@@ -88,6 +91,9 @@ def test_prompt_lab_runners_cannot_schedule_on_model_compute() -> None:
         }
     ]
     assert all(item["key"] != "workload" for item in pod["tolerations"])
+    assert pod["containers"][0]["image"] == (
+        "acrpensionguard.azurecr.io/runner-base:prompt-lab-v1"
+    )
 
 
 def test_runner_service_account_is_tokenless_and_role_free() -> None:
@@ -96,6 +102,18 @@ def test_runner_service_account_is_tokenless_and_role_free() -> None:
     assert docs[0]["metadata"]["name"] == "arc-runners-prompt-lab"
     assert docs[1]["metadata"]["namespace"] == "arc-runners-prompt-lab"
     assert docs[1]["automountServiceAccountToken"] is False
+
+
+def test_prompt_lab_runner_image_pins_required_tools_and_non_root_user() -> None:
+    body = RUNNER_DOCKERFILE.read_text(encoding="utf-8")
+    assert body.startswith(
+        "FROM ghcr.io/astral-sh/uv:0.10.9 AS uv\n"
+        "FROM acrpensionguard.azurecr.io/runner-base:v1"
+    )
+    assert "--kubectl-version v1.35.6" in body
+    assert "--kubelogin-version v0.2.19" in body
+    assert "COPY --from=uv /uv /uvx /usr/local/bin/" in body
+    assert body.rstrip().endswith("USER runner")
 ```
 
 - [ ] **Step 2: Run the tests and verify RED**
@@ -106,9 +124,38 @@ Run:
 uv run pytest -q tests/test_grounding_infrastructure.py
 ```
 
-Expected: FAIL because the infrastructure YAML files do not exist.
+Expected: FAIL because the image and infrastructure files do not exist.
 
-- [ ] **Step 3: Add the ARC values**
+- [ ] **Step 3: Add the pinned Prompt Lab runner image**
+
+Create `infra/arc/runner/Dockerfile`:
+
+```dockerfile
+FROM ghcr.io/astral-sh/uv:0.10.9 AS uv
+
+FROM acrpensionguard.azurecr.io/runner-base:v1
+
+USER root
+
+RUN az aks install-cli \
+      --kubectl-version v1.35.6 \
+      --kubelogin-version v0.2.19 \
+    && kubectl version --client \
+    && kubelogin --version
+
+COPY --from=uv /uv /uvx /usr/local/bin/
+
+RUN uv --version \
+    && az version \
+    && git --version \
+    && bash --version \
+    && python3 --version \
+    && jq --version
+
+USER runner
+```
+
+- [ ] **Step 4: Add the ARC values**
 
 Create `infra/arc/prompt-lab-runners-values.yaml`:
 
@@ -135,7 +182,7 @@ template:
         effect: NoSchedule
     containers:
       - name: runner
-        image: acrpensionguard.azurecr.io/runner-base:v1
+        image: acrpensionguard.azurecr.io/runner-base:prompt-lab-v1
         command:
           - /home/runner/run.sh
         resources:
@@ -162,7 +209,7 @@ metadata:
 automountServiceAccountToken: false
 ```
 
-- [ ] **Step 4: Run focused tests and Helm rendering**
+- [ ] **Step 5: Run focused tests and Helm rendering**
 
 Run:
 
@@ -180,10 +227,11 @@ Expected: tests PASS; Helm renders an `AutoscalingRunnerSet` whose GitHub URL,
 runner scale set name, service account, selector, and maximum match the test.
 Delete `/tmp/prompt-lab-runners-rendered.yaml`.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add infra/arc/prompt-lab-runners-values.yaml \
+git add infra/arc/runner/Dockerfile \
+  infra/arc/prompt-lab-runners-values.yaml \
   infra/arc/prompt-lab-runner-service-account.yaml \
   tests/test_grounding_infrastructure.py
 git commit -m "feat(arc): declare Prompt Lab runner scale set"
@@ -609,7 +657,25 @@ az aks nodepool show \
 Expected: admin access to the repository; `modeleval` count `0` and state
 `Succeeded`.
 
-- [ ] **Step 2: Apply GitHub/Azure/Kubernetes access**
+- [ ] **Step 2: Build the pinned runner image in ACR**
+
+Run:
+
+```bash
+az acr build \
+  --registry acrpensionguard \
+  --image runner-base:prompt-lab-v1 \
+  infra/arc/runner
+az acr repository show \
+  --name acrpensionguard \
+  --image runner-base:prompt-lab-v1 \
+  --query '{digest:digest,lastUpdateTime:lastUpdateTime}' \
+  --output json
+```
+
+Expected: ACR build succeeds and reports an immutable digest for the new tag.
+
+- [ ] **Step 3: Apply GitHub/Azure/Kubernetes access**
 
 With the GitHub App installed on both `hellices/korvid-prompt-lab` and
 `hellices/korvid`, load its ID and private-key path into the shell through the
@@ -625,7 +691,7 @@ test -r "$KORVID_APP_PRIVATE_KEY_FILE"
 Expected: Environment and role setup succeeds without printing the private key,
 tenant, subscription, or tokens.
 
-- [ ] **Step 3: Install the runner scale set**
+- [ ] **Step 4: Install the runner scale set**
 
 Load the ARC GitHub App installation values through the operator's secret
 manager, then verify them:
@@ -640,7 +706,7 @@ test -r "$ARC_GITHUB_APP_PRIVATE_KEY_FILE"
 
 Expected: Helm release deployed and listener Ready with zero idle runners.
 
-- [ ] **Step 4: Run the read-only deployment verifier**
+- [ ] **Step 5: Run the read-only deployment verifier**
 
 Run:
 
@@ -650,7 +716,7 @@ Run:
 
 Expected: every check passes; `modeleval` remains zero.
 
-- [ ] **Step 5: Run repository validation**
+- [ ] **Step 6: Run repository validation**
 
 Run:
 
@@ -671,7 +737,7 @@ PY
 
 Expected: all tests, lint, types, Bash, and YAML validation pass.
 
-- [ ] **Step 6: Push and update Draft PR**
+- [ ] **Step 7: Push and update Draft PR**
 
 Push the reviewed commits to `feat/prompt-lab-mvp` and update Draft PR #1 with:
 
@@ -682,7 +748,7 @@ Push the reviewed commits to `feat/prompt-lab-mvp` and update Draft PR #1 with:
 - the fact that the live Grounding Round waits for merge because the workflow
   intentionally executes only from the default branch.
 
-- [ ] **Step 7: After merge, dispatch the live evaluate-only round**
+- [ ] **Step 8: After merge, dispatch the live evaluate-only round**
 
 Resolve the merged Prompt Lab SHA:
 
@@ -708,7 +774,7 @@ Expected: one ephemeral runner is created on runner compute; `modeleval` goes
 zero to one; Ollama becomes Ready; the round produces a Job Summary and
 `safe-evidence`; `modeleval` returns to zero.
 
-- [ ] **Step 8: Verify cleanup and safe evidence**
+- [ ] **Step 9: Verify cleanup and safe evidence**
 
 Run:
 
@@ -727,7 +793,7 @@ Download only the `safe-evidence` artifact and assert it contains no
 `request.json`, `audit.jsonl`, kubeconfig, raw log, manifest, credential, or
 GEPA state.
 
-- [ ] **Step 9: Document evidence and commit**
+- [ ] **Step 10: Document evidence and commit**
 
 Append the workflow run ID, final node count, artifact manifest, and observed
 model result to `docs/review-fix-report.md`. Update README only if the live
