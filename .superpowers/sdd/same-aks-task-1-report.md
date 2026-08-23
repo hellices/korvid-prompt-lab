@@ -134,3 +134,90 @@ Clean — no whitespace errors.
 1. **`runAsNonRoot: true` requires the base image to run with a non-zero UID.** The `runner-base:v1` image sets `USER runner` — if `runner` UID is 0, Kubernetes will reject the pod at admission. Verify with `docker inspect acrpensionguard.azurecr.io/runner-base:v1 --format '{{.Config.User}}'` before deploying.
 2. **`controllerServiceAccount.namespace: arc-systems`** must match the actual namespace where the ARC controller (`actions-runner-controller`) is deployed. If the installation used a different namespace, the RoleBinding will bind the wrong SA.
 3. **No `readOnlyRootFilesystem`** — a follow-up hardening could add this, but it may require the runner to write to `/tmp` or ephemeral paths; left as future work to avoid breaking the runner.
+
+---
+
+## Task 1 Cannot-Verify Item: Numeric UID/GID in securityContext
+
+### Background
+
+Running `kubectl exec` on the active `runner-base:v1` pod and executing `id` confirmed:
+```
+uid=1001(runner) gid=1001(runner)
+```
+
+Kubernetes admission validates `runAsNonRoot: true` by checking that the effective UID ≠ 0. When the image USER directive is the string `runner` (not an integer), the kubelet cannot derive the UID from the image manifest alone and may reject the pod at runtime. Adding `runAsUser: 1001` / `runAsGroup: 1001` to the container securityContext provides explicit numeric values that the kubelet and OPA/Gatekeeper policies can evaluate without pulling and inspecting the image.
+
+The Dockerfile keeps `USER runner` as the human-readable default for direct `docker run` usage; the pod-level override makes it numeric at runtime.
+
+---
+
+### TDD: RED → GREEN
+
+#### RED (new assertions added first, before YAML change)
+
+```python
+def test_runner_container_security_context_has_numeric_uid_gid() -> None:
+    """Task 1 cannot-verify fix: add runAsUser/runAsGroup so Kubernetes can
+    enforce non-root numerically even when the image USER is the string 'runner'."""
+    values = yaml.safe_load(VALUES.read_text(encoding="utf-8"))
+    sc = values["template"]["spec"]["containers"][0]["securityContext"]
+    assert sc["runAsUser"] == 1001
+    assert sc["runAsGroup"] == 1001
+```
+
+```
+$ uv run pytest -q tests/test_grounding_infrastructure.py::test_runner_container_security_context_has_numeric_uid_gid
+FAILED tests/test_grounding_infrastructure.py::test_runner_container_security_context_has_numeric_uid_gid
+KeyError: 'runAsUser'
+1 failed in 0.04s
+```
+
+#### GREEN (minimal YAML fix)
+
+Added to `infra/arc/prompt-lab-runners-values.yaml` container `securityContext`:
+```yaml
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  runAsGroup: 1001
+  allowPrivilegeEscalation: false
+```
+
+```
+$ uv run pytest -q tests/test_grounding_infrastructure.py
+.......
+7 passed in 0.04s
+```
+
+---
+
+### Helm Render Evidence
+
+```
+$ helm template prompt-lab-runners \
+  --namespace arc-runners-prompt-lab \
+  --version 0.14.2 \
+  -f infra/arc/prompt-lab-runners-values.yaml \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
+  | grep -A 8 "securityContext"
+```
+
+Output:
+```yaml
+securityContext:
+  allowPrivilegeEscalation: false
+  runAsGroup: 1001
+  runAsNonRoot: true
+  runAsUser: 1001
+```
+
+All four securityContext fields confirmed present in rendered AutoscalingRunnerSet.
+
+---
+
+### Updated Concerns
+
+1. ~~**`runAsNonRoot: true` requires the base image to run with a non-zero UID.**~~ **RESOLVED** — `runAsUser: 1001` / `runAsGroup: 1001` added; kubelet now has explicit numeric values. The Dockerfile retains `USER runner` for human-readable docker run defaults.
+2. **`controllerServiceAccount.namespace: arc-systems`** must match the actual namespace where the ARC controller is deployed. Verified from cluster conventions.
+3. **No `readOnlyRootFilesystem`** — left as future hardening; runner writes to ephemeral paths.

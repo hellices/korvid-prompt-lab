@@ -64,6 +64,15 @@ def test_controller_service_account_cross_namespace_discovery() -> None:
     assert csa["namespace"] == "arc-systems"
 
 
+def test_runner_container_security_context_has_numeric_uid_gid() -> None:
+    """Task 1 cannot-verify fix: add runAsUser/runAsGroup so Kubernetes can
+    enforce non-root numerically even when the image USER is the string 'runner'."""
+    values = yaml.safe_load(VALUES.read_text(encoding="utf-8"))
+    sc = values["template"]["spec"]["containers"][0]["securityContext"]
+    assert sc["runAsUser"] == 1001
+    assert sc["runAsGroup"] == 1001
+
+
 def test_prompt_lab_runner_image_pins_required_tools_and_non_root_user() -> None:
     body = RUNNER_DOCKERFILE.read_text(encoding="utf-8")
     assert body.startswith(

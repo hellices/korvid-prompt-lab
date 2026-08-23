@@ -35,4 +35,6 @@ template:
             memory: 5Gi
         securityContext:
           runAsNonRoot: true
+          runAsUser: 1001
+          runAsGroup: 1001
           allowPrivilegeEscalation: false
