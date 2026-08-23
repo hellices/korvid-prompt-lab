@@ -173,7 +173,8 @@ CLUSTER_USER_ROLE = "Azure Kubernetes Service Cluster User Role"
 
 FEDERATED_NAME = "github-aks-grounding"
 FEDERATED_ISSUER = "https://token.actions.githubusercontent.com"
-FEDERATED_SUBJECT = "repo:hellices/korvid-prompt-lab:environment:aks-grounding"
+OIDC_SUBJECT_PREFIX = "repo:hellices@5661904/korvid-prompt-lab@1341877516"
+FEDERATED_SUBJECT = f"{OIDC_SUBJECT_PREFIX}:environment:aks-grounding"
 FEDERATED_AUDIENCE = "api://AzureADTokenExchange"
 
 PRIVATE_KEY_MARKER = "korvid-app-private-key-marker"
@@ -451,6 +452,13 @@ case "$sub1" in
       printf '%s\n' "${FAKE_GH_USER_ID}"
       exit 0
     fi
+    if [[ "$sub2" == "repos/hellices/korvid-prompt-lab/actions/oidc/customization/sub" ]]; then
+      record_call "" "$@"
+      fail_if_requested "gh-oidc-subject"
+      jq -n --arg prefix "${FAKE_GH_OIDC_SUBJECT_PREFIX}" \
+        '{use_default: true, use_immutable_subject: false, sub_claim_prefix: $prefix}'
+      exit 0
+    fi
     payload="$(opt_value --input "$@")"
     record_call "$payload" "$@"
     fail_if_requested "gh-environment"
@@ -623,6 +631,7 @@ class AccessHarness:
             "FAKE_AKS_ID": AKS_ID,
             "FAKE_NODEPOOL_ID": NODE_POOL_ID,
             "FAKE_GH_USER_ID": GH_USER_ID,
+            "FAKE_GH_OIDC_SUBJECT_PREFIX": OIDC_SUBJECT_PREFIX,
             "KORVID_APP_ID": KORVID_APP_ID,
             "KORVID_APP_PRIVATE_KEY_FILE": str(self.key_file),
             "_GROUNDING_RETRY_ATTEMPTS": "2",
@@ -665,7 +674,7 @@ def assert_succeeded(run: AccessRun) -> None:
 
 def test_grounding_access_is_environment_bound_and_nodepool_scoped() -> None:
     body = ACCESS_SCRIPT.read_text(encoding="utf-8")
-    assert "repo:hellices/korvid-prompt-lab:environment:aks-grounding" in body
+    assert "actions/oidc/customization/sub" in body
     assert "agentPools/modeleval" in body
     assert "namespaces/ollama" in body
     assert "AZURE_CLIENT_SECRET" not in body
@@ -736,6 +745,13 @@ def test_cold_bootstrap_creates_identity_roles_and_environment(
 
     federated = run.calls_for("az", "ad", "app", "federated-credential", "create")
     assert len(federated) == 1
+    assert len(
+        run.calls_for(
+            "gh",
+            "api",
+            "repos/hellices/korvid-prompt-lab/actions/oidc/customization/sub",
+        )
+    ) == 1
     assert run.payload(federated[0]) == {
         "name": FEDERATED_NAME,
         "issuer": FEDERATED_ISSUER,
@@ -757,6 +773,23 @@ def test_cold_bootstrap_creates_identity_roles_and_environment(
     assert set(run.variable_names()) == REQUIRED_ENVIRONMENT_VARIABLES
     assert run.secret_names() == ["KORVID_APP_PRIVATE_KEY"]
     assert run.secret("KORVID_APP_PRIVATE_KEY") == PRIVATE_KEY
+
+
+@pytest.mark.parametrize(
+    "subject_prefix",
+    [
+        "repo:hellices@5661904/korvid-prompt-lab",
+        "repo:hellices/korvid-prompt-lab@1341877516",
+    ],
+)
+def test_hybrid_oidc_subject_prefix_is_rejected(
+    access: AccessHarness,
+    subject_prefix: str,
+) -> None:
+    run = access.run(FAKE_GH_OIDC_SUBJECT_PREFIX=subject_prefix)
+    assert run.returncode != 0
+    assert "unexpected OIDC subject prefix" in run.stderr
+    assert not run.calls_for("az")
 
 
 def test_bootstrap_assigns_exactly_three_scoped_roles(access: AccessHarness) -> None:
@@ -972,7 +1005,11 @@ def test_azure_failure_stops_before_any_github_mutation(access: AccessHarness) -
     assert run.returncode != 0
     assert not run.calls_for("gh", "variable", "set")
     assert not run.calls_for("gh", "secret", "set")
-    assert not run.calls_for("gh", "api")
+    assert not [
+        call
+        for call in run.calls_for("gh", "api")
+        if "--method" in call["argv"]
+    ]
 
 
 def test_role_definition_failure_propagates(access: AccessHarness) -> None:

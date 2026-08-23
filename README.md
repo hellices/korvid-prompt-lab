@@ -685,13 +685,19 @@ and are harder to scope to a single repository.
 
 The workflow authenticates with GitHub OIDC — there is no client secret. The
 federated credential on the Entra application `korvid-prompt-lab-grounding`
-accepts exactly one subject:
+accepts exactly one Environment subject. Because GitHub can include immutable
+owner and repository IDs in that subject, the bootstrap reads the repository's
+current `sub_claim_prefix` from the Actions OIDC customization API and appends
+the Environment suffix:
 
 ```text
-repo:hellices/korvid-prompt-lab:environment:aks-grounding
+<sub_claim_prefix>:environment:aks-grounding
 ```
 
-A credential that has drifted from that subject, issuer, or the
+The bootstrap fails closed if the repository does not use GitHub's default
+subject format or if the returned prefix does not identify
+`hellices/korvid-prompt-lab`. A credential that has drifted from the resolved
+subject, issuer, or the
 `api://AzureADTokenExchange` audience is deleted and re-created, so a token
 minted from any other branch, tag, or environment is rejected.
 
@@ -820,14 +826,14 @@ to be `Succeeded` with zero or one node, the Ollama deployment to still select
 `prompt-lab-runners` and upload exactly
 `prompt-lab/artifacts/grounding-round/safe-evidence/`.
 
-### Deployment boundary (as of feat/prompt-lab-mvp)
+### Deployment boundary (as of 2026-08-23)
 
 | Component | State | Notes |
 |---|---|---|
 | `runner-base:prompt-lab-v1` ACR image | **Built and pushed** | digest `sha256:5c8105400a9f6035a8fb7f7a06e6f81277af45584a148a0af6437bef259bae56`, pushed 2026-08-23T04:13:18Z |
-| `aks-grounding` GitHub Environment | **Not installed** | Requires `KORVID_APP_ID` and `KORVID_APP_PRIVATE_KEY_FILE` — load from the operator's secret manager before running `scripts/configure-grounding-access.sh` |
-| `prompt-lab-runners` ARC scale set | **Not installed** | Requires `ARC_GITHUB_APP_ID`, `ARC_GITHUB_APP_INSTALLATION_ID`, and `ARC_GITHUB_APP_PRIVATE_KEY_FILE` — load from the operator's secret manager before running `scripts/install-prompt-lab-runner.sh` |
-| Live grounding round | **Waiting for merge** | `grounding-round.yml` executes only from the default branch (`if: github.ref == 'refs/heads/main'`); dispatch after PR merge |
+| `aks-grounding` GitHub Environment | **Installed and verified** | Environment review, six variables, Korvid checkout App secret, Azure OIDC federation, and least-privilege role assignments are configured |
+| `prompt-lab-runners` ARC scale set | **Installed and verified** | repository-scoped scale set, minimum 0/maximum 1, tokenless service account, non-root runner image, and `workload=gha-runner` scheduling |
+| Live grounding round | **Executed** | run [`32621633590`](https://github.com/hellices/korvid-prompt-lab/actions/runs/32621633590) completed all 10 live evaluations and was correctly blocked by 15 hard safety failures |
 | `korvid-runners` scale set | **Unchanged** | Still registered to `hellices/korvid` (`githubConfigUrl: https://github.com/hellices/korvid`) |
 | `modeleval` node pool | **Idle** | count 0, provisioningState `Succeeded` |
 
