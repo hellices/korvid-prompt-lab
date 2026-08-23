@@ -4,6 +4,10 @@ runnerScaleSetName: prompt-lab-runners
 minRunners: 0
 maxRunners: 1
 
+controllerServiceAccount:
+  name: arc-gha-rs-controller
+  namespace: arc-systems
+
 template:
   metadata:
     annotations:
@@ -29,3 +33,6 @@ template:
             memory: 3Gi
           limits:
             memory: 5Gi
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false

@@ -48,6 +48,22 @@ def test_runner_service_account_is_tokenless_and_role_free() -> None:
     assert docs[1]["automountServiceAccountToken"] is False
 
 
+def test_runner_container_runs_non_root() -> None:
+    """Fix 1: container securityContext must enforce non-root execution."""
+    values = yaml.safe_load(VALUES.read_text(encoding="utf-8"))
+    sc = values["template"]["spec"]["containers"][0]["securityContext"]
+    assert sc["runAsNonRoot"] is True
+    assert sc["allowPrivilegeEscalation"] is False
+
+
+def test_controller_service_account_cross_namespace_discovery() -> None:
+    """Fix 2: explicit controllerServiceAccount avoids cross-namespace discovery failure."""
+    values = yaml.safe_load(VALUES.read_text(encoding="utf-8"))
+    csa = values["controllerServiceAccount"]
+    assert csa["name"] == "arc-gha-rs-controller"
+    assert csa["namespace"] == "arc-systems"
+
+
 def test_prompt_lab_runner_image_pins_required_tools_and_non_root_user() -> None:
     body = RUNNER_DOCKERFILE.read_text(encoding="utf-8")
     assert body.startswith(
