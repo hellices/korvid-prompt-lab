@@ -129,6 +129,133 @@ def test_same_fingerprint_is_unchanged_and_requires_same_evidence() -> None:
         )
 
 
+def test_changed_candidate_without_core_movement_is_not_a_retained_seed() -> None:
+    """A changed fingerprint with no core-metric movement classifies as
+    ``unchanged`` but must never claim the optimizer retained the seed prompt."""
+    before = report(
+        fingerprint=SEED,
+        aggregate=0.1,
+        pass_at_3=0.2,
+        pass_at_5=0.3,
+        systemic=0,
+        failures={"wrong_target_write": 2},
+    )
+    after = replace(before, candidate_fingerprint=BEST)
+
+    comparison = build_round_comparison(
+        before,
+        after,
+        seed_fingerprint=SEED,
+        best_fingerprint=BEST,
+    )
+
+    assert comparison.status == "changed"
+    assert comparison.outcome == "unchanged"
+
+    markdown = render_comparison_markdown(comparison, after)
+    assert "optimizer retained the seed prompt" not in markdown
+    assert "## ➖ UNCHANGED — candidate changed; no core metric moved" in markdown
+    assert f"- Prompt: `{SEED}` → `{BEST}`" in markdown
+
+
+def test_retained_seed_headline_requires_matching_fingerprints() -> None:
+    """The retained-seed sentence appears only when the fingerprints match."""
+    before = report(
+        fingerprint=SEED,
+        aggregate=0.1,
+        pass_at_3=0.2,
+        pass_at_5=0.3,
+        systemic=0,
+        failures={},
+    )
+
+    retained = render_comparison_markdown(
+        build_round_comparison(before, before, seed_fingerprint=SEED, best_fingerprint=SEED),
+        before,
+    )
+    assert "## ➖ UNCHANGED — optimizer retained the seed prompt" in retained
+
+
+def test_changed_headlines_carry_the_design_qualifiers() -> None:
+    before = report(
+        fingerprint=SEED,
+        aggregate=0.1,
+        pass_at_3=0.2,
+        pass_at_5=0.3,
+        systemic=1,
+        failures={"wrong_target_write": 3},
+    )
+    improved = replace(before, candidate_fingerprint=BEST, aggregate_score=0.2)
+    regressed = replace(before, candidate_fingerprint=BEST, aggregate_score=0.0)
+
+    improved_md = render_comparison_markdown(
+        build_round_comparison(before, improved, seed_fingerprint=SEED, best_fingerprint=BEST),
+        improved,
+    )
+    regressed_md = render_comparison_markdown(
+        build_round_comparison(before, regressed, seed_fingerprint=SEED, best_fingerprint=BEST),
+        regressed,
+    )
+
+    assert "## ✅ IMPROVED — candidate changed; no core metric regressed" in improved_md
+    assert "## ⚠️ REGRESSED — candidate changed; one or more core metrics regressed" in regressed_md
+
+
+def test_not_comparable_metrics_are_not_counted_as_unchanged() -> None:
+    """Absent optional pass rates are not comparable and must be surfaced
+    separately instead of inflating the unchanged tally."""
+    before = report(
+        fingerprint=SEED,
+        aggregate=0.1,
+        pass_at_3=None,
+        pass_at_5=None,
+        systemic=0,
+        failures={},
+    )
+    after = replace(before, candidate_fingerprint=BEST, aggregate_score=0.2)
+
+    comparison = build_round_comparison(
+        before,
+        after,
+        seed_fingerprint=SEED,
+        best_fingerprint=BEST,
+    )
+
+    # Metrics: aggregate (improved), pass@3/pass@5 (not comparable),
+    # hard-safety and systemic failures (unchanged).
+    assert comparison.improved_count == 1
+    assert comparison.unchanged_count == 2
+    assert comparison.regressed_count == 0
+    assert comparison.not_comparable_count == 2
+
+    markdown = render_comparison_markdown(comparison, after)
+    assert "- Net: 1 improved, 2 unchanged, 0 regressed, 2 not comparable" in markdown
+
+
+def test_net_omits_not_comparable_when_zero() -> None:
+    before = report(
+        fingerprint=SEED,
+        aggregate=0.1,
+        pass_at_3=0.2,
+        pass_at_5=0.3,
+        systemic=0,
+        failures={},
+    )
+    after = replace(before, candidate_fingerprint=BEST, aggregate_score=0.2)
+
+    comparison = build_round_comparison(
+        before,
+        after,
+        seed_fingerprint=SEED,
+        best_fingerprint=BEST,
+    )
+
+    assert comparison.not_comparable_count == 0
+    markdown = render_comparison_markdown(comparison, after)
+    assert "not comparable" not in markdown
+    assert "- Net: 1 improved, 4 unchanged, 0 regressed\n" in markdown
+
+
 def test_optional_pass_rate_has_no_delta_or_direction() -> None:
     before = report(
         fingerprint=SEED,
@@ -192,6 +319,7 @@ def test_comparison_rejects_contract_mismatch_and_serializes_allowlist() -> None
         "improved_count",
         "unchanged_count",
         "regressed_count",
+        "not_comparable_count",
     }
 
 

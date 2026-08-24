@@ -801,6 +801,149 @@ def test_safe_evidence_renders_comparison_before_collapsed_detail(tmp_path: Path
     assert "after raw" not in all_safe_text(output)
 
 
+def test_before_evaluation_summary_projects_only_safe_artifact_refs(tmp_path: Path) -> None:
+    """The before summary must publish only in-package safe refs, never the
+    seed run's raw request/audit/kubeconfig/credential/GEPA artifact names."""
+    forbidden_refs = [
+        "runs/case-a-model-a-r01/request.json",
+        "runs/case-a-model-a-r01/audit.jsonl",
+        "runs/case-a-model-a-r01/response.json",
+        ".kubeconfig-round.yaml",
+        "reflection-credential.json",
+        "gepa_state.bin",
+    ]
+    before_root = write_live_fixture(
+        tmp_path / "before",
+        aggregate_score=0.1,
+        responses=[
+            response("completed", hard_failures=["wrong_target_write"], answer="before raw"),
+            response(
+                "completed",
+                run_id="case-a-model-a-r02",
+                repetition=2,
+                hard_failures=["wrong_target_write"],
+                answer="before raw",
+            ),
+        ],
+        repetitions_per_case=2,
+        artifact_refs=["evaluation-summary.json", *forbidden_refs],
+    )
+    after_root = write_live_fixture(
+        tmp_path / "after",
+        candidate=CHANGED_BEST_CANDIDATE,
+        aggregate_score=0.2,
+        responses=[
+            response("completed", candidate_fingerprint=CHANGED_FINGERPRINT, answer="after raw"),
+            response(
+                "completed",
+                run_id="case-a-model-a-r02",
+                repetition=2,
+                candidate_fingerprint=CHANGED_FINGERPRINT,
+                hard_failures=["wrong_target_write"],
+                answer="after raw",
+            ),
+        ],
+        repetitions_per_case=2,
+        include_optimization=True,
+        include_best_candidate=True,
+        seed_candidate_fingerprint=FINGERPRINT,
+    )
+
+    output = write_safe_evidence(
+        after_root,
+        tmp_path / "safe",
+        before_artifact_root=before_root,
+        optimize_artifact_root=after_root,
+    )
+
+    before_summary = json.loads(
+        (output / "before-evaluation-summary.json").read_text(encoding="utf-8")
+    )
+    refs = before_summary["artifact_refs"]
+    assert refs[0] == "before-evaluation-summary.json"
+    assert all(
+        ref == "before-evaluation-summary.json" or ref.startswith("before-responses/")
+        for ref in refs
+    ), refs
+    assert sorted(ref for ref in refs if ref.startswith("before-responses/")) == [
+        "before-responses/case-a-model-a-r01.json",
+        "before-responses/case-a-model-a-r02.json",
+    ]
+
+    package_text = all_safe_text(output)
+    # response.json is a legitimate displayable name the after run records, so it
+    # is allowed elsewhere; the raw request/audit/kubeconfig/credential/GEPA
+    # names must never appear anywhere in the published package.
+    for forbidden in (
+        "runs/case-a-model-a-r01/request.json",
+        "runs/case-a-model-a-r01/audit.jsonl",
+        ".kubeconfig-round.yaml",
+        "reflection-credential.json",
+        "gepa_state.bin",
+        "kubeconfig",
+        "credential",
+        "gepa_state",
+    ):
+        assert forbidden not in package_text, forbidden
+
+
+def test_round_summary_starts_with_outcome_heading_even_with_metadata(
+    tmp_path: Path,
+) -> None:
+    """Even when workflow run URL and both revisions are present (the production
+    case), the decision headline must be the first heading on the page."""
+    before_root = write_live_fixture(
+        tmp_path / "before",
+        aggregate_score=0.1,
+        responses=[
+            response("completed", answer="before raw"),
+            response(
+                "completed",
+                run_id="case-a-model-a-r02",
+                repetition=2,
+                answer="before raw",
+            ),
+        ],
+        repetitions_per_case=2,
+    )
+    after_root = write_live_fixture(
+        tmp_path / "after",
+        candidate=CHANGED_BEST_CANDIDATE,
+        aggregate_score=0.2,
+        responses=[
+            response("completed", candidate_fingerprint=CHANGED_FINGERPRINT, answer="after raw"),
+            response(
+                "completed",
+                run_id="case-a-model-a-r02",
+                repetition=2,
+                candidate_fingerprint=CHANGED_FINGERPRINT,
+                answer="after raw",
+            ),
+        ],
+        repetitions_per_case=2,
+        include_optimization=True,
+        include_best_candidate=True,
+        seed_candidate_fingerprint=FINGERPRINT,
+    )
+
+    output = write_safe_evidence(
+        after_root,
+        tmp_path / "safe",
+        before_artifact_root=before_root,
+        optimize_artifact_root=after_root,
+        prompt_lab_revision="prompt-sha",
+        korvid_revision="korvid-sha",
+        workflow_run_url="https://github.example/actions/runs/42",
+    )
+
+    markdown = (output / "round-summary.md").read_text(encoding="utf-8")
+    assert markdown.startswith("# Grounding Round Outcome\n")
+    # Metadata is retained, but below the decision surface, inside <details>.
+    assert "Workflow run: https://github.example/actions/runs/42" in markdown
+    assert markdown.index("<details>") < markdown.index("Workflow run:")
+    assert markdown.index("# Grounding Round Outcome") < markdown.index("Prompt Lab revision")
+
+
 def test_unchanged_candidate_reuses_final_evidence_without_duplication(tmp_path: Path) -> None:
     root = write_live_fixture(
         tmp_path,

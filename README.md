@@ -1012,10 +1012,12 @@ as authoritative and skips a redundant re-evaluation. The Job Summary marks the
 candidate as `(unchanged)` and uses the seed scores for both sides of the table.
 This avoids a duplicate model call while keeping the comparison surface intact.
 
-**Collapsed detail:** per-run evidence (request/response bridge files,
-evaluation-summary.json, optimization-summary.json) is collapsed inside the
-`safe-evidence` artifact. The Job Summary shows headline metrics only; full
-detail is available by downloading the artifact.
+**Collapsed detail:** the `safe-evidence` artifact carries response projections
+with blanked answers alongside `evaluation-summary.json`,
+`optimization-summary.json`, and `comparison-summary.json` — never request
+bridge files or any raw payload. The Job Summary leads with the headline metrics
+and keeps the full detailed evidence collapsed inside its `<details>` section,
+so operators can expand it in place rather than downloading the artifact.
 
 **Evaluation cost:** a changed candidate adds exactly one seed campaign
 evaluation (to establish the Before baseline) on top of the optimizer campaign.

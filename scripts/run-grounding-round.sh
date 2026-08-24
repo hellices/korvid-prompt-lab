@@ -473,11 +473,11 @@ else
   _eval_artifact_root="${GROUNDING_ARTIFACT_ROOT}/evaluate"
   evaluate_exit=0
   run_evaluation "$_candidate" "$_eval_artifact_root" || evaluate_exit=$?
-  # evaluate-only rounds have no before/after comparison, so a systemic
-  # evidence failure is reported as the conventional non-zero exit rather
-  # than the orchestrator-internal 70 sentinel.
+  # evaluate-only rounds have no before/after comparison, but a systemic
+  # evidence failure must still be triageable: preserve the orchestrator-internal
+  # sentinel 70 rather than collapsing it onto the validated hard-safety exit 1.
   if (( evaluate_exit == 70 )); then
-    exit 1
+    exit "$evaluate_exit"
   fi
 fi
 

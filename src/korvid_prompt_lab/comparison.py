@@ -76,6 +76,7 @@ class RoundComparison:
     improved_count: int
     unchanged_count: int
     regressed_count: int
+    not_comparable_count: int
 
 
 def _require_finite(value: float, label: str) -> float:
@@ -213,8 +214,9 @@ def build_round_comparison(
             outcome = "unchanged"
 
     improved_count = sum(1 for m in all_metrics if m.result == "improved")
-    unchanged_count = sum(1 for m in all_metrics if m.result in ("unchanged", "not_comparable"))
+    unchanged_count = sum(1 for m in all_metrics if m.result == "unchanged")
     regressed_count = sum(1 for m in all_metrics if m.result == "regressed")
+    not_comparable_count = sum(1 for m in all_metrics if m.result == "not_comparable")
 
     return RoundComparison(
         status="unchanged" if same_fingerprint else "changed",
@@ -226,6 +228,7 @@ def build_round_comparison(
         improved_count=improved_count,
         unchanged_count=unchanged_count,
         regressed_count=regressed_count,
+        not_comparable_count=not_comparable_count,
     )
 
 
@@ -265,12 +268,17 @@ def _publication_line(report: RoundReport) -> str:
 
 
 def render_comparison_markdown(comparison: RoundComparison, report: RoundReport) -> str:
-    if comparison.outcome == "improved":
-        outcome_line = "## ✅ IMPROVED"
-    elif comparison.outcome == "regressed":
-        outcome_line = "## ⚠️ REGRESSED"
-    else:
+    # Branch on the comparison *status* first: only a matching fingerprint means
+    # the optimizer retained the seed prompt. A changed candidate with no core
+    # movement is still a changed candidate and must say so.
+    if comparison.status == "unchanged":
         outcome_line = "## ➖ UNCHANGED — optimizer retained the seed prompt"
+    elif comparison.outcome == "improved":
+        outcome_line = "## ✅ IMPROVED — candidate changed; no core metric regressed"
+    elif comparison.outcome == "regressed":
+        outcome_line = "## ⚠️ REGRESSED — candidate changed; one or more core metrics regressed"
+    else:
+        outcome_line = "## ➖ UNCHANGED — candidate changed; no core metric moved"
 
     lines = [
         "# Grounding Round Outcome",
@@ -299,8 +307,13 @@ def render_comparison_markdown(comparison: RoundComparison, report: RoundReport)
             f"- Prompt: `{comparison.seed_candidate_fingerprint}` → `{comparison.best_candidate_fingerprint}`"
         )
 
-    comparison.improved_count + comparison.unchanged_count + comparison.regressed_count
-    net_line = f"- Net: {comparison.improved_count} improved, {comparison.unchanged_count} unchanged, {comparison.regressed_count} regressed"
+    net_line = (
+        f"- Net: {comparison.improved_count} improved, "
+        f"{comparison.unchanged_count} unchanged, "
+        f"{comparison.regressed_count} regressed"
+    )
+    if comparison.not_comparable_count:
+        net_line += f", {comparison.not_comparable_count} not comparable"
 
     lines.extend(["", prompt_line, net_line, _publication_line(report)])
     return "\n".join(lines) + "\n"
@@ -362,4 +375,5 @@ def comparison_payload(comparison: RoundComparison) -> dict[str, object]:
         "improved_count": comparison.improved_count,
         "unchanged_count": comparison.unchanged_count,
         "regressed_count": comparison.regressed_count,
+        "not_comparable_count": comparison.not_comparable_count,
     }

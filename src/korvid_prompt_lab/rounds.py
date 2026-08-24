@@ -402,7 +402,19 @@ def write_safe_evidence(
         extra_copied_artifacts.append("comparison-summary.json")
 
         if comparison.status == "changed":
-            # Write safe before-evaluation-summary
+            # Write safe before-responses first so the before summary can name
+            # exactly the safe files that land in the package.
+            before_response_paths = _write_safe_responses(
+                report=before_report,
+                source_root=before_artifact_root_path,
+                safe_output=safe_output_path,
+                destination_dir="before-responses",
+            )
+
+            # Write the safe before-evaluation-summary. Project its artifact_refs
+            # onto the in-package safe files: the before run's raw refs glob every
+            # request.json/audit.jsonl and can name kubeconfigs, credentials, or
+            # GEPA state, none of which may be published or even referenced here.
             before_evaluation_summary = _normalize_evaluation_summary(
                 _load_json_mapping(
                     _resolve_source_path(
@@ -411,19 +423,15 @@ def write_safe_evidence(
                 )
             )
             safe_before_summary = _safe_evaluation_summary_payload(before_evaluation_summary)
+            safe_before_summary["artifact_refs"] = [
+                "before-evaluation-summary.json",
+                *before_response_paths,
+            ]
             _write_json(
                 _resolve_destination_path(safe_output_path, safe_output_path / "before-evaluation-summary.json"),
                 safe_before_summary,
             )
             extra_copied_artifacts.append("before-evaluation-summary.json")
-
-            # Write safe before-responses
-            before_response_paths = _write_safe_responses(
-                report=before_report,
-                source_root=before_artifact_root_path,
-                safe_output=safe_output_path,
-                destination_dir="before-responses",
-            )
             extra_copied_artifacts.extend(before_response_paths)
         else:
             # unchanged: roots must be the same directory, no duplication
@@ -506,36 +514,32 @@ def write_safe_evidence(
     }
     _write_json(_resolve_destination_path(safe_output_path, safe_output_path / "round-summary.json"), summary_payload)
 
-    # Build markdown: comparison/single-evaluation headline first, then detailed
-    # round evidence collapsed inside a <details> block.
+    # Build markdown: the comparison/single-evaluation decision headline is the
+    # first heading on the page. Round metadata and the detailed round evidence
+    # follow, collapsed inside a <details> block.
     headline = (
         render_comparison_markdown(comparison, report)
         if comparison is not None
         else render_single_evaluation_markdown(report)
     )
     details = render_round_markdown(report).rstrip()
-    markdown_lines: list[str] = []
+    markdown_lines: list[str] = [
+        headline.rstrip(),
+        "",
+        "<details>",
+        "<summary>Detailed round evidence</summary>",
+        "",
+    ]
     if workflow_run_url or prompt_lab_revision or korvid_revision:
-        markdown_lines.extend(["# Round Metadata", ""])
+        markdown_lines.extend(["## Round Metadata", ""])
         if workflow_run_url:
             markdown_lines.append(f"- Workflow run: {workflow_run_url}")
         if prompt_lab_revision:
             markdown_lines.append(f"- Prompt Lab revision: `{prompt_lab_revision}`")
         if korvid_revision:
             markdown_lines.append(f"- Korvid revision: `{korvid_revision}`")
-        markdown_lines.extend(["", ""])
-    markdown_lines.extend(
-        [
-            headline.rstrip(),
-            "",
-            "<details>",
-            "<summary>Detailed round evidence</summary>",
-            "",
-            details,
-            "",
-            "</details>",
-        ]
-    )
+        markdown_lines.append("")
+    markdown_lines.extend([details, "", "</details>"])
     markdown_path = _resolve_destination_path(safe_output_path, safe_output_path / "round-summary.md")
     _write_text(markdown_path, "\n".join(markdown_lines).rstrip() + "\n")
     return safe_output_path

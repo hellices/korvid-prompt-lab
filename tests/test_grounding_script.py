@@ -1453,7 +1453,8 @@ def test_round_script_evaluate_exit1_with_summary_is_safety_result(
 def test_round_script_evaluate_exit1_without_summary_is_systemic_error(
     tmp_path: Path,
 ) -> None:
-    """exit 1 + no evaluation-summary.json → systemic error → skip report, exit 1."""
+    """exit 1 + no evaluation-summary.json → systemic error → skip report,
+    preserve the internal systemic sentinel 70 (never the safety exit 1)."""
     result, calls = run_script(
         tmp_path,
         original_count=0,
@@ -1461,9 +1462,9 @@ def test_round_script_evaluate_exit1_without_summary_is_systemic_error(
         emit_evaluation_summary=False,
     )
 
-    assert result.returncode == 1
+    assert result.returncode == 70
     assert "report" not in calls, (
-        "systemic exit 1 (no summary) must skip report generation"
+        "systemic exit (no summary) must skip report generation"
     )
     assert "systemic" in result.stderr.lower(), (
         "a concise systemic error message must be emitted"
@@ -1478,7 +1479,8 @@ def test_round_script_evaluate_exit1_without_summary_is_systemic_error(
 def test_round_script_evaluate_exit0_without_summary_is_systemic_error(
     tmp_path: Path,
 ) -> None:
-    """exit 0 + no evaluation-summary.json → systemic error → exit non-zero."""
+    """exit 0 + no evaluation-summary.json → systemic error → preserve the
+    internal systemic sentinel 70, distinct from the validated safety exit 1."""
     result, calls = run_script(
         tmp_path,
         original_count=0,
@@ -1486,8 +1488,8 @@ def test_round_script_evaluate_exit0_without_summary_is_systemic_error(
         emit_evaluation_summary=False,
     )
 
-    assert result.returncode != 0, (
-        "exit 0 without evaluation-summary.json is systemic and must fail"
+    assert result.returncode == 70, (
+        "exit 0 without evaluation-summary.json is systemic and must surface 70"
     )
     assert "report" not in calls
     assert "systemic" in result.stderr.lower()
