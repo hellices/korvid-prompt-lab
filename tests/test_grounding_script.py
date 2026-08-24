@@ -15,6 +15,8 @@ never pass these tests again.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import signal
 import stat
@@ -34,25 +36,24 @@ from korvid_prompt_lab.cli import build_parser
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run-grounding-round.sh"
 
-#: Bash snippet that writes evaluation-summary.json when the evaluate shim
-#: is told to emit one.  Defined outside the f-string to avoid backslash and
-#: brace escaping issues across Python versions.
-_EVAL_SUMMARY_BLOCK = r"""
-            _eval_dir="${GROUNDING_ARTIFACT_ROOT}/evaluate"
-            mkdir -p "$_eval_dir"
-            echo '{"hard_safety_failures": 0}' > "$_eval_dir/evaluation-summary.json"
-"""
-
 CAMPAIGN_PATH = "examples/campaigns/aks-shared-runners.yaml"
 TRAIN_CASE_ID = "aks-scale-deployment-up"
 VALIDATION_CASE_ID = "aks-restart-denied"
 MILESTONE_CASE_IDS = "aks-scale-deployment-up,aks-restart-denied"
 MAX_METRIC_CALLS = "7"
 SEED = "3"
+CANDIDATE_PATH = "examples/candidates/shipped-small.yaml"
+
+#: Deterministic 64-hex-char fingerprints for the fake optimize shim.  Real
+#: fingerprints are content hashes; these stand in for "seed" and "an
+#: optimized-and-changed candidate" so `optimization_changed()` in the script
+#: under test can validate them with the same regex it uses in production.
+_SEED_FINGERPRINT = hashlib.sha256(b"seed-candidate-content").hexdigest()
+_CHANGED_FINGERPRINT = hashlib.sha256(b"optimized-candidate-content").hexdigest()
 
 _BASE_ENV: dict[str, str] = {
     "GROUNDING_MODEL": "qwen3:1.7b",
-    "GROUNDING_CANDIDATE": "seed",
+    "GROUNDING_CANDIDATE": CANDIDATE_PATH,
     "GROUNDING_CAMPAIGN": CAMPAIGN_PATH,
     "GROUNDING_ROUND_TYPE": "evaluate",
     "GROUNDING_TRAIN_CASE_ID": TRAIN_CASE_ID,
@@ -100,20 +101,46 @@ _FAKE_PARSER_SPEC: dict[str, dict[str, str]] = {
 }
 
 
-def recorded_argv(calls: Sequence[str], prefix: str) -> list[str]:
-    """Reconstruct the argv the orchestrator passed for one subcommand."""
-    counts = [line for line in calls if line.startswith(f"{prefix} argc=")]
-    assert len(counts) == 1, (
-        f"expected exactly one {prefix!r} invocation, got {len(counts)}"
-    )
-    expected_argc = int(counts[0].split("=", 1)[1])
+def recorded_argv_all(calls: Sequence[str], prefix: str) -> list[list[str]]:
+    """Reconstruct every argv the orchestrator passed for one subcommand, in
+    call order. A subcommand may run more than once per round (e.g.
+    ``evaluate`` for both the seed and best-candidate comparison), so this
+    returns one argv list per invocation."""
+    counts_marker = f"{prefix} argc="
+    arg_marker = f"{prefix} arg="
+    filtered = [line for line in calls if line.startswith((counts_marker, arg_marker))]
 
-    marker = f"{prefix} arg="
-    argv = [line[len(marker) :] for line in calls if line.startswith(marker)]
-    assert len(argv) == expected_argc, (
-        f"{prefix} argc={expected_argc} but recorded {len(argv)} args"
+    invocations: list[list[str]] = []
+    current: list[str] | None = None
+    expected_argc = 0
+    for line in filtered:
+        if line.startswith(counts_marker):
+            if current is not None:
+                assert len(current) == expected_argc, (
+                    f"{prefix} argc={expected_argc} but recorded {len(current)} args"
+                )
+                invocations.append(current)
+            expected_argc = int(line[len(counts_marker) :])
+            current = []
+        else:
+            assert current is not None, f"{prefix} arg= recorded before any argc= line"
+            current.append(line[len(arg_marker) :])
+    if current is not None:
+        assert len(current) == expected_argc, (
+            f"{prefix} argc={expected_argc} but recorded {len(current)} args"
+        )
+        invocations.append(current)
+    return invocations
+
+
+def recorded_argv(calls: Sequence[str], prefix: str) -> list[str]:
+    """Reconstruct the argv the orchestrator passed for the single expected
+    invocation of one subcommand."""
+    invocations = recorded_argv_all(calls, prefix)
+    assert len(invocations) == 1, (
+        f"expected exactly one {prefix!r} invocation, got {len(invocations)}"
     )
-    return argv
+    return invocations[0]
 
 
 def option_value(argv: Sequence[str], option: str) -> str:
@@ -123,6 +150,25 @@ def option_value(argv: Sequence[str], option: str) -> str:
 
 def option_values(argv: Sequence[str], option: str) -> list[str]:
     return [argv[index + 1] for index, token in enumerate(argv) if token == option]
+
+
+def assert_report_arg(calls: Sequence[str], option: str) -> None:
+    """Assert that the recorded report invocation carries a bare flag/option."""
+    argv = recorded_argv(calls, "report")
+    assert option in argv, f"{option} missing from report argv {argv}"
+
+
+def assert_report_value(calls: Sequence[str], option: str, expected: str) -> None:
+    """Assert that the recorded report invocation carries option=expected."""
+    argv = recorded_argv(calls, "report")
+    assert option_value(argv, option) == expected, (
+        f"expected {option}={expected!r} in report argv {argv}"
+    )
+
+
+def artifact_path(tmp_path: Path, *segments: str, artifact_root_name: str = "artifacts") -> str:
+    """Build the expected string form of a path under the run's artifact root."""
+    return str(tmp_path.joinpath(artifact_root_name, *segments))
 
 
 def _make_fake_bin_blocking(
@@ -251,10 +297,36 @@ def _make_fake_bin(
     optimize_mode: str = "actual-layout",
     preflight_success_after: int = 0,
     emit_evaluation_summary: bool = True,
+    optimize_changed: bool = True,
+    evaluation_exits: Sequence[int] | None = None,
+    evaluation_systemic_failures: Sequence[int] | None = None,
 ) -> None:
     """Write shim executables into *fake_bin_dir*."""
     fake_bin_dir.mkdir(parents=True, exist_ok=True)
     attempts_file = fake_bin_dir.parent / "aks-check-attempts"
+    eval_attempts_file = fake_bin_dir.parent / "evaluate-attempts"
+
+    # Each evaluate invocation (seed "before" eval, then best-candidate "after"
+    # eval) can be configured independently; a shorter list reuses its last
+    # entry for every later invocation, so a single-element list (the common
+    # case) applies uniformly to both.
+    _exits = list(evaluation_exits) if evaluation_exits is not None else [evaluation_exit]
+    _systemic = (
+        list(evaluation_systemic_failures) if evaluation_systemic_failures is not None else [0]
+    )
+    eval_exits_literal = " ".join(str(value) for value in _exits)
+    eval_systemic_literal = " ".join(str(value) for value in _systemic)
+    emit_evaluation_summary_bash = "true" if emit_evaluation_summary else "false"
+
+    optimization_summary_json = json.dumps(
+        {
+            "seed_candidate_fingerprint": _SEED_FINGERPRINT,
+            "best_candidate_fingerprint": (
+                _CHANGED_FINGERPRINT if optimize_changed else _SEED_FINGERPRINT
+            ),
+            "best_candidate_differs_from_seed": optimize_changed,
+        }
+    )
 
     def _write(name: str, body: str) -> None:
         p = fake_bin_dir / name
@@ -347,6 +419,8 @@ def _make_fake_bin(
             fi
         fi
 
+        _candidate_arg=""
+        _artifact_root_arg=""
         _seen=""
         shift
         while (( $# )); do
@@ -355,6 +429,10 @@ def _make_fake_bin(
                     if (( $# < 2 )); then
                         _usage_error "argument $1: expected one argument"
                     fi
+                    case "$1" in
+                        --candidate) _candidate_arg="$2" ;;
+                        --artifact-root) _artifact_root_arg="$2" ;;
+                    esac
                     _seen="$_seen $1"
                     shift 2
                     continue
@@ -383,14 +461,41 @@ def _make_fake_bin(
             fi
             exit {preflight_exit}
         elif [[ "$_subcommand" == "evaluate" ]]; then
-            {"" if not emit_evaluation_summary else _EVAL_SUMMARY_BLOCK}
-            exit {evaluation_exit}
+            _eval_attempts_file="{eval_attempts_file}"
+            _eval_attempt=$(( $(cat "$_eval_attempts_file" 2>/dev/null || echo 0) + 1 ))
+            echo "$_eval_attempt" > "$_eval_attempts_file"
+
+            _eval_exits=({eval_exits_literal})
+            _eval_systemic=({eval_systemic_literal})
+            _exit_idx=$(( _eval_attempt - 1 ))
+            if (( _exit_idx >= ${{#_eval_exits[@]}} )); then
+                _exit_idx=$(( ${{#_eval_exits[@]}} - 1 ))
+            fi
+            _systemic_idx=$(( _eval_attempt - 1 ))
+            if (( _systemic_idx >= ${{#_eval_systemic[@]}} )); then
+                _systemic_idx=$(( ${{#_eval_systemic[@]}} - 1 ))
+            fi
+            _this_exit="${{_eval_exits[$_exit_idx]}}"
+            _this_systemic="${{_eval_systemic[$_systemic_idx]}}"
+            _this_hard=0
+            if (( _this_exit == 1 )); then
+                _this_hard=1
+            fi
+
+            printf 'evaluate candidate=%s artifact_root=%s\\n' "$_candidate_arg" "$_artifact_root_arg" >> "$CALLS"
+            if {emit_evaluation_summary_bash}; then
+                mkdir -p "$_artifact_root_arg"
+                printf '{{"hard_safety_failures": %s, "systemic_failures": %s}}\\n' \\
+                    "$_this_hard" "$_this_systemic" > "$_artifact_root_arg/evaluation-summary.json"
+            fi
+            exit "$_this_exit"
         elif [[ "$_subcommand" == "optimize" ]]; then
             case "{optimize_mode}" in
                 actual-layout)
                     mkdir -p "${{GROUNDING_ARTIFACT_ROOT}}/optimize/invocations/opt-run-1"
                     echo "candidate: optimized" > "${{GROUNDING_ARTIFACT_ROOT}}/optimize/invocations/opt-run-1/best-candidate.yaml"
-                    echo "{{}}" > "${{GROUNDING_ARTIFACT_ROOT}}/optimize/invocations/opt-run-1/optimization-summary.json"
+                    printf '%s\\n' '{optimization_summary_json}' \\
+                        > "${{GROUNDING_ARTIFACT_ROOT}}/optimize/invocations/opt-run-1/optimization-summary.json"
                     ;;
                 missing-best-candidate)
                     mkdir -p "${{GROUNDING_ARTIFACT_ROOT}}/optimize/invocations/opt-run-1"
@@ -440,6 +545,9 @@ def run_script(
     artifact_root_name: str = "artifacts",
     preflight_success_after: int = 0,
     emit_evaluation_summary: bool = True,
+    optimize_changed: bool = True,
+    evaluation_exits: Sequence[int] | None = None,
+    evaluation_systemic_failures: Sequence[int] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     artifact_root = tmp_path / artifact_root_name
     artifact_root.mkdir(parents=True)
@@ -456,6 +564,9 @@ def run_script(
         optimize_mode=optimize_mode,
         preflight_success_after=preflight_success_after,
         emit_evaluation_summary=emit_evaluation_summary,
+        optimize_changed=optimize_changed,
+        evaluation_exits=evaluation_exits,
+        evaluation_systemic_failures=evaluation_systemic_failures,
     )
 
     env = dict(os.environ)
@@ -554,7 +665,9 @@ def test_round_script_preserves_evaluate_exit_1_as_final_exit(tmp_path: Path) ->
 def test_round_script_optimize_evaluate_runs_optimize_then_evaluate(
     tmp_path: Path,
 ) -> None:
-    """optimize-evaluate round must call optimize then evaluate."""
+    """optimize-evaluate must evaluate the seed candidate, then optimize, then
+    evaluate the changed best candidate — seed evidence always precedes
+    optimization, and the after-evaluation always follows it."""
     result, calls = run_script(
         tmp_path,
         original_count=0,
@@ -564,8 +677,10 @@ def test_round_script_optimize_evaluate_runs_optimize_then_evaluate(
 
     assert result.returncode == 0
     assert "optimize" in calls
-    assert "evaluate" in calls
-    assert calls.index("optimize") < calls.index("evaluate")
+    evaluate_indexes = [index for index, call in enumerate(calls) if call == "evaluate"]
+    assert len(evaluate_indexes) == 2
+    optimize_index = calls.index("optimize")
+    assert evaluate_indexes[0] < optimize_index < evaluate_indexes[1]
 
 
 def test_round_script_optimize_evaluate_uses_invocation_artifacts_and_preserves_spaced_paths(
@@ -606,7 +721,9 @@ def test_round_script_optimize_evaluate_rejects_missing_best_candidate(
 
     assert result.returncode == 1
     assert "did not produce exactly one regular best-candidate.yaml" in result.stderr
-    assert "evaluate" not in calls
+    # The seed evaluation runs before optimize and so has already completed,
+    # but the best-candidate evaluation must never run when optimize fails.
+    assert sum(call.startswith("evaluate candidate=") for call in calls) == 1
     assert "report" not in calls
 
 
@@ -624,7 +741,9 @@ def test_round_script_optimize_evaluate_rejects_ambiguous_best_candidate(
 
     assert result.returncode == 1
     assert "did not produce exactly one regular best-candidate.yaml" in result.stderr
-    assert "evaluate" not in calls
+    # The seed evaluation runs before optimize and so has already completed,
+    # but the best-candidate evaluation must never run when optimize fails.
+    assert sum(call.startswith("evaluate candidate=") for call in calls) == 1
     assert "report" not in calls
 
 
@@ -922,7 +1041,7 @@ def test_round_script_argv_is_accepted_by_the_real_cli_parser(tmp_path: Path) ->
     assert result.returncode == 0, result.stderr
 
     parser = build_parser()
-    for subcommand in ("aks-check", "optimize", "evaluate"):
+    for subcommand in ("aks-check", "optimize"):
         argv = recorded_argv(calls, subcommand)
         assert argv[0] == subcommand
         assert "--korvid-source-root" not in argv, (
@@ -937,6 +1056,25 @@ def test_round_script_argv_is_accepted_by_the_real_cli_parser(tmp_path: Path) ->
         assert parsed.command == subcommand
         assert str(parsed.campaign) == CAMPAIGN_PATH
 
+    # optimize-evaluate evaluates twice under an identical contract: the seed
+    # candidate before optimization, then the best candidate after — both
+    # argvs must independently parse against the real CLI.
+    evaluate_invocations = recorded_argv_all(calls, "evaluate")
+    assert len(evaluate_invocations) == 2
+    for argv in evaluate_invocations:
+        assert argv[0] == "evaluate"
+        assert "--korvid-source-root" not in argv, (
+            "evaluate passes --korvid-source-root, which the CLI does not define; "
+            "the source root is runtime policy read from KORVID_SOURCE_ROOT"
+        )
+        assert "--model" not in argv, (
+            "evaluate passes --model, which the CLI does not define; the model "
+            "comes from the campaign"
+        )
+        parsed = parser.parse_args(argv)  # SystemExit(2) if argv-incompatible
+        assert parsed.command == "evaluate"
+        assert str(parsed.campaign) == CAMPAIGN_PATH
+
 
 def test_round_script_evaluate_argv_carries_campaign_case_sets(tmp_path: Path) -> None:
     result, calls = run_script(tmp_path, original_count=0, evaluation_exit=0)
@@ -945,7 +1083,7 @@ def test_round_script_evaluate_argv_carries_campaign_case_sets(tmp_path: Path) -
     argv = recorded_argv(calls, "evaluate")
 
     assert option_value(argv, "--campaign") == CAMPAIGN_PATH
-    assert option_value(argv, "--candidate") == "seed"
+    assert option_value(argv, "--candidate") == CANDIDATE_PATH
     assert option_value(argv, "--train-case-id") == TRAIN_CASE_ID
     assert option_value(argv, "--validation-case-id") == VALIDATION_CASE_ID
     assert option_values(argv, "--milestone-case-id") == MILESTONE_CASE_IDS.split(",")
@@ -1353,3 +1491,87 @@ def test_round_script_evaluate_exit0_without_summary_is_systemic_error(
     )
     assert "report" not in calls
     assert "systemic" in result.stderr.lower()
+
+
+# ---------------------------------------------------------------------------
+# Task 3: paired seed and best-candidate evaluation under an identical contract
+# ---------------------------------------------------------------------------
+
+
+def test_optimize_round_compares_seed_and_changed_best_with_identical_contract(
+    tmp_path: Path,
+) -> None:
+    """optimize-evaluate must evaluate the seed before optimizing, then the
+    changed best candidate, and pass both roots to the report."""
+    result, calls = run_script(
+        tmp_path,
+        round_type="optimize-evaluate",
+        optimize_changed=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    evaluations = [call for call in calls if call.startswith("evaluate candidate=")]
+    assert len(evaluations) == 2
+    assert CANDIDATE_PATH in evaluations[0]
+    assert "/evaluate-before" in evaluations[0]
+    assert "best-candidate.yaml" in evaluations[1]
+    assert "/evaluate" in evaluations[1]
+    assert_report_arg(calls, "--before-artifact-root")
+
+
+def test_unchanged_best_reuses_seed_evidence_without_second_evaluation(
+    tmp_path: Path,
+) -> None:
+    """When optimize leaves the candidate unchanged, the seed evaluation is
+    reused as the best-candidate evidence instead of evaluating twice."""
+    result, calls = run_script(
+        tmp_path,
+        round_type="optimize-evaluate",
+        optimize_changed=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    evaluations = [call for call in calls if call.startswith("evaluate candidate=")]
+    assert len(evaluations) == 1
+    assert "/evaluate-before" in evaluations[0]
+    assert_report_value(
+        calls, "--artifact-root", artifact_path(tmp_path, "evaluate-before")
+    )
+    assert_report_value(
+        calls, "--before-artifact-root", artifact_path(tmp_path, "evaluate-before")
+    )
+
+
+def test_before_safety_gate_continues_but_systemic_summary_aborts(
+    tmp_path: Path,
+) -> None:
+    """A validated safety exit 1 on the seed evaluation must not abort the
+    round, but a systemic (malformed/inconsistent) summary must abort before
+    optimize ever runs."""
+    safety_result, safety_calls = run_script(
+        tmp_path / "safety",
+        round_type="optimize-evaluate",
+        evaluation_exits=[1],
+        evaluation_systemic_failures=[0],
+    )
+    assert "optimize" in safety_calls
+    assert safety_result.returncode in (0, 1)
+
+    systemic_result, systemic_calls = run_script(
+        tmp_path / "systemic",
+        round_type="optimize-evaluate",
+        evaluation_exits=[1],
+        evaluation_systemic_failures=[1],
+    )
+    assert systemic_result.returncode != 0
+    assert "optimize" not in systemic_calls
+    assert "systemic" in systemic_result.stderr.lower()
+
+
+def test_evaluate_only_still_runs_once_without_before_argument(tmp_path: Path) -> None:
+    """Plain evaluate rounds have no seed/best comparison: exactly one
+    evaluation, and no --before-artifact-root passed to the report."""
+    result, calls = run_script(tmp_path, round_type="evaluate")
+    assert result.returncode == 0, result.stderr
+    assert sum(call.startswith("evaluate candidate=") for call in calls) == 1
+    assert "--before-artifact-root" not in calls
