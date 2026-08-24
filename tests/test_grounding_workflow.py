@@ -1806,6 +1806,10 @@ def test_grounding_workflow_publishes_comparison_summary_with_round_summary() ->
     upload = named("Upload safe evidence")
     summary = named("Append round summary to Job Summary")
 
-    assert "round-summary.md" in summary["run"]
-    assert "safe-evidence" in upload["with"]["path"]
+    assert "$GROUNDING_SAFE_EVIDENCE_DIR/round-summary.md" in summary["run"], (
+        "Job Summary step must read round-summary.md via the env-bound safe-evidence path"
+    )
+    assert upload["with"]["path"].rstrip("/") == SAFE_EVIDENCE_RELPATH, (
+        f"upload path must be exactly {SAFE_EVIDENCE_RELPATH!r}"
+    )
     assert upload["with"]["if-no-files-found"] == "error"

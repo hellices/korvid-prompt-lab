@@ -1004,7 +1004,7 @@ the same evaluation contract.
 | pass@3 | 0.000 | 0.000 | 0.000 | ➖ unchanged |
 
 **Metric direction:** score and pass columns are higher-is-better; the failures
-column is lower-is-better. The `Result` column uses ✅ / ➖ / ❌ accordingly.
+column is lower-is-better. The `Result` column uses ✅ improved / ➖ unchanged / ⚠️ regressed accordingly.
 
 **Unchanged-prompt semantics:** when the optimizer returns a candidate whose
 prompt fingerprint matches the seed, the comparison treats the seed evaluation
