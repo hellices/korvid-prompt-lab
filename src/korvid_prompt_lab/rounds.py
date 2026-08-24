@@ -373,7 +373,7 @@ def write_safe_evidence(
     )
 
     # Build comparison when a before root is provided
-    from .comparison import (  # noqa: PLC0415
+    from .comparison import (
         build_round_comparison,
         comparison_payload,
         render_comparison_markdown,

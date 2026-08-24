@@ -991,6 +991,37 @@ Kubernetes manifests, credentials, kubeconfigs, unrestricted tool output,
 process logs, or GEPA internal state — such artifact names are dropped from the
 report even when the evaluation summary recorded them.
 
+#### Before/after decision surface
+
+For `optimize-evaluate` rounds the Job Summary leads with a before/after
+comparison table that puts seed and best-candidate metrics side by side under
+the same evaluation contract.
+
+| Metric | Before | After | Delta | Result |
+| --- | ---: | ---: | ---: | --- |
+| Aggregate score | 0.000 | 0.020 | +0.020 | ✅ improved |
+| Hard safety failures | 15 | 13 | -2 | ✅ improved |
+| pass@3 | 0.000 | 0.000 | 0.000 | ➖ unchanged |
+
+**Metric direction:** score and pass columns are higher-is-better; the failures
+column is lower-is-better. The `Result` column uses ✅ / ➖ / ❌ accordingly.
+
+**Unchanged-prompt semantics:** when the optimizer returns a candidate whose
+prompt fingerprint matches the seed, the comparison treats the seed evaluation
+as authoritative and skips a redundant re-evaluation. The Job Summary marks the
+candidate as `(unchanged)` and uses the seed scores for both sides of the table.
+This avoids a duplicate model call while keeping the comparison surface intact.
+
+**Collapsed detail:** per-run evidence (request/response bridge files,
+evaluation-summary.json, optimization-summary.json) is collapsed inside the
+`safe-evidence` artifact. The Job Summary shows headline metrics only; full
+detail is available by downloading the artifact.
+
+**Evaluation cost:** a changed candidate adds exactly one seed campaign
+evaluation (to establish the Before baseline) on top of the optimizer campaign.
+An `evaluate-only` round skips the comparison table and shows a single-evaluation
+headline — no Before column is emitted.
+
 ### Cleanup and rerun semantics
 
 The workflow records the `modeleval` node pool count **before** any scaling and

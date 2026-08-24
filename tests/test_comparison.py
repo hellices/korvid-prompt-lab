@@ -12,7 +12,6 @@ from korvid_prompt_lab.comparison import (
 )
 from korvid_prompt_lab.rounds import CaseRunSummary, RoundReport
 
-
 SEED = "a" * 64
 BEST = "b" * 64
 
@@ -216,7 +215,7 @@ def test_single_evaluation_keeps_core_metrics_above_detail() -> None:
     assert "| Systemic failures | 0 |" in markdown
 
 
-def _eligible_report() -> "RoundReport":
+def _eligible_report() -> RoundReport:
     from dataclasses import replace
     r = report(
         fingerprint=SEED,

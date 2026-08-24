@@ -41,7 +41,7 @@ class EvaluationSnapshot:
     hard_failure_counts: tuple[tuple[str, int], ...]
 
     @classmethod
-    def from_report(cls, report: RoundReport) -> "EvaluationSnapshot":
+    def from_report(cls, report: RoundReport) -> EvaluationSnapshot:
         return cls(
             contract=EvaluationContract(
                 campaign_id=report.campaign_id,
@@ -84,7 +84,7 @@ def _require_finite(value: float, label: str) -> float:
     return value
 
 
-def _metric_result(delta: float | int, *, lower_is_better: bool) -> MetricResult:
+def _metric_result(delta: float, *, lower_is_better: bool) -> MetricResult:
     if delta == 0:
         return "unchanged"
     improved = delta < 0 if lower_is_better else delta > 0
@@ -94,8 +94,8 @@ def _metric_result(delta: float | int, *, lower_is_better: bool) -> MetricResult
 def _make_metric(
     key: str,
     label: str,
-    before: float | int | None,
-    after: float | int | None,
+    before: float | None,
+    after: float | None,
     *,
     lower_is_better: bool = False,
     integer: bool = False,
@@ -229,7 +229,7 @@ def build_round_comparison(
     )
 
 
-def _fmt_score(value: float | int | None, *, integer: bool) -> str:
+def _fmt_score(value: float | None, *, integer: bool) -> str:
     if value is None:
         return "N/A"
     if integer:
@@ -237,14 +237,14 @@ def _fmt_score(value: float | int | None, *, integer: bool) -> str:
     return f"{float(value):.3f}"
 
 
-def _fmt_delta(delta: float | int | None, *, integer: bool) -> str:
+def _fmt_delta(delta: float | None, *, integer: bool) -> str:
     if delta is None:
         return "N/A"
     if integer:
-        d = int(delta)
-        return f"+{d}" if d > 0 else str(d)
-    d = float(delta)
-    return f"+{d:.3f}" if d > 0 else f"{d:.3f}"
+        di = int(delta)
+        return f"+{di}" if di > 0 else str(di)
+    df = float(delta)
+    return f"+{df:.3f}" if df > 0 else f"{df:.3f}"
 
 
 def _fmt_result(result: MetricResult) -> str:
@@ -257,14 +257,14 @@ def _fmt_result(result: MetricResult) -> str:
     return "N/A"
 
 
-def _publication_line(report: "RoundReport") -> str:
+def _publication_line(report: RoundReport) -> str:
     if report.promotion_eligible:
         return "- Publication: eligible"
     blockers = ", ".join(f"`{b}`" for b in report.promotion_blockers)
     return f"- Publication: blocked ({blockers})"
 
 
-def render_comparison_markdown(comparison: RoundComparison, report: "RoundReport") -> str:
+def render_comparison_markdown(comparison: RoundComparison, report: RoundReport) -> str:
     if comparison.outcome == "improved":
         outcome_line = "## ✅ IMPROVED"
     elif comparison.outcome == "regressed":
@@ -299,7 +299,7 @@ def render_comparison_markdown(comparison: RoundComparison, report: "RoundReport
             f"- Prompt: `{comparison.seed_candidate_fingerprint}` → `{comparison.best_candidate_fingerprint}`"
         )
 
-    total = comparison.improved_count + comparison.unchanged_count + comparison.regressed_count
+    comparison.improved_count + comparison.unchanged_count + comparison.regressed_count
     net_line = f"- Net: {comparison.improved_count} improved, {comparison.unchanged_count} unchanged, {comparison.regressed_count} regressed"
 
     lines.extend(["", prompt_line, net_line, _publication_line(report)])

@@ -1791,3 +1791,21 @@ def test_trust_script_korvid_rejects_api_failure(tmp_path: Path) -> None:
     )
     failure_text = " ".join(outcome["failures"]).lower()
     assert "korvid" in failure_text or "default branch" in failure_text
+
+
+
+def test_grounding_workflow_publishes_comparison_summary_with_round_summary() -> None:
+    workflow = load_workflow()
+    all_steps = steps(workflow)
+
+    def named(name: str) -> dict[str, Any]:
+        matches = [s for s in all_steps if s.get("name") == name]
+        assert matches, f"workflow must contain a step named {name!r}"
+        return matches[0]
+
+    upload = named("Upload safe evidence")
+    summary = named("Append round summary to Job Summary")
+
+    assert "round-summary.md" in summary["run"]
+    assert "safe-evidence" in upload["with"]["path"]
+    assert upload["with"]["if-no-files-found"] == "error"
