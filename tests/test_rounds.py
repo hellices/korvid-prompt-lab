@@ -25,6 +25,14 @@ DEFAULT_BEST_CANDIDATE = {
 }
 FINGERPRINT = Candidate.from_mapping(DEFAULT_BEST_CANDIDATE).fingerprint
 
+CHANGED_BEST_CANDIDATE = {
+    "schema_version": 1,
+    "candidate_id": "candidate-alpha",
+    "components": {"system": "Stay grounded and verify every target."},
+    "metadata": {},
+}
+CHANGED_FINGERPRINT = Candidate.from_mapping(CHANGED_BEST_CANDIDATE).fingerprint
+
 
 def test_build_round_report_groups_safe_failures_without_raw_payloads(tmp_path: Path) -> None:
     artifact_root = write_live_fixture(
@@ -518,7 +526,13 @@ def write_live_fixture(
     reproduction_command: Sequence[str] | None = None,
     write_request_artifacts: bool = False,
     campaign_id: str = "campaign-2026-08-22",
+    candidate: Mapping[str, Any] = DEFAULT_BEST_CANDIDATE,
+    seed_candidate_fingerprint: str | None = None,
+    systemic_failures: int = 0,
 ) -> Path:
+    resolved_candidate = Candidate.from_mapping(candidate)
+    resolved_seed_fingerprint = seed_candidate_fingerprint or resolved_candidate.fingerprint
+
     artifact_root = tmp_path / "artifacts"
     artifact_root.mkdir(parents=True, exist_ok=True)
     raw_responses = list(responses or [response("completed")])
@@ -537,8 +551,8 @@ def write_live_fixture(
 
     summary = {
         "bundle_kind": "common",
-        "candidate_id": "candidate-alpha",
-        "candidate_fingerprint": FINGERPRINT,
+        "candidate_id": resolved_candidate.candidate_id,
+        "candidate_fingerprint": resolved_candidate.fingerprint,
         "campaign_id": campaign_id,
         "campaign_case_ids": list(case_ids),
         "evaluated_case_ids": list(case_ids),
@@ -553,7 +567,7 @@ def write_live_fixture(
         "pass_at_3": pass_at_3,
         "pass_at_5": pass_at_5,
         "hard_safety_failures": sum(len((item.get("grade") or {}).get("hard_failures", [])) for item in raw_responses),
-        "systemic_failures": 0,
+        "systemic_failures": systemic_failures,
         "milestone_passed": milestone_passed,
         "case_sets": {"train": list(case_ids), "validation": list(case_ids), "milestone": list(case_ids)},
         "artifact_refs": list(artifact_refs) if artifact_refs is not None else default_artifact_refs,
@@ -574,9 +588,9 @@ def write_live_fixture(
                     "seed": 0,
                     "run_identity": {
                         "schema_version": 1,
-                        "campaign_id": "campaign-2026-08-22",
-                        "candidate_id": "candidate-alpha",
-                        "seed_candidate_fingerprint": FINGERPRINT,
+                        "campaign_id": campaign_id,
+                        "candidate_id": resolved_candidate.candidate_id,
+                        "seed_candidate_fingerprint": resolved_seed_fingerprint,
                         "train_case_ids": list(case_ids),
                         "validation_case_ids": list(case_ids),
                         "max_metric_calls": 1,
@@ -586,9 +600,11 @@ def write_live_fixture(
                     "invocation_dir": str(artifact_root / "invocations" / "opt-run-1"),
                     "best_idx": 0,
                     "best_validation_score": aggregate_score,
-                    "best_candidate_fingerprint": FINGERPRINT,
-                    "seed_candidate_fingerprint": FINGERPRINT,
-                    "best_candidate_differs_from_seed": False,
+                    "best_candidate_fingerprint": resolved_candidate.fingerprint,
+                    "seed_candidate_fingerprint": resolved_seed_fingerprint,
+                    "best_candidate_differs_from_seed": (
+                        resolved_candidate.fingerprint != resolved_seed_fingerprint
+                    ),
                     "execution_modes": ["live"],
                     "train_case_ids": list(case_ids),
                     "validation_case_ids": list(case_ids),
@@ -606,7 +622,16 @@ def write_live_fixture(
         )
     if include_best_candidate:
         (artifact_root / "best-candidate.yaml").write_text(
-            yaml.safe_dump(DEFAULT_BEST_CANDIDATE, sort_keys=False, allow_unicode=True),
+            yaml.safe_dump(
+                {
+                    "schema_version": resolved_candidate.schema_version,
+                    "candidate_id": resolved_candidate.candidate_id,
+                    "components": resolved_candidate.components,
+                    "metadata": resolved_candidate.metadata,
+                },
+                sort_keys=False,
+                allow_unicode=True,
+            ),
             encoding="utf-8",
         )
 
@@ -704,3 +729,146 @@ def write_realistic_live_fixture(tmp_path: Path, **overrides: Any) -> Path:
 def _pair(payload: Mapping[str, Any]) -> str:
     identity = payload["request_identity"]
     return f"{identity['case_id']}::{identity['model']}"
+
+
+def all_safe_text(root: Path) -> str:
+    return "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in root.rglob("*")
+        if path.is_file()
+    )
+
+
+def test_safe_evidence_renders_comparison_before_collapsed_detail(tmp_path: Path) -> None:
+    before_root = write_live_fixture(
+        tmp_path / "before",
+        aggregate_score=0.1,
+        responses=[
+            response("completed", hard_failures=["wrong_target_write"], answer="before raw"),
+            response(
+                "completed",
+                run_id="case-a-model-a-r02",
+                repetition=2,
+                hard_failures=["wrong_target_write"],
+                answer="before raw",
+            ),
+        ],
+        repetitions_per_case=2,
+    )
+    after_root = write_live_fixture(
+        tmp_path / "after",
+        candidate=CHANGED_BEST_CANDIDATE,
+        aggregate_score=0.2,
+        responses=[
+            response(
+                "completed",
+                candidate_fingerprint=CHANGED_FINGERPRINT,
+                answer="after raw",
+            ),
+            response(
+                "completed",
+                run_id="case-a-model-a-r02",
+                repetition=2,
+                candidate_fingerprint=CHANGED_FINGERPRINT,
+                hard_failures=["wrong_target_write"],
+                answer="after raw",
+            ),
+        ],
+        repetitions_per_case=2,
+        include_optimization=True,
+        include_best_candidate=True,
+        seed_candidate_fingerprint=FINGERPRINT,
+    )
+
+    output = write_safe_evidence(
+        after_root,
+        tmp_path / "safe",
+        before_artifact_root=before_root,
+        optimize_artifact_root=after_root,
+        prompt_lab_revision="prompt-sha",
+        korvid_revision="korvid-sha",
+        workflow_run_url="https://github.example/actions/runs/42",
+    )
+
+    markdown = (output / "round-summary.md").read_text(encoding="utf-8")
+    assert markdown.index("# Grounding Round Outcome") < markdown.index("<details>")
+    assert "✅ improved" in markdown
+    assert "<summary>Detailed round evidence</summary>" in markdown
+    assert (output / "comparison-summary.json").is_file()
+    assert (output / "before-evaluation-summary.json").is_file()
+    assert len(list((output / "before-responses").glob("*.json"))) == 2
+    assert "before raw" not in all_safe_text(output)
+    assert "after raw" not in all_safe_text(output)
+
+
+def test_unchanged_candidate_reuses_final_evidence_without_duplication(tmp_path: Path) -> None:
+    root = write_live_fixture(
+        tmp_path,
+        include_optimization=True,
+        include_best_candidate=True,
+    )
+
+    output = write_safe_evidence(
+        root,
+        tmp_path / "safe",
+        before_artifact_root=root,
+        optimize_artifact_root=root,
+    )
+
+    payload = json.loads((output / "comparison-summary.json").read_text(encoding="utf-8"))
+    assert payload["status"] == "unchanged"
+    assert "➖ UNCHANGED" in (output / "round-summary.md").read_text(encoding="utf-8")
+    assert not (output / "before-responses").exists()
+    assert not (output / "before-evaluation-summary.json").exists()
+
+
+def test_evaluate_only_summary_has_single_evaluation_headline(tmp_path: Path) -> None:
+    root = write_live_fixture(tmp_path)
+    output = write_safe_evidence(root, tmp_path / "safe")
+    markdown = (output / "round-summary.md").read_text(encoding="utf-8")
+    assert "ℹ️ SINGLE EVALUATION — no before/after pair" in markdown
+    assert "Before vs after" not in markdown
+    assert "| Aggregate score | 1.000 |" in markdown
+    assert markdown.index("| Aggregate score | 1.000 |") < markdown.index("<details>")
+
+
+def test_round_cli_passes_before_artifact_root_to_write_safe_evidence(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    before_root = write_live_fixture(tmp_path / "before", aggregate_score=0.5)
+    after_root = write_live_fixture(
+        tmp_path / "after",
+        candidate=CHANGED_BEST_CANDIDATE,
+        aggregate_score=0.8,
+        responses=[response("completed", candidate_fingerprint=CHANGED_FINGERPRINT)],
+        include_optimization=True,
+        include_best_candidate=True,
+        seed_candidate_fingerprint=FINGERPRINT,
+    )
+    safe_output = tmp_path / "safe-evidence"
+
+    exit_code = main(
+        [
+            "--artifact-root",
+            str(after_root),
+            "--before-artifact-root",
+            str(before_root),
+            "--optimize-artifact-root",
+            str(after_root),
+            "--safe-output",
+            str(safe_output),
+            "--prompt-lab-revision",
+            "abc1234",
+            "--korvid-revision",
+            "def5678",
+            "--workflow-run-url",
+            "https://github.example/actions/runs/99",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.err == ""
+    assert (safe_output / "comparison-summary.json").is_file()
+    comparison = json.loads((safe_output / "comparison-summary.json").read_text(encoding="utf-8"))
+    assert comparison["status"] == "changed"
