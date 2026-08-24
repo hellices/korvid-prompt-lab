@@ -11,6 +11,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="korvid-grounding-report")
     parser.add_argument("--artifact-root", type=Path, required=True, help="Directory containing evaluation artifacts.")
     parser.add_argument(
+        "--before-artifact-root",
+        type=Path,
+        help="Optional seed-evaluation artifact directory for a same-round comparison.",
+    )
+    parser.add_argument(
         "--optimize-artifact-root",
         type=Path,
         help="Optional directory containing optimization-summary.json and best-candidate.yaml artifacts.",
@@ -28,6 +33,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_root = write_safe_evidence(
         args.artifact_root,
         args.safe_output,
+        before_artifact_root=args.before_artifact_root,
         optimize_artifact_root=args.optimize_artifact_root,
         prompt_lab_revision=args.prompt_lab_revision,
         korvid_revision=args.korvid_revision,

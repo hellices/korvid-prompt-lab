@@ -140,6 +140,7 @@ class CaseRunSummary:
     run_id: str
     case_id: str
     model: str
+    repetition: int
     status: str
     completion: float | None
     verification: float | None
@@ -159,6 +160,7 @@ class RoundReport:
     model_scores: Mapping[str, float]
     pass_at_3: float | None
     pass_at_5: float | None
+    systemic_failures: int
     promotion_eligible: bool
     promotion_blockers: tuple[str, ...]
     status_counts: Mapping[str, int]
@@ -218,6 +220,7 @@ def build_round_report(artifact_root: Path | str) -> RoundReport:
         model_scores={model: model_scores[model] for model in models},
         pass_at_3=summary["pass_at_3"],
         pass_at_5=summary["pass_at_5"],
+        systemic_failures=summary["systemic_failures"],
         promotion_eligible=not promotion_blockers,
         promotion_blockers=promotion_blockers,
         status_counts={status: status_counts[status] for status in sorted(status_counts)},
@@ -227,6 +230,7 @@ def build_round_report(artifact_root: Path | str) -> RoundReport:
                 run_id=run.run_id,
                 case_id=run.case_id,
                 model=run.model,
+                repetition=run.repetition,
                 status=run.status,
                 completion=run.completion,
                 verification=run.verification,
@@ -329,6 +333,7 @@ def write_safe_evidence(
     artifact_root: Path | str,
     safe_output: Path | str,
     *,
+    before_artifact_root: Path | str | None = None,
     optimize_artifact_root: Path | str | None = None,
     prompt_lab_revision: str | None = None,
     korvid_revision: str | None = None,
@@ -339,6 +344,11 @@ def write_safe_evidence(
         artifact_root_path
         if optimize_artifact_root is None
         else _resolve_existing_directory(optimize_artifact_root, "optimize_artifact_root")
+    )
+    before_artifact_root_path = (
+        None
+        if before_artifact_root is None
+        else _resolve_existing_directory(before_artifact_root, "before_artifact_root")
     )
     evaluation_summary_path = _resolve_source_path(artifact_root_path, artifact_root_path / "evaluation-summary.json")
     evaluation_summary = _normalize_evaluation_summary(_load_json_mapping(evaluation_summary_path))
@@ -355,15 +365,80 @@ def write_safe_evidence(
 
     report = build_round_report(artifact_root_path)
 
-    safe_response_paths: list[str] = []
-    for run in report.runs:
-        source_path = _resolve_source_path(artifact_root_path, artifact_root_path / "runs" / run.run_id / "response.json")
-        parsed = _parse_response(source_path)
-        if parsed.candidate_fingerprint != report.candidate_fingerprint:
-            raise ValueError("response fingerprint does not match the report fingerprint")
-        destination_path = _resolve_destination_path(safe_output_path, safe_output_path / "responses" / f"{run.run_id}.json")
-        _write_json(destination_path, parsed.payload)
-        safe_response_paths.append(str(destination_path.relative_to(safe_output_path).as_posix()))
+    safe_response_paths: list[str] = _write_safe_responses(
+        report=report,
+        source_root=artifact_root_path,
+        safe_output=safe_output_path,
+        destination_dir="responses",
+    )
+
+    # Build comparison when a before root is provided
+    from .comparison import (
+        build_round_comparison,
+        comparison_payload,
+        render_comparison_markdown,
+        render_single_evaluation_markdown,
+    )
+    comparison = None
+    extra_copied_artifacts: list[str] = []
+    if before_artifact_root_path is not None:
+        if optimization_summary is None:
+            raise ValueError("before_artifact_root requires an optimization summary")
+        if best_candidate_yaml is None:
+            raise ValueError("before_artifact_root requires a best-candidate.yaml")
+        seed_fingerprint = optimization_summary["seed_candidate_fingerprint"]
+        best_fingerprint = optimization_summary["best_candidate_fingerprint"]
+        before_report = build_round_report(before_artifact_root_path)
+        comparison = build_round_comparison(
+            before_report,
+            report,
+            seed_fingerprint=seed_fingerprint,
+            best_fingerprint=best_fingerprint,
+        )
+        _write_json(
+            _resolve_destination_path(safe_output_path, safe_output_path / "comparison-summary.json"),
+            comparison_payload(comparison),
+        )
+        extra_copied_artifacts.append("comparison-summary.json")
+
+        if comparison.status == "changed":
+            # Write safe before-responses first so the before summary can name
+            # exactly the safe files that land in the package.
+            before_response_paths = _write_safe_responses(
+                report=before_report,
+                source_root=before_artifact_root_path,
+                safe_output=safe_output_path,
+                destination_dir="before-responses",
+            )
+
+            # Write the safe before-evaluation-summary. Project its artifact_refs
+            # onto the in-package safe files: the before run's raw refs glob every
+            # request.json/audit.jsonl and can name kubeconfigs, credentials, or
+            # GEPA state, none of which may be published or even referenced here.
+            before_evaluation_summary = _normalize_evaluation_summary(
+                _load_json_mapping(
+                    _resolve_source_path(
+                        before_artifact_root_path, before_artifact_root_path / "evaluation-summary.json"
+                    )
+                )
+            )
+            safe_before_summary = _safe_evaluation_summary_payload(before_evaluation_summary)
+            safe_before_summary["artifact_refs"] = [
+                "before-evaluation-summary.json",
+                *before_response_paths,
+            ]
+            _write_json(
+                _resolve_destination_path(safe_output_path, safe_output_path / "before-evaluation-summary.json"),
+                safe_before_summary,
+            )
+            extra_copied_artifacts.append("before-evaluation-summary.json")
+            extra_copied_artifacts.extend(before_response_paths)
+        else:
+            # unchanged: roots must be the same directory, no duplication
+            if before_artifact_root_path.resolve() != artifact_root_path.resolve():
+                raise ValueError(
+                    "unchanged comparison status requires before_artifact_root and artifact_root to be the same directory"
+                )
 
     copied_artifacts = ["evaluation-summary.json"]
     safe_evaluation_summary = _safe_evaluation_summary_payload(evaluation_summary)
@@ -371,6 +446,7 @@ def write_safe_evidence(
         "evaluation-summary.json",
         *(["optimization-summary.json"] if optimization_summary is not None else []),
         *(["best-candidate.yaml"] if best_candidate_yaml is not None else []),
+        *extra_copied_artifacts,
         *safe_response_paths,
         "round-summary.json",
         "round-summary.md",
@@ -400,6 +476,7 @@ def write_safe_evidence(
         "model_scores": dict(report.model_scores),
         "pass_at_3": report.pass_at_3,
         "pass_at_5": report.pass_at_5,
+        "systemic_failures": report.systemic_failures,
         "promotion_eligible": report.promotion_eligible,
         "promotion_blockers": list(report.promotion_blockers),
         "status_counts": dict(report.status_counts),
@@ -409,6 +486,7 @@ def write_safe_evidence(
                 "run_id": run.run_id,
                 "case_id": run.case_id,
                 "model": run.model,
+                "repetition": run.repetition,
                 "status": run.status,
                 "completion": run.completion,
                 "verification": run.verification,
@@ -424,6 +502,7 @@ def write_safe_evidence(
             "round-summary.json",
             "round-summary.md",
             *copied_artifacts,
+            *extra_copied_artifacts,
             *safe_response_paths,
         ],
         # …and the safe artifact names the evaluation run itself recorded.
@@ -435,20 +514,60 @@ def write_safe_evidence(
     }
     _write_json(_resolve_destination_path(safe_output_path, safe_output_path / "round-summary.json"), summary_payload)
 
-    markdown_path = _resolve_destination_path(safe_output_path, safe_output_path / "round-summary.md")
-    markdown_lines = []
+    # Build markdown: the comparison/single-evaluation decision headline is the
+    # first heading on the page. Round metadata and the detailed round evidence
+    # follow, collapsed inside a <details> block.
+    headline = (
+        render_comparison_markdown(comparison, report)
+        if comparison is not None
+        else render_single_evaluation_markdown(report)
+    )
+    details = render_round_markdown(report).rstrip()
+    markdown_lines: list[str] = [
+        headline.rstrip(),
+        "",
+        "<details>",
+        "<summary>Detailed round evidence</summary>",
+        "",
+    ]
     if workflow_run_url or prompt_lab_revision or korvid_revision:
-        markdown_lines.extend(["# Round Metadata", ""])
+        markdown_lines.extend(["## Round Metadata", ""])
         if workflow_run_url:
             markdown_lines.append(f"- Workflow run: {workflow_run_url}")
         if prompt_lab_revision:
             markdown_lines.append(f"- Prompt Lab revision: `{prompt_lab_revision}`")
         if korvid_revision:
             markdown_lines.append(f"- Korvid revision: `{korvid_revision}`")
-        markdown_lines.extend(["", ""])
-    markdown_lines.append(render_round_markdown(report).rstrip())
+        markdown_lines.append("")
+    markdown_lines.extend([details, "", "</details>"])
+    markdown_path = _resolve_destination_path(safe_output_path, safe_output_path / "round-summary.md")
     _write_text(markdown_path, "\n".join(markdown_lines).rstrip() + "\n")
     return safe_output_path
+
+
+def _write_safe_responses(
+    *,
+    report: RoundReport,
+    source_root: Path,
+    safe_output: Path,
+    destination_dir: str,
+) -> list[str]:
+    references: list[str] = []
+    for run in report.runs:
+        source_path = _resolve_source_path(
+            source_root,
+            source_root / "runs" / run.run_id / "response.json",
+        )
+        parsed = _parse_response(source_path)
+        if parsed.candidate_fingerprint != report.candidate_fingerprint:
+            raise ValueError("response fingerprint does not match the report fingerprint")
+        destination_path = _resolve_destination_path(
+            safe_output,
+            safe_output / destination_dir / f"{run.run_id}.json",
+        )
+        _write_json(destination_path, parsed.payload)
+        references.append(destination_path.relative_to(safe_output).as_posix())
+    return references
 
 
 def _normalize_evaluation_summary(summary: Mapping[str, Any]) -> dict[str, Any]:

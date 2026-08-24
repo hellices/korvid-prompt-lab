@@ -235,6 +235,105 @@ resolve_optimize_best_candidate() {
   printf '%s\n' "${matches[0]}"
 }
 
+# Runs one evaluate invocation under an identical contract (same campaign,
+# case splits, and milestone pack) regardless of whether the candidate is the
+# incoming seed or optimize's best candidate, so seed and best evidence are
+# always comparable.
+#
+# Returns:
+#   0   — evaluation completed, no hard safety failures
+#   1   — validated safety result: evaluate reported hard safety failures and
+#         evaluation-summary.json is internally consistent with that exit code
+#   70  — orchestrator-internal systemic-evidence code: evaluate exited with
+#         an unexpected code, produced no summary, or produced a summary that
+#         is malformed or inconsistent with its own exit code. Never confused
+#         with the validated safety exit 1 above.
+run_evaluation() {
+  local candidate="$1"
+  local artifact_root="$2"
+  local exit_code=0
+  local summary
+
+  mkdir -p "$artifact_root"
+  korvid-prompt-lab evaluate \
+    --candidate "$candidate" \
+    --campaign "$GROUNDING_CAMPAIGN" \
+    --artifact-root "$artifact_root" \
+    --train-case-id "$GROUNDING_TRAIN_CASE_ID" \
+    --validation-case-id "$GROUNDING_VALIDATION_CASE_ID" \
+    "${_milestone_args[@]}" || exit_code=$?
+
+  if (( exit_code != 0 && exit_code != 1 )); then
+    echo "evaluate returned unexpected exit code $exit_code (systemic)" >&2
+    return 70
+  fi
+  summary="${artifact_root}/evaluation-summary.json"
+  if [[ ! -f "$summary" ]]; then
+    echo "evaluate did not produce evaluation-summary.json (systemic error)" >&2
+    return 70
+  fi
+  if ! evaluation_summary_matches_exit "$summary" "$exit_code"; then
+    echo "evaluate summary is inconsistent or reports systemic failures" >&2
+    return 70
+  fi
+  return "$exit_code"
+}
+
+# Validates that evaluation-summary.json is internally consistent with the
+# exit code evaluate returned: zero non-negative safety/systemic counts, no
+# systemic failures, and hard-safety-failure counts that agree with exit 0/1.
+evaluation_summary_matches_exit() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+exit_code = int(sys.argv[2])
+systemic = payload.get("systemic_failures")
+hard = payload.get("hard_safety_failures")
+if (
+    type(systemic) is not int
+    or systemic < 0
+    or type(hard) is not int
+    or hard < 0
+    or systemic != 0
+    or exit_code not in (0, 1)
+):
+    raise SystemExit(1)
+raise SystemExit(0 if (exit_code == 0 and hard == 0) or (exit_code == 1 and hard > 0) else 1)
+PY
+}
+
+# Reads an optimization-summary.json and prints "true"/"false" for whether the
+# best candidate differs from the seed candidate, validated against the
+# summary's own fingerprints. Exits non-zero on a malformed or inconsistent
+# summary so callers never optimize on unverifiable evidence.
+optimization_changed() {
+  python3 - "$1" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+seed = payload.get("seed_candidate_fingerprint")
+best = payload.get("best_candidate_fingerprint")
+changed = payload.get("best_candidate_differs_from_seed")
+fingerprint = re.compile(r"[0-9a-f]{64}")
+if (
+    not isinstance(seed, str)
+    or fingerprint.fullmatch(seed) is None
+    or not isinstance(best, str)
+    or fingerprint.fullmatch(best) is None
+    or type(changed) is not bool
+    or changed != (seed != best)
+):
+    raise SystemExit(1)
+print("true" if changed else "false")
+PY
+}
+
 cleanup() {
   local _status=$?
   if [[ "$_cleanup_ran" == true ]]; then exit "$_status"; fi
@@ -303,13 +402,27 @@ while true; do
 done
 
 # ---------------------------------------------------------------------------
-# optimize step (optimize-evaluate only)
+# optimize step (optimize-evaluate only) and evaluate (both round types)
 # ---------------------------------------------------------------------------
 
 _candidate="$GROUNDING_CANDIDATE"
 _opt_artifact_root=""
+_opt_report_root=""
+_before_eval_artifact_root=""
 
 if [[ "$GROUNDING_ROUND_TYPE" == "optimize-evaluate" ]]; then
+  # Seed evidence: evaluate the incoming candidate before optimization touches
+  # it, under the identical evaluation contract the best candidate will later
+  # run under. This is same-round evidence, not a cached prior run, so the
+  # comparison always has a fresh baseline — even when optimization leaves the
+  # candidate unchanged.
+  _before_eval_artifact_root="${GROUNDING_ARTIFACT_ROOT}/evaluate-before"
+  before_exit=0
+  run_evaluation "$_candidate" "$_before_eval_artifact_root" || before_exit=$?
+  if (( before_exit == 70 )); then
+    exit "$before_exit"
+  fi
+
   _opt_artifact_root="${GROUNDING_ARTIFACT_ROOT}/optimize"
   mkdir -p "$_opt_artifact_root"
   _optimize_args=(
@@ -332,41 +445,40 @@ if [[ "$GROUNDING_ROUND_TYPE" == "optimize-evaluate" ]]; then
     echo "optimize did not produce exactly one regular best-candidate.yaml under ${_opt_artifact_root}/invocations — aborting" >&2
     exit 1
   fi
-  _candidate="$_best_candidate"
   _opt_report_root="$(dirname "$_best_candidate")"
-fi
+  _opt_summary="${_opt_report_root}/optimization-summary.json"
 
-# ---------------------------------------------------------------------------
-# Evaluate
-# ---------------------------------------------------------------------------
+  if ! _best_changed="$(optimization_changed "$_opt_summary")"; then
+    echo "optimize produced an invalid or inconsistent optimization summary at ${_opt_summary} — aborting" >&2
+    exit 1
+  fi
 
-_eval_artifact_root="${GROUNDING_ARTIFACT_ROOT}/evaluate"
-mkdir -p "$_eval_artifact_root"
-_evaluate_args=(
-  evaluate
-  --candidate "$_candidate"
-  --campaign "$GROUNDING_CAMPAIGN"
-  --artifact-root "$_eval_artifact_root"
-  --train-case-id "$GROUNDING_TRAIN_CASE_ID"
-  --validation-case-id "$GROUNDING_VALIDATION_CASE_ID"
-  "${_milestone_args[@]}"
-)
-
-evaluate_exit=0
-korvid-prompt-lab "${_evaluate_args[@]}" || evaluate_exit=$?
-
-# exit 1 is an expected safety signal; any other non-zero exit is systemic
-if (( evaluate_exit != 0 && evaluate_exit != 1 )); then
-  echo "evaluate returned unexpected exit code $evaluate_exit (systemic)" >&2
-  exit "$evaluate_exit"
-fi
-
-# Distinguish safety exit 1 (summary present) from systemic exit 1 (no summary).
-# Exit 0 without a summary is also systemic — the evaluator must always produce one.
-_eval_summary="${_eval_artifact_root}/evaluation-summary.json"
-if [[ ! -f "$_eval_summary" ]]; then
-  echo "evaluate did not produce evaluation-summary.json (systemic error)" >&2
-  exit 1
+  if [[ "$_best_changed" == "true" ]]; then
+    # The best candidate differs from the seed: it must clear the same
+    # evaluation contract on its own evidence before it can be compared.
+    _candidate="$_best_candidate"
+    _eval_artifact_root="${GROUNDING_ARTIFACT_ROOT}/evaluate"
+    evaluate_exit=0
+    run_evaluation "$_candidate" "$_eval_artifact_root" || evaluate_exit=$?
+    if (( evaluate_exit == 70 )); then
+      exit "$evaluate_exit"
+    fi
+  else
+    # Unchanged: the seed evaluation already is the best-candidate evaluation.
+    # Reuse it rather than re-running an identical evaluation twice.
+    _eval_artifact_root="$_before_eval_artifact_root"
+    evaluate_exit="$before_exit"
+  fi
+else
+  _eval_artifact_root="${GROUNDING_ARTIFACT_ROOT}/evaluate"
+  evaluate_exit=0
+  run_evaluation "$_candidate" "$_eval_artifact_root" || evaluate_exit=$?
+  # evaluate-only rounds have no before/after comparison, but a systemic
+  # evidence failure must still be triageable: preserve the orchestrator-internal
+  # sentinel 70 rather than collapsing it onto the validated hard-safety exit 1.
+  if (( evaluate_exit == 70 )); then
+    exit "$evaluate_exit"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -380,8 +492,11 @@ _report_args=(
   --korvid-revision "$KORVID_REVISION"
   --workflow-run-url "$WORKFLOW_RUN_URL"
 )
-if [[ -n "${_opt_report_root:-}" ]]; then
+if [[ -n "$_opt_report_root" ]]; then
   _report_args+=(--optimize-artifact-root "$_opt_report_root")
+fi
+if [[ -n "$_before_eval_artifact_root" ]]; then
+  _report_args+=(--before-artifact-root "$_before_eval_artifact_root")
 fi
 
 korvid-grounding-report "${_report_args[@]}"

@@ -13,3 +13,10 @@ Same-AKS Task 4: repaired pre-review (installer/verifier rewritten, 73 new execu
 Same-AKS Task 4: complete (commits e4e86e4..d146273, review clean; ARC 0.14.2 field paths confirmed by Task 1 render and live CRD)
 Same-AKS Task 5 pre-merge: complete (commits d146273..df9902d; image built; deployment blocked on GitHub App credentials and merge)
 Same-AKS final review: fixes applied (two-phase listener wait + live runner image assertion; see same-aks-task-4-report.md "Final-Review Fixes")
+
+Grounding comparison plan: started from 6d7f361; baseline 678 passed, 6 skipped.
+Grounding comparison Task 1: complete (commits 6d7f361..f889efa, review approved; final review to triage direct-construction non-finite optional pass guard).
+Grounding comparison Task 2: complete (commits f889efa..7d31558, review clean after publication-digest fix).
+Grounding comparison Task 3: complete (commits 7d31558..47d1340, review approved; final review to triage malformed-JSON traceback and evaluate-only systemic exit flattening).
+Grounding comparison Task 4: complete (commits 47d1340..845d22c, review clean after documentation/test evidence fixes).
+Grounding comparison final-review fix wave: complete (all 6 confirmed findings; 7 new regression tests; focused suite 100 passed, full suite 703 passed/6 skipped; ruff/mypy clean; bash -n + git diff --check clean). See grounding-comparison-final-fix-report.md.
