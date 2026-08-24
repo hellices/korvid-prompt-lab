@@ -872,3 +872,23 @@ def test_round_cli_passes_before_artifact_root_to_write_safe_evidence(
     assert (safe_output / "comparison-summary.json").is_file()
     comparison = json.loads((safe_output / "comparison-summary.json").read_text(encoding="utf-8"))
     assert comparison["status"] == "changed"
+
+
+def test_publication_bullet_blocked_precedes_details(tmp_path: Path) -> None:
+    """Blocked publication bullet appears before <details> in round-summary.md."""
+    artifact_root = write_live_fixture(tmp_path / "blocked", milestone_passed=False)
+    safe_output = tmp_path / "out"
+    write_safe_evidence(artifact_root, safe_output)
+    md = (safe_output / "round-summary.md").read_text(encoding="utf-8")
+    assert "- Publication: blocked" in md
+    assert md.index("- Publication:") < md.index("<details>")
+
+
+def test_publication_bullet_eligible_precedes_details(tmp_path: Path) -> None:
+    """Eligible publication bullet appears before <details> in round-summary.md."""
+    artifact_root = write_live_fixture(tmp_path / "eligible", milestone_passed=True)
+    safe_output = tmp_path / "out"
+    write_safe_evidence(artifact_root, safe_output)
+    md = (safe_output / "round-summary.md").read_text(encoding="utf-8")
+    assert "- Publication: eligible" in md
+    assert md.index("- Publication:") < md.index("<details>")

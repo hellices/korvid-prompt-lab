@@ -509,7 +509,7 @@ def write_safe_evidence(
     # Build markdown: comparison/single-evaluation headline first, then detailed
     # round evidence collapsed inside a <details> block.
     headline = (
-        render_comparison_markdown(comparison)
+        render_comparison_markdown(comparison, report)
         if comparison is not None
         else render_single_evaluation_markdown(report)
     )

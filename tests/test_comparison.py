@@ -89,7 +89,7 @@ def test_comparison_renders_semantic_directions_and_failure_union() -> None:
         seed_fingerprint=SEED,
         best_fingerprint=BEST,
     )
-    markdown = render_comparison_markdown(comparison)
+    markdown = render_comparison_markdown(comparison, after)
 
     assert comparison.outcome == "regressed"
     assert "⚠️ REGRESSED" in markdown
@@ -118,7 +118,7 @@ def test_same_fingerprint_is_unchanged_and_requires_same_evidence() -> None:
     )
 
     assert comparison.outcome == "unchanged"
-    assert "➖ UNCHANGED — optimizer retained the seed prompt" in render_comparison_markdown(comparison)
+    assert "➖ UNCHANGED — optimizer retained the seed prompt" in render_comparison_markdown(comparison, before)
     assert all(metric.delta in (0, 0.0) for metric in comparison.metrics)
 
     with pytest.raises(ValueError, match="unchanged candidate evidence"):
@@ -147,7 +147,8 @@ def test_optional_pass_rate_has_no_delta_or_direction() -> None:
             after,
             seed_fingerprint=SEED,
             best_fingerprint=BEST,
-        )
+        ),
+        after,
     )
 
     assert "| pass@3 | N/A | N/A | N/A | N/A |" in markdown
@@ -213,3 +214,57 @@ def test_single_evaluation_keeps_core_metrics_above_detail() -> None:
     assert "| pass@5 | 0.300 |" in markdown
     assert "| Hard safety failures | 2 |" in markdown
     assert "| Systemic failures | 0 |" in markdown
+
+
+def _eligible_report() -> "RoundReport":
+    from dataclasses import replace
+    r = report(
+        fingerprint=SEED,
+        aggregate=0.9,
+        pass_at_3=0.8,
+        pass_at_5=0.7,
+        systemic=0,
+        failures={},
+    )
+    return replace(r, promotion_eligible=True, promotion_blockers=())
+
+
+def test_publication_bullet_blocked_appears_after_net_in_comparison() -> None:
+    before = report(
+        fingerprint=SEED,
+        aggregate=0.1,
+        pass_at_3=0.2,
+        pass_at_5=0.3,
+        systemic=0,
+        failures={},
+    )
+    after = report(
+        fingerprint=BEST,
+        aggregate=0.2,
+        pass_at_3=0.2,
+        pass_at_5=0.3,
+        systemic=0,
+        failures={},
+    )
+    # after has promotion_eligible=False, promotion_blockers=("hard_safety_failures",)
+    comparison = build_round_comparison(before, after, seed_fingerprint=SEED, best_fingerprint=BEST)
+    markdown = render_comparison_markdown(comparison, after)
+
+    assert "- Publication: blocked (`hard_safety_failures`)" in markdown
+    net_pos = markdown.index("- Net:")
+    pub_pos = markdown.index("- Publication:")
+    assert net_pos < pub_pos, "Publication bullet must appear after Net bullet"
+
+
+def test_publication_bullet_eligible_appears_after_net_in_comparison() -> None:
+    before = _eligible_report()
+    after = _eligible_report()
+    after = replace(after, candidate_fingerprint=BEST)
+    comparison = build_round_comparison(before, after, seed_fingerprint=SEED, best_fingerprint=BEST)
+    markdown = render_comparison_markdown(comparison, after)
+
+    assert "- Publication: eligible" in markdown
+    net_pos = markdown.index("- Net:")
+    pub_pos = markdown.index("- Publication:")
+    assert net_pos < pub_pos, "Publication bullet must appear after Net bullet"
+

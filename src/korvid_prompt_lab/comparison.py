@@ -257,7 +257,14 @@ def _fmt_result(result: MetricResult) -> str:
     return "N/A"
 
 
-def render_comparison_markdown(comparison: RoundComparison) -> str:
+def _publication_line(report: "RoundReport") -> str:
+    if report.promotion_eligible:
+        return "- Publication: eligible"
+    blockers = ", ".join(f"`{b}`" for b in report.promotion_blockers)
+    return f"- Publication: blocked ({blockers})"
+
+
+def render_comparison_markdown(comparison: RoundComparison, report: "RoundReport") -> str:
     if comparison.outcome == "improved":
         outcome_line = "## ✅ IMPROVED"
     elif comparison.outcome == "regressed":
@@ -295,7 +302,7 @@ def render_comparison_markdown(comparison: RoundComparison) -> str:
     total = comparison.improved_count + comparison.unchanged_count + comparison.regressed_count
     net_line = f"- Net: {comparison.improved_count} improved, {comparison.unchanged_count} unchanged, {comparison.regressed_count} regressed"
 
-    lines.extend(["", prompt_line, net_line])
+    lines.extend(["", prompt_line, net_line, _publication_line(report)])
     return "\n".join(lines) + "\n"
 
 
@@ -322,7 +329,7 @@ def render_single_evaluation_markdown(report: RoundReport) -> str:
     for key, count in snap.hard_failure_counts:
         lines.append(f"| `{key}` | {count} |")
 
-    lines.append("")
+    lines.extend(["", _publication_line(report)])
     return "\n".join(lines) + "\n"
 
 
