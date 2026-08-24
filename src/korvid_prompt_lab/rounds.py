@@ -140,6 +140,7 @@ class CaseRunSummary:
     run_id: str
     case_id: str
     model: str
+    repetition: int
     status: str
     completion: float | None
     verification: float | None
@@ -159,6 +160,7 @@ class RoundReport:
     model_scores: Mapping[str, float]
     pass_at_3: float | None
     pass_at_5: float | None
+    systemic_failures: int
     promotion_eligible: bool
     promotion_blockers: tuple[str, ...]
     status_counts: Mapping[str, int]
@@ -218,6 +220,7 @@ def build_round_report(artifact_root: Path | str) -> RoundReport:
         model_scores={model: model_scores[model] for model in models},
         pass_at_3=summary["pass_at_3"],
         pass_at_5=summary["pass_at_5"],
+        systemic_failures=summary["systemic_failures"],
         promotion_eligible=not promotion_blockers,
         promotion_blockers=promotion_blockers,
         status_counts={status: status_counts[status] for status in sorted(status_counts)},
@@ -227,6 +230,7 @@ def build_round_report(artifact_root: Path | str) -> RoundReport:
                 run_id=run.run_id,
                 case_id=run.case_id,
                 model=run.model,
+                repetition=run.repetition,
                 status=run.status,
                 completion=run.completion,
                 verification=run.verification,
@@ -400,6 +404,7 @@ def write_safe_evidence(
         "model_scores": dict(report.model_scores),
         "pass_at_3": report.pass_at_3,
         "pass_at_5": report.pass_at_5,
+        "systemic_failures": report.systemic_failures,
         "promotion_eligible": report.promotion_eligible,
         "promotion_blockers": list(report.promotion_blockers),
         "status_counts": dict(report.status_counts),
@@ -409,6 +414,7 @@ def write_safe_evidence(
                 "run_id": run.run_id,
                 "case_id": run.case_id,
                 "model": run.model,
+                "repetition": run.repetition,
                 "status": run.status,
                 "completion": run.completion,
                 "verification": run.verification,
