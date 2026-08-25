@@ -34,7 +34,7 @@ def _write_control(path: Path) -> None:
     control = {
         "schema_version": 1,
         "campaign_id": "test-campaign",
-        "evaluation_campaign": "eval-campaign",
+        "evaluation_campaign": "test-campaign",
         "initial_candidate": "seed.yaml",
         "train_case_ids": ["case-a", "case-b"],
         "validation_case_ids": ["case-c"],
@@ -358,6 +358,72 @@ class TestCLIAdvance:
         new_state = json.loads(output_state.read_text())
         assert new_state["status"] == "running"
         assert new_state["seed_index"] == 1
+
+    def test_system_error_advances_retry_without_consuming_budget(
+        self, tmp_path: Path,
+    ) -> None:
+        state_path = tmp_path / "state.json"
+        control_path = tmp_path / "control.yaml"
+        action_path = tmp_path / "action.json"
+        output_state = tmp_path / "new-state.json"
+        _write_control(control_path)
+        current_hash = _write_state(state_path)
+        assert main([
+            "plan", "--control", str(control_path), "--state", str(state_path),
+            "--output", str(action_path),
+        ]) == 0
+
+        rc = main([
+            "advance",
+            "--control", str(control_path),
+            "--state", str(state_path),
+            "--action", str(action_path),
+            "--outcome-kind", "system_error",
+            "--error-message", "model endpoint unavailable",
+            "--output-state", str(output_state),
+            "--expected-prior-hash", current_hash,
+        ])
+
+        assert rc == 0
+        new_state = json.loads(output_state.read_text())
+        assert new_state["status"] == "running"
+        assert new_state["metric_calls_used"] == 0
+        assert new_state["retries_used"] == 1
+        assert new_state["champion_score"] == json.loads(
+            state_path.read_text()
+        )["champion_score"]
+
+    def test_config_error_is_terminal_without_consuming_budget(
+        self, tmp_path: Path,
+    ) -> None:
+        state_path = tmp_path / "state.json"
+        control_path = tmp_path / "control.yaml"
+        action_path = tmp_path / "action.json"
+        output_state = tmp_path / "new-state.json"
+        _write_control(control_path)
+        current_hash = _write_state(state_path)
+        assert main([
+            "plan", "--control", str(control_path), "--state", str(state_path),
+            "--output", str(action_path),
+        ]) == 0
+
+        rc = main([
+            "advance",
+            "--control", str(control_path),
+            "--state", str(state_path),
+            "--action", str(action_path),
+            "--outcome-kind", "config_error",
+            "--error-message", "live model digest mismatch",
+            "--output-state", str(output_state),
+            "--expected-prior-hash", current_hash,
+        ])
+
+        assert rc == 0
+        new_state = json.loads(output_state.read_text())
+        assert new_state["status"] == "system_error"
+        assert new_state["metric_calls_used"] == 0
+        assert new_state["retries_used"] == 0
+        assert new_state["stop_reason"] == "config_error: live model digest mismatch"
 
     def test_advance_rejects_stale_prior_hash(self, tmp_path: Path) -> None:
         state_path = tmp_path / "state.json"

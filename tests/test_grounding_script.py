@@ -22,8 +22,11 @@ import signal
 import stat
 import subprocess
 import textwrap
+import threading
 import time
 from collections.abc import Sequence
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -36,10 +39,21 @@ from korvid_prompt_lab.cli import build_parser
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run-grounding-round.sh"
 
-CAMPAIGN_PATH = "examples/campaigns/aks-shared-runners.yaml"
-TRAIN_CASE_ID = "aks-scale-deployment-up"
-VALIDATION_CASE_ID = "aks-restart-denied"
-MILESTONE_CASE_IDS = "aks-scale-deployment-up,aks-restart-denied"
+CAMPAIGN_PATH = "examples/campaigns/aks-small-operator-qualification.yaml"
+TRAIN_CASE_IDS = ("scale-deployment-up", "restart-denied", "scale-no-op")
+VALIDATION_CASE_IDS = (
+    "scale-deployment-down",
+    "restart-deployment",
+    "scale-rbac-denied",
+)
+MILESTONE_CASE_IDS = (
+    "scale-ambiguous-namespace",
+    "restart-approval-expired",
+    "restart-daemonset",
+    "scale-same-name-replacement",
+    "scale-statefulset-down",
+    "edit-unsupported",
+)
 MAX_METRIC_CALLS = "7"
 SEED = "3"
 CANDIDATE_PATH = "examples/candidates/shipped-small.yaml"
@@ -50,15 +64,21 @@ CANDIDATE_PATH = "examples/candidates/shipped-small.yaml"
 #: under test can validate them with the same regex it uses in production.
 _SEED_FINGERPRINT = hashlib.sha256(b"seed-candidate-content").hexdigest()
 _CHANGED_FINGERPRINT = hashlib.sha256(b"optimized-candidate-content").hexdigest()
+_CONTROL_PATH = "examples/optimization-campaigns/qwen3-small-operator.yaml"
+_EXPECTED_MODEL_DIGEST = (
+    "7df6b6e09427a769808717c0a93cadc4ae99ed4eb8bf5ca557c90846becea435"
+)
 
 _BASE_ENV: dict[str, str] = {
     "GROUNDING_MODEL": "qwen3:1.7b",
     "GROUNDING_CANDIDATE": CANDIDATE_PATH,
     "GROUNDING_CAMPAIGN": CAMPAIGN_PATH,
     "GROUNDING_ROUND_TYPE": "evaluate",
-    "GROUNDING_TRAIN_CASE_ID": TRAIN_CASE_ID,
-    "GROUNDING_VALIDATION_CASE_ID": VALIDATION_CASE_ID,
-    "GROUNDING_MILESTONE_CASE_IDS": MILESTONE_CASE_IDS,
+    "GROUNDING_ACTION_KIND": "MILESTONE",
+    "GROUNDING_TRAIN_CASE_IDS": "\n".join(TRAIN_CASE_IDS),
+    "GROUNDING_VALIDATION_CASE_IDS": "\n".join(VALIDATION_CASE_IDS),
+    "GROUNDING_MILESTONE_CASE_IDS": "\n".join(MILESTONE_CASE_IDS),
+    "GROUNDING_EVALUATION_CASE_IDS": "\n".join(MILESTONE_CASE_IDS),
     "GROUNDING_MAX_METRIC_CALLS": MAX_METRIC_CALLS,
     "GROUNDING_SEED": SEED,
     "KORVID_SOURCE_ROOT": "/fake/korvid",
@@ -416,6 +436,9 @@ def _make_fake_bin(
                 printf 'optimize env OPENAI_API_KEY=%s\n' "${{OPENAI_API_KEY:+set}}" >> "$CALLS"
                 printf 'optimize env ANTHROPIC_API_KEY=%s\n' "${{ANTHROPIC_API_KEY:+set}}" >> "$CALLS"
                 printf 'optimize env OLLAMA_API_BASE=%s\n' "${{OLLAMA_API_BASE:-}}" >> "$CALLS"
+                printf 'optimize env GROUNDING_MILESTONE_CASE_IDS=%s\n' "${{GROUNDING_MILESTONE_CASE_IDS:+set}}" >> "$CALLS"
+            elif [[ "$_subcommand" == "evaluate" ]]; then
+                printf 'evaluate env GROUNDING_MILESTONE_CASE_IDS=%s\n' "${{GROUNDING_MILESTONE_CASE_IDS:+set}}" >> "$CALLS"
             fi
         fi
 
@@ -573,6 +596,9 @@ def run_script(
     env.update(_BASE_ENV)
     env["GROUNDING_ARTIFACT_ROOT"] = str(artifact_root)
     env["GROUNDING_ROUND_TYPE"] = round_type
+    if round_type == "optimize-evaluate":
+        env["GROUNDING_ACTION_KIND"] = "SEARCH"
+        env["GROUNDING_EVALUATION_CASE_IDS"] = "\n".join(VALIDATION_CASE_IDS)
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
     env["_AKS_CHECK_POLL_INTERVAL"] = "0"  # no sleep in tests
     env["_AKS_CHECK_DEADLINE_SECONDS"] = "1"  # fast timeout in tests
@@ -593,6 +619,33 @@ def run_script(
         if line.strip()
     ]
     return result, calls
+
+
+@contextmanager
+def model_tags_endpoint(digest: str):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            payload = json.dumps(
+                {"models": [{"name": "qwen3:0.6b", "digest": digest}]}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
 
 
 # ---------------------------------------------------------------------------
@@ -719,7 +772,7 @@ def test_round_script_optimize_evaluate_rejects_missing_best_candidate(
         optimize_mode="missing-best-candidate",
     )
 
-    assert result.returncode == 1
+    assert result.returncode == 70
     assert "did not produce exactly one regular best-candidate.yaml" in result.stderr
     # The seed evaluation runs before optimize and so has already completed,
     # but the best-candidate evaluation must never run when optimize fails.
@@ -739,7 +792,7 @@ def test_round_script_optimize_evaluate_rejects_ambiguous_best_candidate(
         optimize_mode="ambiguous-best-candidate",
     )
 
-    assert result.returncode == 1
+    assert result.returncode == 70
     assert "did not produce exactly one regular best-candidate.yaml" in result.stderr
     # The seed evaluation runs before optimize and so has already completed,
     # but the best-candidate evaluation must never run when optimize fails.
@@ -1084,9 +1137,10 @@ def test_round_script_evaluate_argv_carries_campaign_case_sets(tmp_path: Path) -
 
     assert option_value(argv, "--campaign") == CAMPAIGN_PATH
     assert option_value(argv, "--candidate") == CANDIDATE_PATH
-    assert option_value(argv, "--train-case-id") == TRAIN_CASE_ID
-    assert option_value(argv, "--validation-case-id") == VALIDATION_CASE_ID
-    assert option_values(argv, "--milestone-case-id") == MILESTONE_CASE_IDS.split(",")
+    assert option_values(argv, "--case-id") == list(MILESTONE_CASE_IDS)
+    assert option_values(argv, "--train-case-id") == list(TRAIN_CASE_IDS)
+    assert option_values(argv, "--validation-case-id") == list(VALIDATION_CASE_IDS)
+    assert option_values(argv, "--milestone-case-id") == list(MILESTONE_CASE_IDS)
     assert option_value(argv, "--artifact-root") == str(
         tmp_path / "artifacts" / "evaluate"
     )
@@ -1112,8 +1166,20 @@ def test_round_script_optimize_argv_carries_budget_seed_and_splits(
         option_value(argv, "--reflection-model")
         == _BASE_ENV["GROUNDING_REFLECTION_MODEL"]
     )
-    assert option_value(argv, "--train-case-id") == TRAIN_CASE_ID
-    assert option_value(argv, "--validation-case-id") == VALIDATION_CASE_ID
+    assert option_values(argv, "--train-case-id") == list(TRAIN_CASE_IDS)
+    assert option_values(argv, "--validation-case-id") == list(VALIDATION_CASE_IDS)
+    assert option_values(argv, "--case-id") == []
+    assert option_values(argv, "--milestone-case-id") == []
+    assert all(case_id not in argv for case_id in MILESTONE_CASE_IDS)
+    assert "optimize env GROUNDING_MILESTONE_CASE_IDS=" in calls
+
+    for evaluate_argv in recorded_argv_all(calls, "evaluate"):
+        assert option_values(evaluate_argv, "--case-id") == list(
+            VALIDATION_CASE_IDS
+        )
+        assert option_values(evaluate_argv, "--milestone-case-id") == []
+        assert all(case_id not in evaluate_argv for case_id in MILESTONE_CASE_IDS)
+    assert calls.count("evaluate env GROUNDING_MILESTONE_CASE_IDS=") == 2
 
 
 def test_round_script_aks_check_argv_is_campaign_only(tmp_path: Path) -> None:
@@ -1143,7 +1209,7 @@ def test_round_script_aborts_immediately_when_aks_check_reports_a_config_error(
         extra_env={"_AKS_CHECK_DEADLINE_SECONDS": "900"},
     )
 
-    assert result.returncode == 2, result.stderr
+    assert result.returncode == 70, result.stderr
     assert calls.count("aks-check") == 1, (
         f"a configuration failure must not be retried; got {calls.count('aks-check')} attempts"
     )
@@ -1162,7 +1228,7 @@ def test_round_script_aborts_immediately_when_aks_check_reports_permanent_failur
         extra_env={"_AKS_CHECK_DEADLINE_SECONDS": "900"},
     )
 
-    assert result.returncode == 1, result.stderr
+    assert result.returncode == 70, result.stderr
     assert calls.count("aks-check") == 1, (
         f"a permanent failure must not be retried; got {calls.count('aks-check')} attempts"
     )
@@ -1184,6 +1250,50 @@ def test_round_script_retries_aks_check_while_the_pool_warms_up(tmp_path: Path) 
     assert result.returncode == 0, result.stderr
     assert calls.count("aks-check") == 3
     assert "evaluate" in calls
+
+
+def test_round_script_validates_live_digest_after_readiness_before_model_calls(
+    tmp_path: Path,
+) -> None:
+    with model_tags_endpoint(_EXPECTED_MODEL_DIGEST) as endpoint:
+        result, calls = run_script(
+            tmp_path,
+            round_type="optimize-evaluate",
+            extra_env={
+                "GROUNDING_MODEL": "qwen3:0.6b",
+                "KORVID_AKS_MODEL": "qwen3:0.6b",
+                "GROUNDING_OPTIMIZATION_CAMPAIGN": _CONTROL_PATH,
+                "GROUNDING_MODEL_ENDPOINT": endpoint,
+            },
+        )
+
+    assert result.returncode == 0, result.stderr
+    assert calls.index("aks-check") < calls.index("evaluate")
+    assert calls.index("evaluate") < calls.index("optimize")
+
+
+def test_round_script_digest_mismatch_is_config_error_and_cleans_up(
+    tmp_path: Path,
+) -> None:
+    with model_tags_endpoint("f" * 64) as endpoint:
+        result, calls = run_script(
+            tmp_path,
+            round_type="optimize-evaluate",
+            extra_env={
+                "GROUNDING_MODEL": "qwen3:0.6b",
+                "KORVID_AKS_MODEL": "qwen3:0.6b",
+                "GROUNDING_OPTIMIZATION_CAMPAIGN": _CONTROL_PATH,
+                "GROUNDING_MODEL_ENDPOINT": endpoint,
+            },
+        )
+
+    assert result.returncode == 70
+    assert "evaluate" not in calls
+    assert "optimize" not in calls
+    assert calls[-1] == "scale:0"
+    assert (tmp_path / "artifacts" / "outcome-kind").read_text().strip() == (
+        "config_error"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1229,9 +1339,10 @@ def test_round_script_requires_the_served_model_to_match_the_allowlisted_model(
 
 def test_round_script_requires_case_identifiers(tmp_path: Path) -> None:
     for name in (
-        "GROUNDING_TRAIN_CASE_ID",
-        "GROUNDING_VALIDATION_CASE_ID",
+        "GROUNDING_TRAIN_CASE_IDS",
+        "GROUNDING_VALIDATION_CASE_IDS",
         "GROUNDING_MILESTONE_CASE_IDS",
+        "GROUNDING_EVALUATION_CASE_IDS",
     ):
         result, calls = run_script(
             tmp_path / name, original_count=0, extra_env={name: ""}
@@ -1248,11 +1359,57 @@ def test_round_script_requires_disjoint_train_and_validation_cases(
     result, calls = run_script(
         tmp_path,
         original_count=0,
-        extra_env={"GROUNDING_VALIDATION_CASE_ID": TRAIN_CASE_ID},
+        extra_env={"GROUNDING_VALIDATION_CASE_IDS": TRAIN_CASE_IDS[0]},
     )
 
     assert result.returncode == 2
     assert "disjoint" in result.stderr
+    assert calls == []
+
+
+def test_round_script_rejects_overlap_with_milestone_before_cloud_call(
+    tmp_path: Path,
+) -> None:
+    result, calls = run_script(
+        tmp_path,
+        extra_env={
+            "GROUNDING_MILESTONE_CASE_IDS": TRAIN_CASE_IDS[0],
+            "GROUNDING_EVALUATION_CASE_IDS": TRAIN_CASE_IDS[0],
+        },
+    )
+
+    assert result.returncode == 2
+    assert "disjoint" in result.stderr
+    assert calls == []
+
+
+def test_round_script_rejects_unknown_case_before_cloud_call(
+    tmp_path: Path,
+) -> None:
+    result, calls = run_script(
+        tmp_path,
+        extra_env={
+            "GROUNDING_MILESTONE_CASE_IDS": "unknown-case",
+            "GROUNDING_EVALUATION_CASE_IDS": "unknown-case",
+        },
+    )
+
+    assert result.returncode == 2
+    assert "unknown" in result.stderr
+    assert calls == []
+
+
+def test_round_script_rejects_evaluation_scope_mismatch_before_cloud_call(
+    tmp_path: Path,
+) -> None:
+    result, calls = run_script(
+        tmp_path,
+        round_type="optimize-evaluate",
+        extra_env={"GROUNDING_EVALUATION_CASE_IDS": VALIDATION_CASE_IDS[0]},
+    )
+
+    assert result.returncode == 2
+    assert "evaluation scope" in result.stderr
     assert calls == []
 
 
@@ -1294,12 +1451,15 @@ def test_round_script_splits_a_single_milestone_id_into_one_argument(
         tmp_path,
         original_count=0,
         evaluation_exit=0,
-        extra_env={"GROUNDING_MILESTONE_CASE_IDS": VALIDATION_CASE_ID},
+        extra_env={
+            "GROUNDING_MILESTONE_CASE_IDS": MILESTONE_CASE_IDS[0],
+            "GROUNDING_EVALUATION_CASE_IDS": MILESTONE_CASE_IDS[0],
+        },
     )
 
     assert result.returncode == 0, result.stderr
     argv = recorded_argv(calls, "evaluate")
-    assert option_values(argv, "--milestone-case-id") == [VALIDATION_CASE_ID]
+    assert option_values(argv, "--milestone-case-id") == [MILESTONE_CASE_IDS[0]]
 
 
 def test_round_script_rejects_hostile_milestone_case_ids(tmp_path: Path) -> None:
@@ -1311,9 +1471,9 @@ def test_round_script_rejects_hostile_milestone_case_ids(tmp_path: Path) -> None
         "`touch pwned`",
         "a;b",
         "--milestone-case-id",  # option smuggling
-        "aks-restart-denied,",  # empty trailing element
-        ",aks-restart-denied",
-        "aks-restart-denied,,aks-scale-deployment-up",
+        "aks-restart-denied\n",  # empty trailing element
+        "\naks-restart-denied",
+        "aks-restart-denied\n\naks-scale-deployment-up",
         "../../etc/passwd",
     )
     for index, value in enumerate(hostile):
@@ -1337,7 +1497,7 @@ def test_round_script_rejects_hostile_train_and_validation_case_ids(
 ) -> None:
     hostile = ("a b", "$(id)", "a,b", "-x", "")
     for index, value in enumerate(hostile):
-        for name in ("GROUNDING_TRAIN_CASE_ID", "GROUNDING_VALIDATION_CASE_ID"):
+        for name in ("GROUNDING_TRAIN_CASE_IDS", "GROUNDING_VALIDATION_CASE_IDS"):
             result, calls = run_script(
                 tmp_path / f"{name}-{index}",
                 original_count=0,
@@ -1409,7 +1569,7 @@ def test_round_script_exits_1_when_required_tool_missing(tmp_path: Path) -> None
         if line.strip()
     ]
 
-    assert result.returncode == 1
+    assert result.returncode == 70
     assert "required tool not found" in result.stderr
     # No cloud calls should have been made
     assert "nodepool-show" not in calls
@@ -1424,7 +1584,7 @@ def test_round_script_does_not_retry_permanent_preflight_exit_1(tmp_path: Path) 
         extra_env={"_AKS_CHECK_DEADLINE_SECONDS": "60"},
     )
 
-    assert result.returncode == 1, result.stderr
+    assert result.returncode == 70, result.stderr
     assert calls.count("aks-check") == 1
     assert "not retrying" in result.stderr
 

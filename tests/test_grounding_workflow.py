@@ -1165,9 +1165,11 @@ def test_grounding_workflow_declares_campaign_case_and_budget_inputs() -> None:
 
     for name in (
         "campaign",
-        "train_case_id",
-        "validation_case_id",
+        "action_kind",
+        "train_case_ids",
+        "validation_case_ids",
         "milestone_case_ids",
+        "evaluation_case_ids",
         "max_metric_calls",
         "seed",
     ):
@@ -1179,19 +1181,23 @@ def test_grounding_workflow_declares_campaign_case_and_budget_inputs() -> None:
 
     assert inputs["campaign"]["type"] == "string"
     assert inputs["campaign"]["default"].endswith(".yaml")
-    assert inputs["train_case_id"]["type"] == "string"
-    assert inputs["validation_case_id"]["type"] == "string"
+    assert inputs["action_kind"]["type"] == "choice"
+    assert set(inputs["action_kind"]["options"]) == {"SEARCH", "MILESTONE", "CONFIRM"}
+    assert inputs["train_case_ids"]["type"] == "string"
+    assert inputs["validation_case_ids"]["type"] == "string"
     assert inputs["milestone_case_ids"]["type"] == "string"
+    assert inputs["evaluation_case_ids"]["type"] == "string"
     assert inputs["max_metric_calls"]["type"] == "number"
     assert inputs["seed"]["type"] == "number"
 
     assert (
-        inputs["train_case_id"]["default"] != inputs["validation_case_id"]["default"]
+        set(inputs["train_case_ids"]["default"].splitlines()).isdisjoint(
+            inputs["validation_case_ids"]["default"].splitlines()
+        )
     ), "the shipped defaults must keep the train and validation splits disjoint"
     assert (
-        "," in inputs["milestone_case_ids"]["description"].lower()
-        or "comma" in str(inputs["milestone_case_ids"]["description"]).lower()
-    ), "milestone_case_ids must document that it is a comma-separated list"
+        "line" in str(inputs["milestone_case_ids"]["description"]).lower()
+    ), "milestone_case_ids must document that it is a newline-separated list"
 
 
 def test_grounding_workflow_validates_campaign_case_and_budget_inputs_first() -> None:
@@ -1202,9 +1208,11 @@ def test_grounding_workflow_validates_campaign_case_and_budget_inputs_first() ->
 
     expected = {
         "CAMPAIGN": "${{ inputs.campaign }}",
-        "TRAIN_CASE_ID": "${{ inputs.train_case_id }}",
-        "VALIDATION_CASE_ID": "${{ inputs.validation_case_id }}",
+        "ACTION_KIND": "${{ inputs.action_kind }}",
+        "TRAIN_CASE_IDS": "${{ inputs.train_case_ids }}",
+        "VALIDATION_CASE_IDS": "${{ inputs.validation_case_ids }}",
         "MILESTONE_CASE_IDS": "${{ inputs.milestone_case_ids }}",
+        "EVALUATION_CASE_IDS": "${{ inputs.evaluation_case_ids }}",
         "MAX_METRIC_CALLS": "${{ inputs.max_metric_calls }}",
         "SEED": "${{ inputs.seed }}",
     }
@@ -1232,9 +1240,11 @@ def test_grounding_workflow_wires_campaign_cases_and_budget_to_the_orchestrator(
     env = effective_env(workflow, orchestrator_step(workflow))
 
     assert env["GROUNDING_CAMPAIGN"] == "${{ inputs.campaign }}"
-    assert env["GROUNDING_TRAIN_CASE_ID"] == "${{ inputs.train_case_id }}"
-    assert env["GROUNDING_VALIDATION_CASE_ID"] == "${{ inputs.validation_case_id }}"
+    assert env["GROUNDING_ACTION_KIND"] == "${{ inputs.action_kind }}"
+    assert env["GROUNDING_TRAIN_CASE_IDS"] == "${{ inputs.train_case_ids }}"
+    assert env["GROUNDING_VALIDATION_CASE_IDS"] == "${{ inputs.validation_case_ids }}"
     assert env["GROUNDING_MILESTONE_CASE_IDS"] == "${{ inputs.milestone_case_ids }}"
+    assert env["GROUNDING_EVALUATION_CASE_IDS"] == "${{ inputs.evaluation_case_ids }}"
     assert env["GROUNDING_MAX_METRIC_CALLS"] == "${{ inputs.max_metric_calls }}"
     assert env["GROUNDING_SEED"] == "${{ inputs.seed }}"
 

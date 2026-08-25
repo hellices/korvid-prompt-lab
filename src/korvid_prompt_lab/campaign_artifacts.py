@@ -364,7 +364,7 @@ def _validate_comparison_summary(
         round_summary.get("campaign_id"),
         "round-summary.campaign_id",
     )
-    if contract_campaign_id != expected_campaign_id or contract_campaign_id != state.campaign_id:
+    if contract_campaign_id != expected_campaign_id:
         raise ValueError("comparison-summary.contract.campaign_id mismatch")
 
     contract_models = _require_string_list(
@@ -603,16 +603,19 @@ def load_round_outcome(
         eval_summary.get("campaign_id"),
         "evaluation-summary.campaign_id",
     )
-    expected_campaign_id = _require_str(state.campaign_id, "state.campaign_id")
     if round_campaign_id != eval_campaign_id:
         raise ValueError(
             f"campaign_id mismatch: round-summary has {round_campaign_id!r}, "
             f"evaluation-summary has {eval_campaign_id!r}"
         )
-    if round_campaign_id != control.campaign_id or round_campaign_id != expected_campaign_id:
+    expected_evaluation_campaign_id = _require_str(
+        control.evaluation_campaign,
+        "control.evaluation_campaign",
+    )
+    if round_campaign_id != expected_evaluation_campaign_id:
         raise ValueError(
             f"campaign_id mismatch: evidence has {round_campaign_id!r}, "
-            f"expected {control.campaign_id!r}"
+            f"expected evaluation campaign {expected_evaluation_campaign_id!r}"
         )
 
     evidence_action_id = _require_str(
@@ -912,7 +915,10 @@ def _validate_search_optimization_evidence(
         raise ValueError(
             f"run_identity.max_metric_calls ({ri_max}) != action.metric_calls ({action.metric_calls})"
         )
-    if _require_str(run_identity.get("campaign_id"), "run_identity.campaign_id") != control.campaign_id:
+    if (
+        _require_str(run_identity.get("campaign_id"), "run_identity.campaign_id")
+        != control.evaluation_campaign
+    ):
         raise ValueError("run_identity.campaign_id mismatch")
     run_identity_candidate_id = _require_str(
         run_identity.get("candidate_id"),

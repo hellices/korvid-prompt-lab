@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -47,7 +48,7 @@ def _control() -> OptimizationCampaign:
     return OptimizationCampaign(
         schema_version=1,
         campaign_id="test-campaign",
-        evaluation_campaign="eval-campaign",
+        evaluation_campaign="test-campaign",
         initial_candidate="seed.yaml",
         train_case_ids=("case-a", "case-b"),
         validation_case_ids=("case-c",),
@@ -313,6 +314,23 @@ class TestLoadRoundOutcome:
         outcome = load_round_outcome(root, action, control=ctrl, state=st)
         assert outcome.candidate_fingerprint == expected_fingerprint
         assert outcome.aggregate_score == 0.6
+
+    def test_evidence_campaign_id_binds_to_evaluation_campaign(
+        self, tmp_path: Path,
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        control = replace(_control(), campaign_id="optimization-controller")
+        state = replace(_state(), campaign_id="optimization-controller")
+
+        outcome = load_round_outcome(
+            root,
+            _search_action(),
+            control=control,
+            state=state,
+        )
+
+        assert outcome.evaluated_case_ids == ("case-c",)
 
     def test_rejects_wrong_action_id(self, tmp_path: Path) -> None:
         root = tmp_path / "evidence"

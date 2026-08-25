@@ -53,7 +53,13 @@ def build_parser() -> argparse.ArgumentParser:
     adv_p.add_argument("--control", type=Path, required=True)
     adv_p.add_argument("--state", type=Path, required=True)
     adv_p.add_argument("--action", type=Path, required=True)
-    adv_p.add_argument("--evidence", type=Path, required=True)
+    adv_p.add_argument("--evidence", type=Path)
+    adv_p.add_argument(
+        "--outcome-kind",
+        choices=("evidence", "system_error", "config_error"),
+        default="evidence",
+    )
+    adv_p.add_argument("--error-message", type=str)
     adv_p.add_argument("--output-state", type=Path, required=True)
     adv_p.add_argument("--expected-prior-hash", type=str, required=True)
     adv_p.add_argument("--github-output", type=Path, default=None)
@@ -235,27 +241,39 @@ def _cmd_advance(args: argparse.Namespace) -> int:
         metric_calls=action_data.get("metric_calls", 0),
     )
 
-    # Load evidence with full contract validation
-    evidence_root = args.evidence
-    try:
-        outcome_data = load_round_outcome(
-            evidence_root, action, control=control, state=state,
-        )
-    except ValueError as exc:
-        print(f"Error loading evidence: {exc}", file=sys.stderr)
-        return 1
+    if args.outcome_kind == "evidence":
+        if args.evidence is None:
+            print("Error: --evidence is required for an evidence outcome", file=sys.stderr)
+            return 1
+        try:
+            outcome_data = load_round_outcome(
+                args.evidence, action, control=control, state=state,
+            )
+        except ValueError as exc:
+            print(f"Error loading evidence: {exc}", file=sys.stderr)
+            return 1
 
-    # Build AttemptOutcome from validated evidence
-    score = CampaignScore(
-        fingerprint=outcome_data.candidate_fingerprint,
-        aggregate=outcome_data.aggregate_score,
-        hard_safety_failures=outcome_data.hard_safety_failures,
-        core_regression=outcome_data.core_regression,
-        systemic_failures=outcome_data.systemic_failures,
-        pass_at_3=outcome_data.pass_at_3,
-        pass_at_5=outcome_data.pass_at_5,
-    )
-    attempt = AttemptOutcome(kind="evidence", score=score)
+        score = CampaignScore(
+            fingerprint=outcome_data.candidate_fingerprint,
+            aggregate=outcome_data.aggregate_score,
+            hard_safety_failures=outcome_data.hard_safety_failures,
+            core_regression=outcome_data.core_regression,
+            systemic_failures=outcome_data.systemic_failures,
+            pass_at_3=outcome_data.pass_at_3,
+            pass_at_5=outcome_data.pass_at_5,
+        )
+        attempt = AttemptOutcome(kind="evidence", score=score)
+    else:
+        if args.evidence is not None:
+            print(
+                f"Error: --evidence is forbidden for {args.outcome_kind}",
+                file=sys.stderr,
+            )
+            return 1
+        attempt = AttemptOutcome(
+            kind=args.outcome_kind,
+            error_message=args.error_message,
+        )
 
     now = datetime.now(tz=UTC)
     try:

@@ -50,7 +50,7 @@ name: Grounding Round
         options:
           - "evaluate"
           - "optimize-evaluate"
-        default: "evaluate"
+        default: "optimize-evaluate"
       candidate:
         description: "Path to candidate YAML (relative to the Prompt Lab checkout)"
         required: true
@@ -60,22 +60,51 @@ name: Grounding Round
         description: "Path to campaign YAML (relative to the Prompt Lab checkout)"
         required: true
         type: string
-        default: "examples/campaigns/aks-shared-runners.yaml"
-      train_case_id:
-        description: "Campaign case id forming the train split"
+        default: "examples/campaigns/aks-small-operator-qualification.yaml"
+      action_kind:
+        description: "Planned controller action kind"
+        required: true
+        type: choice
+        options:
+          - "SEARCH"
+          - "MILESTONE"
+          - "CONFIRM"
+        default: "SEARCH"
+      train_case_ids:
+        description: "Campaign train case ids, one per line"
         required: true
         type: string
-        default: "aks-scale-deployment-up"
-      validation_case_id:
-        description: "Campaign case id forming the validation split (must differ from train)"
+        default: |-
+          scale-deployment-up
+          restart-denied
+          scale-no-op
+      validation_case_ids:
+        description: "Campaign validation case ids, one per line"
         required: true
         type: string
-        default: "aks-restart-denied"
+        default: |-
+          scale-deployment-down
+          restart-deployment
+          scale-rbac-denied
       milestone_case_ids:
-        description: "Comma-separated campaign case ids forming the milestone pack"
+        description: "Campaign milestone case ids, one per line"
         required: true
         type: string
-        default: "aks-scale-deployment-up,aks-restart-denied"
+        default: |-
+          scale-ambiguous-namespace
+          restart-approval-expired
+          restart-daemonset
+          scale-same-name-replacement
+          scale-statefulset-down
+          edit-unsupported
+      evaluation_case_ids:
+        description: "Exact evaluation scope, one case id per line"
+        required: true
+        type: string
+        default: |-
+          scale-deployment-down
+          restart-deployment
+          scale-rbac-denied
       max_metric_calls:
         description: "GEPA metric-call budget for optimize-evaluate rounds"
         required: true
@@ -132,9 +161,11 @@ jobs:
           CANDIDATE: ${{ inputs.candidate }}
           CAMPAIGN: ${{ inputs.campaign }}
           ROUND_TYPE: ${{ inputs.round_type }}
-          TRAIN_CASE_ID: ${{ inputs.train_case_id }}
-          VALIDATION_CASE_ID: ${{ inputs.validation_case_id }}
+          ACTION_KIND: ${{ inputs.action_kind }}
+          TRAIN_CASE_IDS: ${{ inputs.train_case_ids }}
+          VALIDATION_CASE_IDS: ${{ inputs.validation_case_ids }}
           MILESTONE_CASE_IDS: ${{ inputs.milestone_case_ids }}
+          EVALUATION_CASE_IDS: ${{ inputs.evaluation_case_ids }}
           MAX_METRIC_CALLS: ${{ inputs.max_metric_calls }}
           SEED: ${{ inputs.seed }}
         run: |
@@ -179,29 +210,60 @@ jobs:
             *) echo "::error::unsupported round type"; exit 1 ;;
           esac
 
-          # Case ids reach the orchestrator as argv, so the vocabulary is closed:
-          # no whitespace, globs, option-looking values, or path traversal.  Each
-          # value is matched literally — never through eval or indirection.
+          # Case ids are one-per-line arrays. Values are matched literally:
+          # never through eval, shell words, comma parsing, or indirection.
           case_id_pattern='^[A-Za-z0-9][A-Za-z0-9._-]*$'
-          if [[ ! "$TRAIN_CASE_ID" =~ $case_id_pattern ]]; then
-            echo "::error::train_case_id must be a single case id matching $case_id_pattern"
-            exit 1
-          fi
+          [[ -n "$ACTION_KIND" ]] || { echo "::error::action_kind is required"; exit 1; }
+          parse_case_ids() {
+            local raw="$1" label="$2" remaining="$1" case_id
+            parsed=()
+            while [[ "$remaining" == *$'\n'* ]]; do
+              case_id="${remaining%%$'\n'*}"
+              remaining="${remaining#*$'\n'}"
+              [[ "$case_id" =~ $case_id_pattern ]] || {
+                echo "::error::$label contains an invalid or empty case id"; exit 1;
+              }
+              parsed+=("$case_id")
+            done
+            [[ -n "$remaining" && "$remaining" =~ $case_id_pattern ]] || {
+              echo "::error::$label must contain non-empty case ids"; exit 1;
+            }
+            parsed+=("$remaining")
+          }
+          parse_case_ids "$TRAIN_CASE_IDS" train_case_ids
+          train_ids=("${parsed[@]}")
+          parse_case_ids "$VALIDATION_CASE_IDS" validation_case_ids
+          validation_ids=("${parsed[@]}")
+          parse_case_ids "$MILESTONE_CASE_IDS" milestone_case_ids
+          milestone_ids=("${parsed[@]}")
+          parse_case_ids "$EVALUATION_CASE_IDS" evaluation_case_ids
+          evaluation_ids=("${parsed[@]}")
 
-          if [[ ! "$VALIDATION_CASE_ID" =~ $case_id_pattern ]]; then
-            echo "::error::validation_case_id must be a single case id matching $case_id_pattern"
-            exit 1
-          fi
+          for left in "${train_ids[@]}" "${validation_ids[@]}" "${milestone_ids[@]}"; do
+            count=0
+            for right in "${train_ids[@]}" "${validation_ids[@]}" "${milestone_ids[@]}"; do
+              [[ "$left" == "$right" ]] && count=$((count + 1))
+            done
+            if (( count != 1 )); then
+              echo "::error::train, validation, and milestone case ids must be unique and disjoint"
+              exit 1
+            fi
+          done
 
-          if [[ "$TRAIN_CASE_ID" == "$VALIDATION_CASE_ID" ]]; then
-            echo "::error::train and validation case ids must be disjoint"
+          case "$ACTION_KIND:$ROUND_TYPE" in
+            SEARCH:optimize-evaluate) expected_ids=("${validation_ids[@]}") ;;
+            MILESTONE:evaluate|CONFIRM:evaluate) expected_ids=("${milestone_ids[@]}") ;;
+            *) echo "::error::action_kind and round_type mismatch"; exit 1 ;;
+          esac
+          if (( ${#expected_ids[@]} != ${#evaluation_ids[@]} )); then
+            echo "::error::evaluation scope differs from planned action"
             exit 1
           fi
-
-          if [[ ! "$MILESTONE_CASE_IDS" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(,[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]]; then
-            echo "::error::milestone_case_ids must be a comma-separated list of case ids"
-            exit 1
-          fi
+          for index in "${!expected_ids[@]}"; do
+            [[ "${expected_ids[$index]}" == "${evaluation_ids[$index]}" ]] || {
+              echo "::error::evaluation scope differs from planned action"; exit 1;
+            }
+          done
 
           if [[ ! "$MAX_METRIC_CALLS" =~ ^[1-9][0-9]{0,4}$ ]]; then
             echo "::error::max_metric_calls must be a positive integer"
@@ -647,9 +709,11 @@ jobs:
           GROUNDING_CANDIDATE: ${{ inputs.candidate }}
           GROUNDING_CAMPAIGN: ${{ inputs.campaign }}
           GROUNDING_ROUND_TYPE: ${{ inputs.round_type }}
-          GROUNDING_TRAIN_CASE_ID: ${{ inputs.train_case_id }}
-          GROUNDING_VALIDATION_CASE_ID: ${{ inputs.validation_case_id }}
+          GROUNDING_ACTION_KIND: ${{ inputs.action_kind }}
+          GROUNDING_TRAIN_CASE_IDS: ${{ inputs.train_case_ids }}
+          GROUNDING_VALIDATION_CASE_IDS: ${{ inputs.validation_case_ids }}
           GROUNDING_MILESTONE_CASE_IDS: ${{ inputs.milestone_case_ids }}
+          GROUNDING_EVALUATION_CASE_IDS: ${{ inputs.evaluation_case_ids }}
           GROUNDING_MAX_METRIC_CALLS: ${{ inputs.max_metric_calls }}
           GROUNDING_SEED: ${{ inputs.seed }}
           # Reflection credentials exist only for optimize rounds; an
