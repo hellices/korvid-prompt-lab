@@ -1426,6 +1426,48 @@ def test_round_script_requires_a_positive_metric_call_budget(tmp_path: Path) -> 
         assert calls == []
 
 
+def test_evaluate_only_action_accepts_zero_gepa_budget(tmp_path: Path) -> None:
+    result, calls = run_script(
+        tmp_path,
+        round_type="evaluate",
+        extra_env={"GROUNDING_MAX_METRIC_CALLS": "0"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "evaluate" in calls
+    assert "optimize" not in calls
+
+
+def test_evaluate_only_action_rejects_malformed_gepa_budget(tmp_path: Path) -> None:
+    result, calls = run_script(
+        tmp_path,
+        round_type="evaluate",
+        extra_env={"GROUNDING_MAX_METRIC_CALLS": "zero"},
+    )
+
+    assert result.returncode == 2
+    assert calls == []
+
+
+def test_standalone_evaluate_does_not_require_campaign_action_metadata(
+    tmp_path: Path,
+) -> None:
+    result, calls = run_script(
+        tmp_path,
+        round_type="evaluate",
+        extra_env={
+            "GROUNDING_ACTION_KIND": "",
+            "GROUNDING_CAMPAIGN_ACTION_ID": "",
+            "GROUNDING_OPTIMIZATION_CAMPAIGN": "",
+            "GROUNDING_MAX_METRIC_CALLS": "",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "evaluate" in calls
+    assert "optimize" not in calls
+
+
 def test_round_script_requires_a_non_negative_seed(tmp_path: Path) -> None:
     for index, value in enumerate(("-1", "abc", "0x10", "")):
         result, calls = run_script(

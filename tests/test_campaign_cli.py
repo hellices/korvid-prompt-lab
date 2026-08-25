@@ -325,6 +325,66 @@ class TestCLIAdvance:
                 # missing --expected-prior-hash
             ])
 
+    def test_validate_evidence_rejects_malformed_without_writing_state(
+        self, tmp_path: Path,
+    ) -> None:
+        state_path = tmp_path / "state.json"
+        control_path = tmp_path / "control.yaml"
+        action_path = tmp_path / "action.json"
+        evidence_path = tmp_path / "evidence"
+        evidence_path.mkdir()
+        (evidence_path / "round-summary.json").write_text("{not-json")
+        _write_control(control_path)
+        current_hash = _write_state(state_path)
+        assert main([
+            "plan", "--control", str(control_path), "--state", str(state_path),
+            "--output", str(action_path),
+        ]) == 0
+
+        rc = main([
+            "validate-evidence",
+            "--control", str(control_path),
+            "--state", str(state_path),
+            "--action", str(action_path),
+            "--evidence", str(evidence_path),
+            "--expected-prior-hash", current_hash,
+        ])
+
+        assert rc == 1
+        assert list(tmp_path.glob("*state*")) == [state_path]
+
+    def test_validate_evidence_rejects_contradictory_action_binding(
+        self, tmp_path: Path,
+    ) -> None:
+        state_path = tmp_path / "state.json"
+        control_path = tmp_path / "control.yaml"
+        action_path = tmp_path / "action.json"
+        evidence_path = tmp_path / "evidence"
+        _write_control(control_path)
+        current_hash = _write_state(state_path)
+        assert main([
+            "plan", "--control", str(control_path), "--state", str(state_path),
+            "--output", str(action_path),
+        ]) == 0
+        action = json.loads(action_path.read_text())
+        _write_evidence(evidence_path, action)
+        summary_path = evidence_path / "round-summary.json"
+        summary = json.loads(summary_path.read_text())
+        summary["campaign_action_id"] = "different-action"
+        summary_path.write_text(json.dumps(summary))
+
+        rc = main([
+            "validate-evidence",
+            "--control", str(control_path),
+            "--state", str(state_path),
+            "--action", str(action_path),
+            "--evidence", str(evidence_path),
+            "--expected-prior-hash", current_hash,
+        ])
+
+        assert rc == 1
+        assert list(tmp_path.glob("*state*")) == [state_path]
+
     def test_advance_updates_state(self, tmp_path: Path) -> None:
         state_path = tmp_path / "state.json"
         control_path = tmp_path / "control.yaml"

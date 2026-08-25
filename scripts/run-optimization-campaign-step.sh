@@ -167,7 +167,11 @@ export GROUNDING_ACTION_KIND="$(json_scalar kind)"
 export GROUNDING_ROUND_TYPE="$(json_scalar round_type)"
 export GROUNDING_MODEL="$(json_scalar model)"
 export KORVID_AKS_MODEL="$GROUNDING_MODEL"
-export GROUNDING_MAX_METRIC_CALLS="$(json_scalar metric_calls)"
+if [[ "$GROUNDING_ACTION_KIND" == "SEARCH" ]]; then
+  export GROUNDING_MAX_METRIC_CALLS="$(json_scalar metric_calls)"
+else
+  unset GROUNDING_MAX_METRIC_CALLS
+fi
 export GROUNDING_SEED="$(json_scalar seed)"
 export GROUNDING_TRAIN_CASE_IDS="$(json_lines train_case_ids)"
 export GROUNDING_VALIDATION_CASE_IDS="$(json_lines validation_case_ids)"
@@ -204,11 +208,17 @@ _outcome_kind=evidence
 _advance_args=()
 case "$_round_exit" in
   0|1)
-    if [[ ! -d "${GROUNDING_ARTIFACT_ROOT}/safe-evidence" ]]; then
-      echo "grounding round returned evidence exit without safe evidence" >&2
-      _outcome_kind=system_error
+    _safe_evidence="${GROUNDING_ARTIFACT_ROOT}/safe-evidence"
+    if korvid-campaign validate-evidence \
+        --control "$CAMPAIGN_CONTROL" \
+        --state "$CAMPAIGN_STATE" \
+        --action "$_action_path" \
+        --evidence "$_safe_evidence" \
+        --expected-prior-hash "$CAMPAIGN_EXPECTED_PRIOR_HASH"; then
+      _advance_args+=(--evidence "$_safe_evidence")
     else
-      _advance_args+=(--evidence "${GROUNDING_ARTIFACT_ROOT}/safe-evidence")
+      echo "grounding safe evidence failed strict validation" >&2
+      _outcome_kind=system_error
     fi
     ;;
   70)

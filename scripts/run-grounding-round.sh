@@ -6,10 +6,8 @@
 #   GROUNDING_CANDIDATE        — path of the candidate YAML (checkout-relative)
 #   GROUNDING_CAMPAIGN         — path of the campaign YAML (checkout-relative)
 #   GROUNDING_ROUND_TYPE       — evaluate | optimize-evaluate
-#   GROUNDING_ACTION_KIND         — SEARCH | MILESTONE | CONFIRM
 #   GROUNDING_*_CASE_IDS          — newline-separated train, validation,
 #                                   milestone, and evaluation case-id arrays
-#   GROUNDING_MAX_METRIC_CALLS    — GEPA metric-call budget (positive integer)
 #   GROUNDING_SEED                — GEPA search seed (non-negative integer)
 #   KORVID_SOURCE_ROOT         — path to Korvid repository checkout
 #   KORVID_AKS_MODEL           — model the campaign serves; must equal GROUNDING_MODEL
@@ -21,8 +19,11 @@
 #   KORVID_REVISION            — korvid git revision (for report)
 #
 # Additional required for optimize-evaluate:
+#   GROUNDING_MAX_METRIC_CALLS    — GEPA metric-call budget (positive integer)
 #   GROUNDING_REFLECTION_MODEL      — reflection LLM model identifier
 #   GROUNDING_REFLECTION_CREDENTIAL — API credential for hosted reflection models
+# Optional campaign-controller binding:
+#   GROUNDING_ACTION_KIND         — SEARCH | MILESTONE | CONFIRM
 #
 # The campaign resolves `models`, `serving.namespace`, `serving.service`, and
 # `serving.model` through `env:` references, so the KORVID_AKS_* variables are as
@@ -43,12 +44,10 @@ source "${SCRIPT_DIR}/lib/reflection-provider.sh"
 : "${GROUNDING_CANDIDATE:?GROUNDING_CANDIDATE is required}"
 : "${GROUNDING_CAMPAIGN:?GROUNDING_CAMPAIGN is required}"
 : "${GROUNDING_ROUND_TYPE:?GROUNDING_ROUND_TYPE is required}"
-: "${GROUNDING_ACTION_KIND:?GROUNDING_ACTION_KIND is required}"
 : "${GROUNDING_TRAIN_CASE_IDS:?GROUNDING_TRAIN_CASE_IDS is required}"
 : "${GROUNDING_VALIDATION_CASE_IDS:?GROUNDING_VALIDATION_CASE_IDS is required}"
 : "${GROUNDING_MILESTONE_CASE_IDS:?GROUNDING_MILESTONE_CASE_IDS is required}"
 : "${GROUNDING_EVALUATION_CASE_IDS:?GROUNDING_EVALUATION_CASE_IDS is required}"
-: "${GROUNDING_MAX_METRIC_CALLS:?GROUNDING_MAX_METRIC_CALLS is required}"
 : "${GROUNDING_SEED:?GROUNDING_SEED is required}"
 : "${KORVID_SOURCE_ROOT:?KORVID_SOURCE_ROOT is required}"
 : "${KORVID_AKS_MODEL:?KORVID_AKS_MODEL is required by the campaign env: references}"
@@ -165,6 +164,7 @@ for _left_name in TRAIN VALIDATION MILESTONE; do
   done
 done
 
+GROUNDING_ACTION_KIND="${GROUNDING_ACTION_KIND:-}"
 case "$GROUNDING_ACTION_KIND:$GROUNDING_ROUND_TYPE" in
   SEARCH:optimize-evaluate)
     _expected_evaluation=("${GROUNDING_VALIDATION_CASE_IDS_ARRAY[@]}")
@@ -172,17 +172,22 @@ case "$GROUNDING_ACTION_KIND:$GROUNDING_ROUND_TYPE" in
   MILESTONE:evaluate|CONFIRM:evaluate)
     _expected_evaluation=("${GROUNDING_MILESTONE_CASE_IDS_ARRAY[@]}")
     ;;
+  :evaluate|:optimize-evaluate)
+    _expected_evaluation=("${GROUNDING_EVALUATION_CASE_IDS_ARRAY[@]}")
+    ;;
   *)
     echo "action kind and round type mismatch: $GROUNDING_ACTION_KIND/$GROUNDING_ROUND_TYPE" >&2
     exit 2
     ;;
 esac
-if (( ${#_expected_evaluation[@]} != ${#GROUNDING_EVALUATION_CASE_IDS_ARRAY[@]} )); then
+if [[ -n "$GROUNDING_ACTION_KIND" ]] \
+    && (( ${#_expected_evaluation[@]} != ${#GROUNDING_EVALUATION_CASE_IDS_ARRAY[@]} )); then
   echo "evaluation scope differs from planned $GROUNDING_ACTION_KIND action" >&2
   exit 2
 fi
 for _scope_index in "${!_expected_evaluation[@]}"; do
-  if [[ "${_expected_evaluation[$_scope_index]}" != "${GROUNDING_EVALUATION_CASE_IDS_ARRAY[$_scope_index]}" ]]; then
+  if [[ -n "$GROUNDING_ACTION_KIND" ]] \
+      && [[ "${_expected_evaluation[$_scope_index]}" != "${GROUNDING_EVALUATION_CASE_IDS_ARRAY[$_scope_index]}" ]]; then
     echo "evaluation scope differs from planned $GROUNDING_ACTION_KIND action" >&2
     exit 2
   fi
@@ -221,8 +226,14 @@ then
   exit 2
 fi
 
-if [[ ! "$GROUNDING_MAX_METRIC_CALLS" =~ ^[1-9][0-9]{0,4}$ ]]; then
-  echo "GROUNDING_MAX_METRIC_CALLS must be a positive integer: $GROUNDING_MAX_METRIC_CALLS" >&2
+if [[ "$GROUNDING_ROUND_TYPE" == "optimize-evaluate" ]]; then
+  if [[ ! "${GROUNDING_MAX_METRIC_CALLS:-}" =~ ^[1-9][0-9]{0,4}$ ]]; then
+    echo "GROUNDING_MAX_METRIC_CALLS must be a positive integer: ${GROUNDING_MAX_METRIC_CALLS:-}" >&2
+    exit 2
+  fi
+elif [[ -n "${GROUNDING_MAX_METRIC_CALLS:-}" ]] \
+    && [[ ! "$GROUNDING_MAX_METRIC_CALLS" =~ ^[0-9]{1,5}$ ]]; then
+  echo "GROUNDING_MAX_METRIC_CALLS must be a non-negative integer when supplied: $GROUNDING_MAX_METRIC_CALLS" >&2
   exit 2
 fi
 

@@ -64,6 +64,17 @@ def build_parser() -> argparse.ArgumentParser:
     adv_p.add_argument("--expected-prior-hash", type=str, required=True)
     adv_p.add_argument("--github-output", type=Path, default=None)
 
+    # validate-evidence (read-only preflight for unambiguous wrapper fallback)
+    val_p = sub.add_parser(
+        "validate-evidence",
+        help="Validate evidence and the resulting pure transition without persistence.",
+    )
+    val_p.add_argument("--control", type=Path, required=True)
+    val_p.add_argument("--state", type=Path, required=True)
+    val_p.add_argument("--action", type=Path, required=True)
+    val_p.add_argument("--evidence", type=Path, required=True)
+    val_p.add_argument("--expected-prior-hash", type=str, required=True)
+
     # render
     rend_p = sub.add_parser("render", help="Render campaign summary.")
     rend_p.add_argument("--control", type=Path, required=True)
@@ -301,6 +312,54 @@ def _cmd_advance(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_validate_evidence(args: argparse.Namespace) -> int:
+    """Validate evidence and its transition without writing campaign state."""
+    control = _load_control(args.control)
+    state = _load_state(args.state)
+    current_hash = state_hash(state)
+    if args.expected_prior_hash != current_hash:
+        print("Error: expected prior hash mismatch", file=sys.stderr)
+        return 1
+
+    try:
+        action_data = json.loads(args.action.read_text(encoding="utf-8"))
+        action = CampaignAction(
+            action_id=action_data["action_id"],
+            kind=ActionKind(action_data["kind"]),
+            expected_state_hash=action_data["expected_state_hash"],
+            stage_index=action_data.get("stage_index", 0),
+            seed_index=action_data.get("seed_index", 0),
+            tier_index=action_data.get("tier_index", 0),
+            metric_calls=action_data.get("metric_calls", 0),
+        )
+        outcome_data = load_round_outcome(
+            args.evidence,
+            action,
+            control=control,
+            state=state,
+        )
+        score = CampaignScore(
+            fingerprint=outcome_data.candidate_fingerprint,
+            aggregate=outcome_data.aggregate_score,
+            hard_safety_failures=outcome_data.hard_safety_failures,
+            core_regression=outcome_data.core_regression,
+            systemic_failures=outcome_data.systemic_failures,
+            pass_at_3=outcome_data.pass_at_3,
+            pass_at_5=outcome_data.pass_at_5,
+        )
+        advance_state(
+            control,
+            state,
+            action,
+            AttemptOutcome(kind="evidence", score=score),
+            datetime.now(tz=UTC),
+        )
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Error validating evidence: {str(exc)[:240]}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _cmd_render(args: argparse.Namespace) -> int:
     control = _load_control(args.control)
     state = _load_state(args.state)
@@ -316,6 +375,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     commands = {
         "plan": _cmd_plan,
         "advance": _cmd_advance,
+        "validate-evidence": _cmd_validate_evidence,
         "render": _cmd_render,
     }
     handler = commands.get(args.command)

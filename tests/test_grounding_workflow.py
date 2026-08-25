@@ -237,6 +237,8 @@ def test_grounding_workflow_declares_typed_inputs() -> None:
     assert inputs["model"]["type"] == "choice"
     assert inputs["round_type"]["type"] == "choice"
     assert set(inputs["round_type"]["options"]) == {"evaluate", "optimize-evaluate"}
+    assert inputs["round_type"]["default"] == "evaluate"
+    assert "action_kind" not in inputs
     assert inputs["pr_number"]["type"] == "number", (
         "pr_number must be typed so a free-form string can never reach the API call"
     )
@@ -1165,7 +1167,6 @@ def test_grounding_workflow_declares_campaign_case_and_budget_inputs() -> None:
 
     for name in (
         "campaign",
-        "action_kind",
         "train_case_ids",
         "validation_case_ids",
         "milestone_case_ids",
@@ -1181,8 +1182,6 @@ def test_grounding_workflow_declares_campaign_case_and_budget_inputs() -> None:
 
     assert inputs["campaign"]["type"] == "string"
     assert inputs["campaign"]["default"].endswith(".yaml")
-    assert inputs["action_kind"]["type"] == "choice"
-    assert set(inputs["action_kind"]["options"]) == {"SEARCH", "MILESTONE", "CONFIRM"}
     assert inputs["train_case_ids"]["type"] == "string"
     assert inputs["validation_case_ids"]["type"] == "string"
     assert inputs["milestone_case_ids"]["type"] == "string"
@@ -1208,7 +1207,6 @@ def test_grounding_workflow_validates_campaign_case_and_budget_inputs_first() ->
 
     expected = {
         "CAMPAIGN": "${{ inputs.campaign }}",
-        "ACTION_KIND": "${{ inputs.action_kind }}",
         "TRAIN_CASE_IDS": "${{ inputs.train_case_ids }}",
         "VALIDATION_CASE_IDS": "${{ inputs.validation_case_ids }}",
         "MILESTONE_CASE_IDS": "${{ inputs.milestone_case_ids }}",
@@ -1240,12 +1238,14 @@ def test_grounding_workflow_wires_campaign_cases_and_budget_to_the_orchestrator(
     env = effective_env(workflow, orchestrator_step(workflow))
 
     assert env["GROUNDING_CAMPAIGN"] == "${{ inputs.campaign }}"
-    assert env["GROUNDING_ACTION_KIND"] == "${{ inputs.action_kind }}"
+    assert "GROUNDING_ACTION_KIND" not in env
     assert env["GROUNDING_TRAIN_CASE_IDS"] == "${{ inputs.train_case_ids }}"
     assert env["GROUNDING_VALIDATION_CASE_IDS"] == "${{ inputs.validation_case_ids }}"
     assert env["GROUNDING_MILESTONE_CASE_IDS"] == "${{ inputs.milestone_case_ids }}"
     assert env["GROUNDING_EVALUATION_CASE_IDS"] == "${{ inputs.evaluation_case_ids }}"
-    assert env["GROUNDING_MAX_METRIC_CALLS"] == "${{ inputs.max_metric_calls }}"
+    assert "inputs.round_type == 'optimize-evaluate'" in env[
+        "GROUNDING_MAX_METRIC_CALLS"
+    ]
     assert env["GROUNDING_SEED"] == "${{ inputs.seed }}"
 
 

@@ -50,7 +50,7 @@ name: Grounding Round
         options:
           - "evaluate"
           - "optimize-evaluate"
-        default: "optimize-evaluate"
+        default: "evaluate"
       candidate:
         description: "Path to candidate YAML (relative to the Prompt Lab checkout)"
         required: true
@@ -61,15 +61,6 @@ name: Grounding Round
         required: true
         type: string
         default: "examples/campaigns/aks-small-operator-qualification.yaml"
-      action_kind:
-        description: "Planned controller action kind"
-        required: true
-        type: choice
-        options:
-          - "SEARCH"
-          - "MILESTONE"
-          - "CONFIRM"
-        default: "SEARCH"
       train_case_ids:
         description: "Campaign train case ids, one per line"
         required: true
@@ -161,7 +152,6 @@ jobs:
           CANDIDATE: ${{ inputs.candidate }}
           CAMPAIGN: ${{ inputs.campaign }}
           ROUND_TYPE: ${{ inputs.round_type }}
-          ACTION_KIND: ${{ inputs.action_kind }}
           TRAIN_CASE_IDS: ${{ inputs.train_case_ids }}
           VALIDATION_CASE_IDS: ${{ inputs.validation_case_ids }}
           MILESTONE_CASE_IDS: ${{ inputs.milestone_case_ids }}
@@ -213,7 +203,6 @@ jobs:
           # Case ids are one-per-line arrays. Values are matched literally:
           # never through eval, shell words, comma parsing, or indirection.
           case_id_pattern='^[A-Za-z0-9][A-Za-z0-9._-]*$'
-          [[ -n "$ACTION_KIND" ]] || { echo "::error::action_kind is required"; exit 1; }
           parse_case_ids() {
             local raw="$1" label="$2" remaining="$1" case_id
             parsed=()
@@ -248,21 +237,6 @@ jobs:
               echo "::error::train, validation, and milestone case ids must be unique and disjoint"
               exit 1
             fi
-          done
-
-          case "$ACTION_KIND:$ROUND_TYPE" in
-            SEARCH:optimize-evaluate) expected_ids=("${validation_ids[@]}") ;;
-            MILESTONE:evaluate|CONFIRM:evaluate) expected_ids=("${milestone_ids[@]}") ;;
-            *) echo "::error::action_kind and round_type mismatch"; exit 1 ;;
-          esac
-          if (( ${#expected_ids[@]} != ${#evaluation_ids[@]} )); then
-            echo "::error::evaluation scope differs from planned action"
-            exit 1
-          fi
-          for index in "${!expected_ids[@]}"; do
-            [[ "${expected_ids[$index]}" == "${evaluation_ids[$index]}" ]] || {
-              echo "::error::evaluation scope differs from planned action"; exit 1;
-            }
           done
 
           if [[ ! "$MAX_METRIC_CALLS" =~ ^[1-9][0-9]{0,4}$ ]]; then
@@ -709,12 +683,11 @@ jobs:
           GROUNDING_CANDIDATE: ${{ inputs.candidate }}
           GROUNDING_CAMPAIGN: ${{ inputs.campaign }}
           GROUNDING_ROUND_TYPE: ${{ inputs.round_type }}
-          GROUNDING_ACTION_KIND: ${{ inputs.action_kind }}
           GROUNDING_TRAIN_CASE_IDS: ${{ inputs.train_case_ids }}
           GROUNDING_VALIDATION_CASE_IDS: ${{ inputs.validation_case_ids }}
           GROUNDING_MILESTONE_CASE_IDS: ${{ inputs.milestone_case_ids }}
           GROUNDING_EVALUATION_CASE_IDS: ${{ inputs.evaluation_case_ids }}
-          GROUNDING_MAX_METRIC_CALLS: ${{ inputs.max_metric_calls }}
+          GROUNDING_MAX_METRIC_CALLS: ${{ inputs.round_type == 'optimize-evaluate' && inputs.max_metric_calls || '' }}
           GROUNDING_SEED: ${{ inputs.seed }}
           # Reflection credentials exist only for optimize rounds; an
           # evaluate-only round never materialises them.
