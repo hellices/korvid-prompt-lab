@@ -237,7 +237,11 @@ def _write_search_evidence(
         "contract": {
             "campaign_id": "test-campaign",
             "models": list(models),
-            "case_repetitions": [[case_id, models[0], 5] for case_id in evaluated_case_ids],
+            "case_repetitions": sorted(
+                [case_id, models[0], rep]
+                for case_id in evaluated_case_ids
+                for rep in range(1, 6)  # repetitions_per_case=5
+            ),
             "execution_modes": ["live"],
         },
         "metrics": [
@@ -851,3 +855,70 @@ class TestCompareAndSwap:
         with patch("os.replace", side_effect=OSError("disk full")), pytest.raises(OSError):
             write_campaign_state(st, path, expected_prior_hash=h)
         assert not list(path.parent.glob(f"{path.name}.*.tmp"))
+
+
+class TestCaseRepetitionsCartesian:
+    """Full Cartesian case_repetitions validation with N=5 repetitions."""
+
+    def test_full_cartesian_product_success(self, tmp_path: Path) -> None:
+        """2 cases × 5 reps = 10 triplets in sorted order passes."""
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        # _write_search_evidence already produces the full Cartesian product
+        outcome = load_round_outcome(root, _search_action(), control=_control(), state=_state())
+        assert outcome.aggregate_score == 0.6
+
+    def test_missing_one_triplet_rejected(self, tmp_path: Path) -> None:
+        """Omitting one case/repetition triplet is rejected."""
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        comparison = json.loads((root / "comparison-summary.json").read_text())
+        # Remove last triplet
+        comparison["contract"]["case_repetitions"] = comparison["contract"]["case_repetitions"][:-1]
+        (root / "comparison-summary.json").write_text(json.dumps(comparison))
+        with pytest.raises(ValueError, match="does not match expected Cartesian set"):
+            load_round_outcome(root, _search_action(), control=_control(), state=_state())
+
+    def test_duplicate_triplet_rejected(self, tmp_path: Path) -> None:
+        """Duplicate triplets are rejected."""
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        comparison = json.loads((root / "comparison-summary.json").read_text())
+        reps = comparison["contract"]["case_repetitions"]
+        reps.append(reps[0])  # duplicate first
+        (root / "comparison-summary.json").write_text(json.dumps(comparison))
+        with pytest.raises(ValueError, match="duplicate triplet"):
+            load_round_outcome(root, _search_action(), control=_control(), state=_state())
+
+    def test_wrong_repetition_out_of_range_rejected(self, tmp_path: Path) -> None:
+        """Repetition 0 or > N is rejected."""
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        comparison = json.loads((root / "comparison-summary.json").read_text())
+        reps = comparison["contract"]["case_repetitions"]
+        reps[0][2] = 0  # out of range
+        (root / "comparison-summary.json").write_text(json.dumps(comparison))
+        with pytest.raises(ValueError, match="must be positive"):
+            load_round_outcome(root, _search_action(), control=_control(), state=_state())
+
+    def test_repetition_above_n_rejected(self, tmp_path: Path) -> None:
+        """Repetition 6 with repetitions_per_case=5 is out of range."""
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        comparison = json.loads((root / "comparison-summary.json").read_text())
+        reps = comparison["contract"]["case_repetitions"]
+        reps[0][2] = 6  # above N=5
+        (root / "comparison-summary.json").write_text(json.dumps(comparison))
+        with pytest.raises(ValueError, match="out of range"):
+            load_round_outcome(root, _search_action(), control=_control(), state=_state())
+
+    def test_wrong_model_in_triplet_rejected(self, tmp_path: Path) -> None:
+        """Wrong model in a triplet is rejected."""
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        comparison = json.loads((root / "comparison-summary.json").read_text())
+        reps = comparison["contract"]["case_repetitions"]
+        reps[0][1] = "wrong-model"
+        (root / "comparison-summary.json").write_text(json.dumps(comparison))
+        with pytest.raises(ValueError, match="model mismatch"):
+            load_round_outcome(root, _search_action(), control=_control(), state=_state())

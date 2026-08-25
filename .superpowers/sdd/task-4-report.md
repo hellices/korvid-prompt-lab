@@ -93,3 +93,40 @@ cd /Users/hwang-inhwan/workspace/kube-prompt-grounding/.worktrees/feat-bounded-o
 cd /Users/hwang-inhwan/workspace/kube-prompt-grounding/.worktrees/feat-bounded-optimization-campaign && python -m mypy src/korvid_prompt_lab/campaign_artifacts.py src/korvid_prompt_lab/rounds.py src/korvid_prompt_lab/round_cli.py src/korvid_prompt_lab/campaign_cli.py
 git commit -m "fix(campaigns): compatibility fixes — campaign_action_id, case_repetitions shape, exact max_metric_calls" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
+
+## Fix Wave 3: Producer Wiring & Cartesian Validation
+
+**Commit:** `5b0ac33` — `fix(campaigns): wire shell producer campaign_action_id, Cartesian case_repetitions`
+
+### Changes
+
+1. **Shell producer** (`scripts/run-grounding-round.sh`): Accepts optional `GROUNDING_CAMPAIGN_ACTION_ID` env var; validates pattern `^[A-Za-z0-9][A-Za-z0-9._-]*$`; appends `--campaign-action-id` to `korvid-grounding-report` when set; omits when unset (backward-compatible).
+
+2. **Cartesian case_repetitions**: `_validate_comparison_summary` now builds the full expected Cartesian product `case_ids × model × repetitions 1..N`, then verifies the actual triplet set matches exactly (no duplicates, omissions, extras, or out-of-range repetitions).
+
+3. **Process-level tests** (`tests/test_grounding_script.py`): 3 new tests — set→arg present, unset→absent, invalid→exit 2.
+
+4. **Unit tests** (`tests/test_campaign_artifacts.py`): 6 new tests in `TestCaseRepetitionsCartesian` — full success, missing triplet, duplicate, rep=0, rep>N, wrong model.
+
+### RED → GREEN
+
+| Phase | Command | Result |
+|-------|---------|--------|
+| RED | `pytest tests/test_campaign_artifacts.py::TestCaseRepetitionsCartesian -q` | 6 FAILED (before Cartesian fix) |
+| GREEN | `pytest tests/test_campaign_artifacts.py tests/test_campaign_cli.py tests/test_rounds.py tests/test_campaigns.py -q` | 129 passed |
+| Script | `pytest tests/test_grounding_script.py::test_campaign_action_id_set_passes_to_report tests/test_grounding_script.py::test_campaign_action_id_unset_omitted_from_report tests/test_grounding_script.py::test_campaign_action_id_invalid_rejected -q` | 3 passed |
+| Lint | `ruff check src/korvid_prompt_lab/{campaign_artifacts,rounds,round_cli,campaign_cli}.py` | All checks passed |
+| Types | `mypy src/korvid_prompt_lab/{campaign_artifacts,rounds,round_cli,campaign_cli}.py` | Success: no issues found in 4 source files |
+| Bash | `bash -n scripts/run-grounding-round.sh` | OK |
+
+### Commit SHAs (all on `feat/bounded-optimization-campaign`)
+
+- `fbfe523` — initial Task 4 implementation
+- `3dcb4a3` — fix wave 1
+- `200e891` — fix wave 2 (cross-process CAS, strict schemas)
+- `b7458a0` — compatibility fixes (campaign_action_id, 3-tuple shape, exact max_metric_calls)
+- `5b0ac33` — this wave (shell producer, Cartesian validation)
+
+### Concerns
+
+None.

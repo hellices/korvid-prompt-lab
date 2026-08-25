@@ -379,11 +379,22 @@ def _validate_comparison_summary(
     case_repetitions = contract.get("case_repetitions")
     if not isinstance(case_repetitions, list) or not case_repetitions:
         raise ValueError("comparison-summary.contract.case_repetitions must be a non-empty list")
-    comparison_case_ids: list[str] = []
     expected_repetitions = _require_positive_int(
         eval_summary.get("repetitions_per_case"),
         "evaluation-summary.repetitions_per_case",
     )
+    expected_model = state.model_identity.model
+
+    # Build expected Cartesian product: sorted(case_id, model, rep) for
+    # case_id in expected_case_ids, rep in 1..N — matches comparison.py producer.
+    expected_triplets = sorted(
+        (cid, expected_model, rep)
+        for cid in expected_case_ids
+        for rep in range(1, expected_repetitions + 1)
+    )
+
+    actual_triplets: list[tuple[str, str, int]] = []
+    seen_triplets: set[tuple[str, str, int]] = set()
     for index, entry in enumerate(case_repetitions):
         if not isinstance(entry, list) or len(entry) != 3:
             raise ValueError(
@@ -395,18 +406,28 @@ def _validate_comparison_summary(
         model = _require_str(
             entry[1], f"comparison-summary.contract.case_repetitions[{index}][1]",
         )
-        if model != state.model_identity.model:
+        if model != expected_model:
             raise ValueError(
                 f"comparison-summary.contract.case_repetitions[{index}][1] model mismatch"
             )
         repetition = _require_positive_int(
             entry[2], f"comparison-summary.contract.case_repetitions[{index}][2]",
         )
-        if repetition != expected_repetitions:
-            raise ValueError("comparison-summary.contract.case_repetitions repetition mismatch")
-        comparison_case_ids.append(case_id)
-    if tuple(sorted(comparison_case_ids)) != tuple(sorted(expected_case_ids)):
-        raise ValueError("comparison-summary.contract.case_repetitions case set mismatch")
+        if repetition < 1 or repetition > expected_repetitions:
+            raise ValueError(
+                f"comparison-summary.contract.case_repetitions[{index}][2] "
+                f"repetition {repetition} out of range 1..{expected_repetitions}"
+            )
+        triplet = (case_id, model, repetition)
+        if triplet in seen_triplets:
+            raise ValueError(
+                f"comparison-summary.contract.case_repetitions[{index}] duplicate triplet"
+            )
+        seen_triplets.add(triplet)
+        actual_triplets.append(triplet)
+
+    if sorted(actual_triplets) != expected_triplets:
+        raise ValueError("comparison-summary.contract.case_repetitions does not match expected Cartesian set")
 
     execution_modes = _require_string_list(
         contract.get("execution_modes"),

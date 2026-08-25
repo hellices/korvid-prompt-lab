@@ -1577,3 +1577,36 @@ def test_evaluate_only_still_runs_once_without_before_argument(tmp_path: Path) -
     assert result.returncode == 0, result.stderr
     assert sum(call.startswith("evaluate candidate=") for call in calls) == 1
     assert "--before-artifact-root" not in calls
+
+
+def test_campaign_action_id_set_passes_to_report(tmp_path: Path) -> None:
+    """When GROUNDING_CAMPAIGN_ACTION_ID is set, it appears as --campaign-action-id in report args."""
+    result, calls = run_script(
+        tmp_path,
+        round_type="evaluate",
+        extra_env={"GROUNDING_CAMPAIGN_ACTION_ID": "search-3"},
+    )
+    assert result.returncode == 0, result.stderr
+    report_args = [line for line in calls if line.startswith("report arg=")]
+    assert "report arg=--campaign-action-id" in report_args
+    idx = report_args.index("report arg=--campaign-action-id")
+    assert report_args[idx + 1] == "report arg=search-3"
+
+
+def test_campaign_action_id_unset_omitted_from_report(tmp_path: Path) -> None:
+    """When GROUNDING_CAMPAIGN_ACTION_ID is not set, --campaign-action-id is absent."""
+    result, calls = run_script(tmp_path, round_type="evaluate")
+    assert result.returncode == 0, result.stderr
+    report_args = [line for line in calls if line.startswith("report arg=")]
+    assert "report arg=--campaign-action-id" not in report_args
+
+
+def test_campaign_action_id_invalid_rejected(tmp_path: Path) -> None:
+    """An invalid GROUNDING_CAMPAIGN_ACTION_ID (e.g. spaces) exits 2."""
+    result, _calls = run_script(
+        tmp_path,
+        round_type="evaluate",
+        extra_env={"GROUNDING_CAMPAIGN_ACTION_ID": "has spaces"},
+    )
+    assert result.returncode == 2
+    assert "GROUNDING_CAMPAIGN_ACTION_ID" in result.stderr

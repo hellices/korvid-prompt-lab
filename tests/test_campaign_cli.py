@@ -183,7 +183,7 @@ def _write_evidence(
         "contract": {
             "campaign_id": "test-campaign",
             "models": ["qwen3:0.6b"],
-            "case_repetitions": [["case-c", "qwen3:0.6b", 5]],
+            "case_repetitions": [["case-c", "qwen3:0.6b", r] for r in range(1, 6)],
             "execution_modes": ["live"],
         },
         "metrics": [

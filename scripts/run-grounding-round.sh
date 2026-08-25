@@ -498,6 +498,13 @@ fi
 if [[ -n "$_before_eval_artifact_root" ]]; then
   _report_args+=(--before-artifact-root "$_before_eval_artifact_root")
 fi
+if [[ -n "${GROUNDING_CAMPAIGN_ACTION_ID:-}" ]]; then
+  if [[ ! "$GROUNDING_CAMPAIGN_ACTION_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "invalid GROUNDING_CAMPAIGN_ACTION_ID: must match ^[A-Za-z0-9][A-Za-z0-9._-]*\$ (got: $GROUNDING_CAMPAIGN_ACTION_ID)" >&2
+    exit 2
+  fi
+  _report_args+=(--campaign-action-id "$GROUNDING_CAMPAIGN_ACTION_ID")
+fi
 
 korvid-grounding-report "${_report_args[@]}"
 
