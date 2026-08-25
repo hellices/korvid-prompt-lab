@@ -276,8 +276,6 @@ jobs:
           MANIFEST: ${{ inputs.manifest }}
           PROMPT_LAB_REF: ${{ inputs.prompt_lab_ref }}
           KORVID_REF: ${{ inputs.korvid_ref }}
-          KORVID_AKS_NAMESPACE: ${{ vars.KORVID_AKS_NAMESPACE }}
-          KORVID_AKS_SERVICE: ${{ vars.KORVID_AKS_SERVICE }}
         run: |
           set -Eeuo pipefail
           uv sync --python 3.12 --frozen
@@ -309,6 +307,8 @@ jobs:
           if not isinstance(first_tier, dict) or not isinstance(first_tier.get("model"), str):
               raise SystemExit("optimization manifest first model tier is invalid")
           os.environ["KORVID_AKS_MODEL"] = first_tier["model"]
+          os.environ["KORVID_AKS_NAMESPACE"] = "identity-validation"
+          os.environ["KORVID_AKS_SERVICE"] = "identity-validation"
 
           evaluation_id = mapping.get("evaluation_campaign")
           if not isinstance(evaluation_id, str) or not re.fullmatch(
