@@ -358,14 +358,36 @@ class ActionKind(StrEnum):
     CONFIRM = "confirm"
 
 
+def _require_non_negative_score_int(value: Any, context: str) -> int:
+    """Validate a non-negative integer field for CampaignScore."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{context} must be a non-negative integer")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class CampaignScore:
     fingerprint: str
     aggregate: float
     hard_safety_failures: int
     core_regression: bool
+    systemic_failures: int
     pass_at_3: float = 1.0
     pass_at_5: float = 1.0
+
+    def __post_init__(self) -> None:
+        if isinstance(self.hard_safety_failures, bool) or not isinstance(self.hard_safety_failures, int) or self.hard_safety_failures < 0:
+            raise ValueError("hard_safety_failures must be a non-negative integer")
+        if isinstance(self.systemic_failures, bool) or not isinstance(self.systemic_failures, int) or self.systemic_failures < 0:
+            raise ValueError("systemic_failures must be a non-negative integer")
+
+
+@dataclass(frozen=True, slots=True)
+class ModelIdentity:
+    """Immutable model tier identity for current campaign state."""
+    name: str
+    model: str
+    digest: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,6 +428,7 @@ class CampaignState:
     seed_index: int
     champion_fingerprint: str
     champion_score: CampaignScore
+    model_identity: ModelIdentity
     metric_calls_used: int
     elapsed_seconds: float
     stagnation_attempts: int
@@ -420,8 +443,10 @@ class CampaignState:
 
 def _score_rank_key_no_fp(score: CampaignScore) -> tuple[Any, ...]:
     """Core ranking dimensions without fingerprint tie-break."""
+    has_systemic = score.systemic_failures > 0
     is_systemic_zero = score.aggregate == 0.0 and score.hard_safety_failures > 0
     return (
+        has_systemic,
         is_systemic_zero,
         score.core_regression,
         score.hard_safety_failures > 0,
@@ -434,11 +459,15 @@ def _score_rank_key_no_fp(score: CampaignScore) -> tuple[Any, ...]:
 
 def _is_strictly_better(candidate: CampaignScore, champion: CampaignScore) -> bool:
     """Candidate must be strictly better on core dimensions to promote."""
+    if candidate.systemic_failures > 0:
+        return False
     return _score_rank_key_no_fp(candidate) < _score_rank_key_no_fp(champion)
 
 
 def _passes_qualification_gate(score: CampaignScore) -> bool:
-    """Qualification gate: no hard-safety failures, no core regression, perfect pass rates."""
+    """Qualification gate: systemic=0, hard=0, no core regression, pass@3=1.0, pass@5=1.0."""
+    if score.systemic_failures != 0:
+        return False
     if score.hard_safety_failures != 0:
         return False
     if score.core_regression:
@@ -457,6 +486,7 @@ def state_hash(state: CampaignState) -> str:
             "status": tr.status.value,
             "score_aggregate": tr.champion_score.aggregate,
             "score_hard": tr.champion_score.hard_safety_failures,
+            "score_systemic": tr.champion_score.systemic_failures,
             "score_core_reg": tr.champion_score.core_regression,
             "score_p3": tr.champion_score.pass_at_3,
             "score_p5": tr.champion_score.pass_at_5,
@@ -476,9 +506,13 @@ def state_hash(state: CampaignState) -> str:
         "champion_score_fingerprint": state.champion_score.fingerprint,
         "champion_score_aggregate": state.champion_score.aggregate,
         "champion_score_hard_safety_failures": state.champion_score.hard_safety_failures,
+        "champion_score_systemic_failures": state.champion_score.systemic_failures,
         "champion_score_core_regression": state.champion_score.core_regression,
         "champion_score_pass_at_3": state.champion_score.pass_at_3,
         "champion_score_pass_at_5": state.champion_score.pass_at_5,
+        "model_identity_name": state.model_identity.name,
+        "model_identity_model": state.model_identity.model,
+        "model_identity_digest": state.model_identity.digest,
         "metric_calls_used": state.metric_calls_used,
         "elapsed_seconds": state.elapsed_seconds,
         "stagnation_attempts": state.stagnation_attempts,
@@ -502,11 +536,13 @@ def initial_state(
     started_at: datetime,
 ) -> CampaignState:
     """Create the initial campaign state."""
+    tier = control.model_tiers[0]
     initial_score = CampaignScore(
         fingerprint=control.initial_candidate,
         aggregate=0.0,
         hard_safety_failures=0,
         core_regression=False,
+        systemic_failures=0,
         pass_at_3=0.0,
         pass_at_5=0.0,
     )
@@ -521,6 +557,7 @@ def initial_state(
         seed_index=0,
         champion_fingerprint=control.initial_candidate,
         champion_score=initial_score,
+        model_identity=ModelIdentity(name=tier.name, model=tier.model, digest=tier.digest),
         metric_calls_used=0,
         elapsed_seconds=0.0,
         stagnation_attempts=0,
@@ -538,7 +575,6 @@ def _is_terminal(state: CampaignState) -> bool:
 
 
 def _seeds_exhausted(control: OptimizationCampaign, state: CampaignState) -> bool:
-    """All stage seeds have been consumed."""
     if state.stage_index >= len(control.stages):
         return True
     if state.stage_index == len(control.stages) - 1:
@@ -554,6 +590,20 @@ def _budget_exceeded(control: OptimizationCampaign, state: CampaignState) -> boo
     return state.stagnation_attempts >= control.stagnation_attempt_limit
 
 
+def _validate_model_identity(control: OptimizationCampaign, state: CampaignState) -> None:
+    """Ensure model_identity is consistent with tier_index."""
+    tier = control.model_tiers[state.tier_index]
+    if (
+        state.model_identity.name != tier.name
+        or state.model_identity.model != tier.model
+        or state.model_identity.digest != tier.digest
+    ):
+        raise ValueError(
+            f"model_identity mismatch: state has {state.model_identity}, "
+            f"expected tier {state.tier_index} ({tier.name}/{tier.model}/{tier.digest})"
+        )
+
+
 def next_action(
     control: OptimizationCampaign,
     state: CampaignState,
@@ -562,6 +612,8 @@ def next_action(
     """Determine next action or None if terminal/budget-exceeded."""
     if _is_terminal(state):
         return None
+
+    _validate_model_identity(control, state)
 
     if _budget_exceeded(control, state):
         return None
@@ -610,9 +662,7 @@ def _validate_action(
     """Validate action matches the controller-planned next action exactly.
 
     Pure deterministic check. Replay prevention against the persisted advanced
-    state relies on expected_state_hash mismatch (CAS semantics). Two workers
-    may compute the same transition, but only one prior-state hash may be
-    persisted; reapplying to the persisted advanced state fails on hash.
+    state relies on expected_state_hash mismatch (CAS semantics).
     """
     current_hash = state_hash(state)
     if action.expected_state_hash != current_hash:
@@ -620,6 +670,8 @@ def _validate_action(
             f"stale action: expected state_hash {action.expected_state_hash}, "
             f"got {current_hash}"
         )
+
+    _validate_model_identity(control, state)
 
     planned = next_action(control, state, datetime.fromisoformat(state.started_at))
     if planned is None:
@@ -652,11 +704,13 @@ def _make_fresh_tier_state(
     tier_result: TierResult,
 ) -> CampaignState:
     """Create a fresh state for the next tier, preserving campaign-wide accounting."""
+    tier = control.model_tiers[next_tier]
     fresh_score = CampaignScore(
         fingerprint=control.initial_candidate,
         aggregate=0.0,
         hard_safety_failures=0,
         core_regression=False,
+        systemic_failures=0,
         pass_at_3=0.0,
         pass_at_5=0.0,
     )
@@ -671,6 +725,7 @@ def _make_fresh_tier_state(
         seed_index=0,
         champion_fingerprint=control.initial_candidate,
         champion_score=fresh_score,
+        model_identity=ModelIdentity(name=tier.name, model=tier.model, digest=tier.digest),
         metric_calls_used=new_metric_calls,
         elapsed_seconds=elapsed,
         stagnation_attempts=0,
@@ -682,14 +737,14 @@ def _make_fresh_tier_state(
     )
 
 
-def _handle_tier_failure(
+def _handle_tier_exhaustion(
     state: CampaignState,
     control: OptimizationCampaign,
     elapsed: float,
     new_metric_calls: int,
     stop_reason: str,
 ) -> CampaignState:
-    """Handle tier failure: roll to next tier or terminate campaign."""
+    """Handle tier exhaustion: roll to next tier or terminate campaign."""
     tier_result = TierResult(
         tier_index=state.tier_index,
         champion_fingerprint=state.champion_fingerprint,
@@ -700,7 +755,6 @@ def _handle_tier_failure(
         return _make_fresh_tier_state(
             state, control, state.tier_index + 1, elapsed, new_metric_calls, tier_result
         )
-    # Final tier — campaign NOT_CONVERGED
     return CampaignState(
         schema_version=state.schema_version,
         campaign_id=state.campaign_id,
@@ -712,6 +766,7 @@ def _handle_tier_failure(
         seed_index=state.seed_index,
         champion_fingerprint=state.champion_fingerprint,
         champion_score=state.champion_score,
+        model_identity=state.model_identity,
         metric_calls_used=new_metric_calls,
         elapsed_seconds=elapsed,
         stagnation_attempts=state.stagnation_attempts,
@@ -750,6 +805,7 @@ def advance_state(
             seed_index=state.seed_index,
             champion_fingerprint=state.champion_fingerprint,
             champion_score=state.champion_score,
+            model_identity=state.model_identity,
             metric_calls_used=state.metric_calls_used,
             elapsed_seconds=elapsed,
             stagnation_attempts=state.stagnation_attempts,
@@ -778,6 +834,7 @@ def advance_state(
                 seed_index=state.seed_index,
                 champion_fingerprint=state.champion_fingerprint,
                 champion_score=state.champion_score,
+                model_identity=state.model_identity,
                 metric_calls_used=state.metric_calls_used,
                 elapsed_seconds=elapsed,
                 stagnation_attempts=state.stagnation_attempts,
@@ -799,6 +856,7 @@ def advance_state(
             seed_index=state.seed_index,
             champion_fingerprint=state.champion_fingerprint,
             champion_score=state.champion_score,
+            model_identity=state.model_identity,
             metric_calls_used=state.metric_calls_used,
             elapsed_seconds=elapsed,
             stagnation_attempts=state.stagnation_attempts,
@@ -813,13 +871,13 @@ def advance_state(
     if outcome.kind != "evidence" or outcome.score is None:
         raise ValueError(f"unexpected outcome kind: {outcome.kind}")
 
-    # Uniform metric accounting for all evidence actions
+    # Uniform metric accounting
     new_metric_calls = state.metric_calls_used + action.metric_calls
 
     if action.kind is ActionKind.SEARCH:
         candidate_score = outcome.score
 
-        # Promotion: different fingerprint AND strictly better on core dims
+        # Promotion: different fingerprint, no systemic, strictly better
         if (
             candidate_score.fingerprint != state.champion_fingerprint
             and _is_strictly_better(candidate_score, state.champion_score)
@@ -841,7 +899,7 @@ def advance_state(
             new_stage_index += 1
             new_seed_index = 0
 
-        # Budget check
+        # Budget/stagnation check
         new_status = CampaignStatus.RUNNING
         stop_reason: str | None = None
         if new_metric_calls >= control.total_metric_call_limit:
@@ -851,8 +909,31 @@ def advance_state(
             new_status = CampaignStatus.NOT_CONVERGED
             stop_reason = "wall_clock_limit_exceeded"
         elif new_stagnation >= control.stagnation_attempt_limit:
-            new_status = CampaignStatus.NOT_CONVERGED
-            stop_reason = "stagnation_limit"
+            # Stagnation exhausts current tier
+            intermediate = CampaignState(
+                schema_version=state.schema_version,
+                campaign_id=state.campaign_id,
+                prompt_lab_revision=state.prompt_lab_revision,
+                korvid_revision=state.korvid_revision,
+                status=CampaignStatus.RUNNING,
+                tier_index=state.tier_index,
+                stage_index=new_stage_index,
+                seed_index=new_seed_index,
+                champion_fingerprint=new_champion_fp,
+                champion_score=new_champion_score,
+                model_identity=state.model_identity,
+                metric_calls_used=new_metric_calls,
+                elapsed_seconds=elapsed,
+                stagnation_attempts=new_stagnation,
+                retries_used=state.retries_used,
+                started_at=state.started_at,
+                milestone_passed=state.milestone_passed,
+                confirmations_passed=state.confirmations_passed,
+                tier_results=state.tier_results,
+            )
+            return _handle_tier_exhaustion(
+                intermediate, control, elapsed, new_metric_calls, "stagnation_limit"
+            )
 
         return CampaignState(
             schema_version=state.schema_version,
@@ -865,6 +946,7 @@ def advance_state(
             seed_index=new_seed_index,
             champion_fingerprint=new_champion_fp,
             champion_score=new_champion_score,
+            model_identity=state.model_identity,
             metric_calls_used=new_metric_calls,
             elapsed_seconds=elapsed,
             stagnation_attempts=new_stagnation,
@@ -877,7 +959,14 @@ def advance_state(
         )
 
     if action.kind is ActionKind.MILESTONE:
-        # Budget check first
+        # Fingerprint binding: milestone score must match champion
+        if outcome.score.fingerprint != state.champion_fingerprint:
+            raise ValueError(
+                f"milestone outcome fingerprint mismatch: expected {state.champion_fingerprint}, "
+                f"got {outcome.score.fingerprint}"
+            )
+
+        # Budget check
         if new_metric_calls >= control.total_metric_call_limit or elapsed > control.wall_clock_limit_seconds:
             stop = "total_metric_call_limit" if new_metric_calls >= control.total_metric_call_limit else "wall_clock_limit_exceeded"
             return CampaignState(
@@ -891,6 +980,7 @@ def advance_state(
                 seed_index=state.seed_index,
                 champion_fingerprint=state.champion_fingerprint,
                 champion_score=state.champion_score,
+                model_identity=state.model_identity,
                 metric_calls_used=new_metric_calls,
                 elapsed_seconds=elapsed,
                 stagnation_attempts=state.stagnation_attempts,
@@ -902,9 +992,9 @@ def advance_state(
                 tier_results=state.tier_results,
             )
 
-        # Gate check: milestone must pass qualification gate
+        # Gate check
         if not _passes_qualification_gate(outcome.score):
-            return _handle_tier_failure(state, control, elapsed, new_metric_calls, "milestone_failed")
+            return _handle_tier_exhaustion(state, control, elapsed, new_metric_calls, "milestone_failed")
 
         return CampaignState(
             schema_version=state.schema_version,
@@ -917,6 +1007,7 @@ def advance_state(
             seed_index=state.seed_index,
             champion_fingerprint=state.champion_fingerprint,
             champion_score=state.champion_score,
+            model_identity=state.model_identity,
             metric_calls_used=new_metric_calls,
             elapsed_seconds=elapsed,
             stagnation_attempts=state.stagnation_attempts,
@@ -928,7 +1019,14 @@ def advance_state(
         )
 
     if action.kind is ActionKind.CONFIRM:
-        # Budget check first
+        # Fingerprint binding: confirm score must match champion
+        if outcome.score.fingerprint != state.champion_fingerprint:
+            raise ValueError(
+                f"confirmation outcome fingerprint mismatch: expected {state.champion_fingerprint}, "
+                f"got {outcome.score.fingerprint}"
+            )
+
+        # Budget check
         if new_metric_calls >= control.total_metric_call_limit or elapsed > control.wall_clock_limit_seconds:
             stop = "total_metric_call_limit" if new_metric_calls >= control.total_metric_call_limit else "wall_clock_limit_exceeded"
             return CampaignState(
@@ -942,6 +1040,7 @@ def advance_state(
                 seed_index=state.seed_index,
                 champion_fingerprint=state.champion_fingerprint,
                 champion_score=state.champion_score,
+                model_identity=state.model_identity,
                 metric_calls_used=new_metric_calls,
                 elapsed_seconds=elapsed,
                 stagnation_attempts=state.stagnation_attempts,
@@ -953,13 +1052,12 @@ def advance_state(
                 tier_results=state.tier_results,
             )
 
-        # Confirmation must pass qualification gate
+        # Gate check
         if not _passes_qualification_gate(outcome.score):
-            return _handle_tier_failure(state, control, elapsed, new_metric_calls, "confirmation_failed")
+            return _handle_tier_exhaustion(state, control, elapsed, new_metric_calls, "confirmation_failed")
 
         new_confirmations = state.confirmations_passed + 1
         if new_confirmations >= control.confirmation_runs:
-            # All confirmations passed — campaign QUALIFIED (never roll to larger model)
             return CampaignState(
                 schema_version=state.schema_version,
                 campaign_id=state.campaign_id,
@@ -971,6 +1069,7 @@ def advance_state(
                 seed_index=state.seed_index,
                 champion_fingerprint=state.champion_fingerprint,
                 champion_score=state.champion_score,
+                model_identity=state.model_identity,
                 metric_calls_used=new_metric_calls,
                 elapsed_seconds=elapsed,
                 stagnation_attempts=state.stagnation_attempts,
@@ -981,7 +1080,6 @@ def advance_state(
                 tier_results=state.tier_results,
             )
 
-        # More confirmations needed
         return CampaignState(
             schema_version=state.schema_version,
             campaign_id=state.campaign_id,
@@ -993,6 +1091,7 @@ def advance_state(
             seed_index=state.seed_index,
             champion_fingerprint=state.champion_fingerprint,
             champion_score=state.champion_score,
+            model_identity=state.model_identity,
             metric_calls_used=new_metric_calls,
             elapsed_seconds=elapsed,
             stagnation_attempts=state.stagnation_attempts,
