@@ -276,8 +276,12 @@ most one expensive search or evaluation attempt, persists updated state, and
 dispatches the next invocation only when the state says `RUNNING`.
 
 The continuation token is the immutable campaign ID plus the hash of the prior
-state. The controller rejects stale state updates. This makes retries idempotent
-and prevents two completed jobs from selecting different champions.
+state. The pure transition function rejects an action against any state other
+than the exact prior state it names. Persistence uses compare-and-swap on that
+prior hash: two workers may deterministically compute the same transition, but
+only one may replace the persisted prior state, and replay against the persisted
+advanced state fails. This makes retries idempotent without hidden mutable replay
+state and prevents two completed jobs from selecting different champions.
 
 Protected-environment approval remains required for AKS and reflection
 credentials. `QUALIFIED` does not automatically publish; it makes the existing

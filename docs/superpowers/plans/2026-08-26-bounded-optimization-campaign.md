@@ -527,8 +527,12 @@ milestone/confirmation results, and final stop reason.
 
 `state_hash` serializes a safe mapping with sorted keys and compact separators,
 then returns SHA-256. `advance_state` must require
-`action.expected_state_hash == state_hash(state)` and reject a second application
-of the same action.
+`action.expected_state_hash == state_hash(state)` and the exact planned action
+identity. Because this is a pure deterministic function, two calls with
+identical immutable inputs may compute the same advanced state. The persistence
+layer in Tasks 4 and 6 must compare-and-swap on the prior hash so only one result
+is persisted; applying the action to that persisted advanced state must fail as
+stale.
 
 Ranking follows the design order exactly: systemic zero, no hard-safety or core
 regression, hard-safety reduction, aggregate, pass@3, pass@5, fingerprint.
