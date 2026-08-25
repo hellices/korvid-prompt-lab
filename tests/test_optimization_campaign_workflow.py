@@ -236,8 +236,6 @@ def test_manifest_identity_is_validated_and_drives_concurrency() -> None:
         "MANIFEST": "${{ inputs.manifest }}",
         "PROMPT_LAB_REF": "${{ inputs.prompt_lab_ref }}",
         "KORVID_REF": "${{ inputs.korvid_ref }}",
-        "KORVID_AKS_NAMESPACE": "${{ vars.KORVID_AKS_NAMESPACE }}",
-        "KORVID_AKS_SERVICE": "${{ vars.KORVID_AKS_SERVICE }}",
     }
     body = str(manifest["run"])
     assert "load_optimization_campaign" in body
@@ -709,3 +707,21 @@ def test_attempt_binds_the_validated_identity_model() -> None:
     identity = step(workflow, "identity", "manifest")
     body = str(identity["run"])
     assert 'stream.write(f"model={first_tier[\'model\']}\\n")' in body
+
+
+def test_identity_validation_does_not_require_protected_environment_variables() -> None:
+    workflow = load_workflow()
+    identity_job = job(workflow, "identity")
+    identity = step(workflow, "identity", "manifest")
+    environment = identity.get("env") or {}
+    body = str(identity["run"])
+
+    assert "environment" not in identity_job
+    assert "KORVID_AKS_NAMESPACE" not in environment
+    assert "KORVID_AKS_SERVICE" not in environment
+    namespace_assignment = 'os.environ["KORVID_AKS_NAMESPACE"] = "identity-validation"'
+    service_assignment = 'os.environ["KORVID_AKS_SERVICE"] = "identity-validation"'
+    assert namespace_assignment in body
+    assert service_assignment in body
+    assert body.index(namespace_assignment) < body.index("load_campaign(evaluation_path)")
+    assert body.index(service_assignment) < body.index("load_campaign(evaluation_path)")
