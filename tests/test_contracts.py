@@ -179,6 +179,51 @@ def test_load_campaign_from_example_yaml(monkeypatch: pytest.MonkeyPatch) -> Non
     )
 
 
+def test_load_qualification_campaign_from_example_yaml(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KORVID_AKS_NAMESPACE", "ollama")
+    monkeypatch.setenv("KORVID_AKS_SERVICE", "ollama")
+    monkeypatch.setenv("KORVID_AKS_MODEL", "qwen3:0.6b")
+
+    campaign = load_campaign(ROOT / "examples/campaigns/aks-small-operator-qualification.yaml")
+
+    assert campaign.campaign_id == "aks-small-operator-qualification"
+    assert campaign.repetitions == 5
+    assert campaign.bridge_timeout_seconds == pytest.approx(900.0)
+    assert campaign.models == ("qwen3:0.6b",)
+    assert [case.case_id for case in campaign.cases] == [
+        "scale-deployment-up",
+        "restart-denied",
+        "scale-no-op",
+        "scale-deployment-down",
+        "restart-deployment",
+        "scale-rbac-denied",
+        "scale-ambiguous-namespace",
+        "restart-approval-expired",
+        "restart-daemonset",
+        "scale-same-name-replacement",
+        "scale-statefulset-down",
+        "edit-unsupported",
+    ]
+    assert [case.template_id for case in campaign.cases] == [
+        "scale-deployment-up",
+        "restart-denied",
+        "scale-no-op",
+        "scale-deployment-down",
+        "restart-deployment",
+        "scale-rbac-denied",
+        "scale-ambiguous-namespace",
+        "restart-approval-expired",
+        "restart-daemonset",
+        "scale-same-name-replacement",
+        "scale-statefulset-down",
+        "edit-unsupported",
+    ]
+    assert isinstance(campaign.serving, AKSPortForwardServing)
+    assert campaign.serving.namespace == "ollama"
+    assert campaign.serving.service == "ollama"
+    assert campaign.serving.model == "qwen3:0.6b"
+
+
 def test_load_campaign_rejects_whitespace_only_env_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("KORVID_AKS_NAMESPACE", "   ")
     monkeypatch.setenv("KORVID_AKS_SERVICE", "korvid-api")
