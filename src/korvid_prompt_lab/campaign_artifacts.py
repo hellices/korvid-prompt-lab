@@ -12,6 +12,7 @@ import fcntl
 import json
 import math
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -38,6 +39,109 @@ _ALLOWED_FILES = frozenset({
     "optimization-summary.json",
     "best-candidate.yaml",
 })
+
+#: Every top-level file `write_safe_evidence` is allowed to emit.
+SAFE_ROUND_PACKAGE_FILES = frozenset({
+    "round-summary.json",
+    "round-summary.md",
+    "evaluation-summary.json",
+    "optimization-summary.json",
+    "best-candidate.yaml",
+    "comparison-summary.json",
+    "before-evaluation-summary.json",
+})
+
+#: Files that must always be present in a safe round projection.
+SAFE_ROUND_PACKAGE_REQUIRED_FILES = frozenset({
+    "round-summary.json",
+    "round-summary.md",
+    "evaluation-summary.json",
+})
+
+#: The two sanitized response projection directories, and nothing else.
+SAFE_ROUND_PACKAGE_DIRECTORIES = frozenset({"responses", "before-responses"})
+
+_SAFE_RESPONSE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.json$")
+
+
+def validate_safe_round_package(root: Path | str) -> None:
+    """Validate a safe round evidence projection against an explicit allowlist.
+
+    Accepts exactly what :func:`korvid_prompt_lab.rounds.write_safe_evidence`
+    produces — the allowlisted summary files plus the sanitized ``responses/``
+    and ``before-responses/`` projections — and rejects everything else:
+    raw artifact roots, transcripts, audit journals, kubeconfig, credentials,
+    GEPA state, unexpected paths, symlinks and non-regular files.
+    """
+    package = Path(root)
+    if package.is_symlink():
+        raise ValueError(f"safe round package must not be a symlink: {package}")
+    if not package.is_dir():
+        raise ValueError(f"safe round package is not a directory: {package}")
+
+    files: set[str] = set()
+    directories: set[str] = set()
+    for entry in sorted(package.iterdir()):
+        if entry.is_symlink():
+            raise ValueError(
+                f"safe round package contains a symlink: {entry.name}"
+            )
+        if entry.is_dir():
+            if entry.name not in SAFE_ROUND_PACKAGE_DIRECTORIES:
+                raise ValueError(
+                    f"safe round package contains an unexpected directory: {entry.name}"
+                )
+            directories.add(entry.name)
+            _validate_safe_response_directory(entry)
+            continue
+        if not entry.is_file():
+            raise ValueError(
+                f"safe round package contains a non-regular entry: {entry.name}"
+            )
+        if entry.name not in SAFE_ROUND_PACKAGE_FILES:
+            raise ValueError(
+                f"safe round package contains an unexpected file: {entry.name}"
+            )
+        files.add(entry.name)
+
+    missing = sorted(SAFE_ROUND_PACKAGE_REQUIRED_FILES - files)
+    if missing:
+        raise ValueError(
+            f"safe round package is missing required file(s): {', '.join(missing)}"
+        )
+    if "responses" not in directories:
+        raise ValueError(
+            "safe round package is missing the responses projection directory"
+        )
+    if "before-responses" in directories and not {
+        "comparison-summary.json",
+        "before-evaluation-summary.json",
+    } <= files:
+        raise ValueError(
+            "safe round package has before-responses without a comparison projection"
+        )
+
+
+def _validate_safe_response_directory(directory: Path) -> None:
+    """Only sanitized per-run JSON projections may live in a response directory."""
+    entries = sorted(directory.iterdir())
+    if not entries:
+        raise ValueError(
+            f"safe round package has an empty projection directory: {directory.name}"
+        )
+    for entry in entries:
+        label = f"{directory.name}/{entry.name}"
+        if entry.is_symlink():
+            raise ValueError(f"safe round package contains a symlink: {label}")
+        if not entry.is_file():
+            raise ValueError(
+                f"safe round package contains a non-regular entry: {label}"
+            )
+        if not _SAFE_RESPONSE_NAME_RE.match(entry.name):
+            raise ValueError(
+                f"safe round package contains an unexpected projection: {label}"
+            )
+
 
 _OPTIMIZATION_SUMMARY_REQUIRED_KEYS = frozenset({
     "run_id",
@@ -303,7 +407,8 @@ def _validate_comparison_summary(
     round_summary: dict[str, Any],
     eval_summary: dict[str, Any],
     expected_case_ids: tuple[str, ...],
-) -> None:
+) -> bool:
+    """Validate a comparison summary and return its derived core-regression flag."""
     _ensure_exact_keys(
         comparison_summary,
         _COMPARISON_SUMMARY_REQUIRED_KEYS,
@@ -441,6 +546,7 @@ def _validate_comparison_summary(
     metrics = comparison_summary.get("metrics")
     if not isinstance(metrics, list):
         raise ValueError("comparison-summary.metrics must be a list")  # noqa: TRY004
+    core_results: list[str] = []
     for index, metric in enumerate(metrics):
         metric_mapping = _require_mapping(metric, f"comparison-summary.metrics[{index}]")
         _ensure_exact_keys(
@@ -465,10 +571,49 @@ def _validate_comparison_summary(
                 f"comparison-summary.metrics[{index}].result must be a comparison result"
             )
         _require_bool(metric_mapping.get("integer"), f"comparison-summary.metrics[{index}].integer")
-        _require_bool(metric_mapping.get("core"), f"comparison-summary.metrics[{index}].core")
+        is_core = _require_bool(
+            metric_mapping.get("core"), f"comparison-summary.metrics[{index}].core"
+        )
+        if is_core and result != "not_comparable":
+            core_results.append(result)
 
     for key in ("improved_count", "unchanged_count", "regressed_count", "not_comparable_count"):
         _require_non_negative_int(comparison_summary.get(key), f"comparison-summary.{key}")
+
+    return _derive_core_regression(status=status, outcome=outcome, core_results=core_results)
+
+
+def _derive_core_regression(
+    *, status: str, outcome: str, core_results: list[str],
+) -> bool:
+    """Derive core-metric regression and reject a contradictory summary outcome.
+
+    `comparison.py` computes `outcome` from core metrics alone: `regressed` when
+    any core metric regressed, otherwise `improved` when any core metric
+    improved, otherwise `unchanged`; a same-fingerprint (`unchanged`) status is
+    always reported as `unchanged`. Re-deriving that here turns the summary-level
+    headline into a cross-check instead of trusted input.
+    """
+    core_regression = "regressed" in core_results
+    if status == "unchanged":
+        expected_outcome = "unchanged"
+        if core_regression or "improved" in core_results:
+            raise ValueError(
+                "comparison-summary.status 'unchanged' contradicts core metric "
+                f"results {sorted(set(core_results))}"
+            )
+    elif core_regression:
+        expected_outcome = "regressed"
+    elif "improved" in core_results:
+        expected_outcome = "improved"
+    else:
+        expected_outcome = "unchanged"
+    if outcome != expected_outcome:
+        raise ValueError(
+            f"comparison-summary.outcome {outcome!r} contradicts core metric "
+            f"results {sorted(set(core_results))} (expected {expected_outcome!r})"
+        )
+    return core_regression
 
 
 # ---------------------------------------------------------------------------
@@ -754,9 +899,10 @@ def load_round_outcome(
         "evaluation-summary.milestone_passed",
     )
 
+    core_regression = False
     if action.kind is ActionKind.SEARCH:
         comparison_summary = _load_safe_json(safe_root, "comparison-summary.json")
-        _validate_comparison_summary(
+        core_regression = _validate_comparison_summary(
             comparison_summary,
             state=state,
             round_summary=round_summary,
@@ -813,7 +959,7 @@ def load_round_outcome(
         pass_at_5=pass_at_5,
         hard_safety_failures=hard_safety_failures,
         systemic_failures=systemic_failures,
-        core_regression=False,
+        core_regression=core_regression,
         models=tuple(evaluated_models),
         evaluated_case_ids=tuple(evaluated_case_ids),
         action_id=action.action_id,

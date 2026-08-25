@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -212,12 +213,69 @@ def test_system_error_does_not_consume_budget() -> None:
 
 
 def test_retry_exhaustion_terminates() -> None:
+    """`infrastructure_retry_limit` is retries allowed *per action*.
+
+    With limit 1 the first transient system error retries the same logical
+    action; only the second consecutive system error is terminal.
+    """
     ctrl = _control(infrastructure_retry_limit=1)
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
     assert action is not None
     s1 = advance_state(ctrl, state, action, AttemptOutcome(kind="system_error", error_message="x"), LATER)
+    assert s1.status is CampaignStatus.RUNNING
+    assert s1.retries_used == 1
+
+    retry_action = next_action(ctrl, s1, LATER)
+    assert retry_action is not None
+    assert retry_action.kind is action.kind
+    assert retry_action.stage_index == action.stage_index
+    assert retry_action.seed_index == action.seed_index
+    assert retry_action.tier_index == action.tier_index
+    assert retry_action.metric_calls == action.metric_calls
+
+    s2 = advance_state(ctrl, s1, retry_action, AttemptOutcome(kind="system_error", error_message="x"), LATER)
+    assert s2.status is CampaignStatus.SYSTEM_ERROR
+    assert s2.stop_reason == "infrastructure_retry_limit_exhausted"
+
+
+def test_retry_counter_resets_after_valid_evidence() -> None:
+    """The bound is per attempt: evidence progress clears the retry counter."""
+    ctrl = _control(infrastructure_retry_limit=1)
+    state = _init(ctrl)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+    s1 = advance_state(ctrl, state, action, AttemptOutcome(kind="system_error", error_message="x"), LATER)
+    assert s1.retries_used == 1
+
+    evidence_action = next_action(ctrl, s1, LATER)
+    assert evidence_action is not None
+    s2 = advance_state(
+        ctrl,
+        s1,
+        evidence_action,
+        AttemptOutcome(kind="evidence", score=_score("candidate-a", aggregate=0.7)),
+        LATER,
+    )
+    assert s2.status is CampaignStatus.RUNNING
+    assert s2.retries_used == 0
+
+    next_attempt = next_action(ctrl, s2, LATER)
+    assert next_attempt is not None
+    s3 = advance_state(ctrl, s2, next_attempt, AttemptOutcome(kind="system_error", error_message="x"), LATER)
+    assert s3.status is CampaignStatus.RUNNING
+    assert s3.retries_used == 1
+
+
+def test_system_error_wall_clock_crossing_terminates_before_retry_allowance() -> None:
+    """Wall-clock counting is preserved even while retries remain."""
+    ctrl = _control(wall_clock_limit_seconds=21600, infrastructure_retry_limit=5)
+    state = _init(ctrl)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+    s1 = advance_state(ctrl, state, action, AttemptOutcome(kind="system_error", error_message="t"), MUCH_LATER)
     assert s1.status is CampaignStatus.SYSTEM_ERROR
+    assert s1.stop_reason == "wall_clock_limit_exceeded"
 
 
 def test_system_error_wall_clock_crossing_terminates() -> None:
@@ -271,8 +329,10 @@ def test_wall_clock_crossing_during_confirm_terminates() -> None:
     state = _exhaust_stages(ctrl, _init(ctrl))
     champ = state.champion_fingerprint
     action = next_action(ctrl, state, LATER)
+    assert action is not None
     state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(champ)), LATER)
     action = next_action(ctrl, state, LATER)
+    assert action is not None
     s1 = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(champ)), MUCH_LATER)
     assert s1.status is CampaignStatus.NOT_CONVERGED
 
@@ -313,6 +373,64 @@ def test_stagnation_final_tier_terminates() -> None:
         outcome = AttemptOutcome(kind="evidence", score=_score(state.champion_fingerprint, aggregate=0.0))
         state = advance_state(ctrl, state, action, outcome, LATER)
     assert state.status is CampaignStatus.NOT_CONVERGED
+
+
+# --- Tier roll budget boundaries ---
+
+
+def _two_tier_control(**overrides: Any) -> OptimizationCampaign:
+    return _control(
+        model_tiers=(
+            ModelTier(name="small", model="qwen3:0.6b", digest=DIGEST_A),
+            ModelTier(name="large", model="qwen3:14b", digest=DIGEST_B),
+        ),
+        stagnation_attempt_limit=2,
+        **overrides,
+    )
+
+
+def _stagnate_to_tier_roll(
+    ctrl: OptimizationCampaign, state: CampaignState, now: datetime = LATER,
+) -> CampaignState:
+    for _ in range(ctrl.stagnation_attempt_limit):
+        action = next_action(ctrl, state, NOW)
+        assert action is not None
+        outcome = AttemptOutcome(
+            kind="evidence", score=_score(state.champion_fingerprint, aggregate=0.0),
+        )
+        state = advance_state(ctrl, state, action, outcome, now)
+    return state
+
+
+def test_tier_roll_without_metric_budget_terminates_not_converged() -> None:
+    """A next tier that cannot afford one legal action must not start RUNNING."""
+    ctrl = _two_tier_control(total_metric_call_limit=25)
+    state = _stagnate_to_tier_roll(ctrl, _init(ctrl))
+
+    assert state.status is CampaignStatus.NOT_CONVERGED
+    assert state.stop_reason == "next_tier_budget_exhausted"
+    assert next_action(ctrl, state, LATER) is None
+
+
+def test_tier_roll_with_exact_metric_budget_still_rolls() -> None:
+    """Budget that exactly covers the next tier's first action still rolls."""
+    ctrl = _two_tier_control(total_metric_call_limit=36)
+    state = _stagnate_to_tier_roll(ctrl, _init(ctrl))
+
+    assert state.status is CampaignStatus.RUNNING
+    assert state.tier_index == 1
+    assert next_action(ctrl, state, LATER) is not None
+
+
+def test_tier_roll_without_wall_clock_budget_terminates_not_converged() -> None:
+    """Wall-clock exactly at the limit leaves no room for a next-tier action."""
+    ctrl = _two_tier_control(wall_clock_limit_seconds=300)
+    exactly_at_limit = NOW + timedelta(seconds=300)
+    state = _stagnate_to_tier_roll(ctrl, _init(ctrl), now=exactly_at_limit)
+
+    assert state.status is CampaignStatus.NOT_CONVERGED
+    assert state.stop_reason == "next_tier_budget_exhausted"
+    assert next_action(ctrl, state, exactly_at_limit) is None
 
 
 # --- Action validation ---
@@ -368,6 +486,7 @@ def test_confirm_wrong_fingerprint_rejected() -> None:
     state = _exhaust_stages(ctrl, _init(ctrl))
     champ = state.champion_fingerprint
     action = next_action(ctrl, state, LATER)
+    assert action is not None
     state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(champ)), LATER)
     action = next_action(ctrl, state, LATER)
     assert action is not None and action.kind is ActionKind.CONFIRM
@@ -386,6 +505,7 @@ def test_systemic_milestone_not_qualified() -> None:
     state = _exhaust_stages(ctrl, _init(ctrl))
     champ = state.champion_fingerprint
     action = next_action(ctrl, state, LATER)
+    assert action is not None
     bad_score = _score(champ, aggregate=0.9, systemic_failures=1)
     state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=bad_score), LATER)
     assert state.status is CampaignStatus.NOT_CONVERGED
@@ -402,8 +522,10 @@ def test_systemic_confirm_not_qualified() -> None:
     state = _exhaust_stages(ctrl, _init(ctrl))
     champ = state.champion_fingerprint
     action = next_action(ctrl, state, LATER)
+    assert action is not None
     state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(champ)), LATER)
     action = next_action(ctrl, state, LATER)
+    assert action is not None
     bad_score = _score(champ, aggregate=0.9, systemic_failures=1)
     state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=bad_score), LATER)
     # Rolls to tier 1 (non-final)
@@ -425,8 +547,10 @@ def test_tier0_success_qualifies_campaign() -> None:
     state = _exhaust_stages(ctrl, _init(ctrl))
     champ = state.champion_fingerprint
     action = next_action(ctrl, state, LATER)
+    assert action is not None
     state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(champ)), LATER)
     action = next_action(ctrl, state, LATER)
+    assert action is not None
     state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(champ)), LATER)
     assert state.status is CampaignStatus.QUALIFIED
     assert state.tier_index == 0
@@ -437,11 +561,14 @@ def test_confirmation_runs_2() -> None:
     state = _exhaust_stages(ctrl, _init(ctrl))
     champ = state.champion_fingerprint
     action = next_action(ctrl, state, LATER)
+    assert action is not None
     state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(champ)), LATER)
     action = next_action(ctrl, state, LATER)
+    assert action is not None
     state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(champ)), LATER)
     assert state.status is CampaignStatus.RUNNING and state.confirmations_passed == 1
     action = next_action(ctrl, state, LATER)
+    assert action is not None
     state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(champ)), LATER)
     assert state.status is CampaignStatus.QUALIFIED
 
@@ -459,6 +586,7 @@ def test_milestone_failure_rolls_to_next_tier() -> None:
     state = _exhaust_stages(ctrl, _init(ctrl))
     champ = state.champion_fingerprint
     action = next_action(ctrl, state, LATER)
+    assert action is not None
     bad_score = _score(champ, aggregate=0.9, hard_safety_failures=1)
     state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=bad_score), LATER)
     assert state.status is CampaignStatus.RUNNING
@@ -470,6 +598,7 @@ def test_final_tier_failure_not_converged() -> None:
     state = _exhaust_stages(ctrl, _init(ctrl))
     champ = state.champion_fingerprint
     action = next_action(ctrl, state, LATER)
+    assert action is not None
     bad_score = _score(champ, aggregate=0.9, pass_at_5=0.8)
     state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=bad_score), LATER)
     assert state.status is CampaignStatus.NOT_CONVERGED

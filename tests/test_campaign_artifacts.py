@@ -8,6 +8,7 @@ import threading
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -146,6 +147,8 @@ def _write_search_evidence(
     validation_case_ids: tuple[str, ...] = ("case-c",),
     prompt_lab_revision: str = "abc123",
     korvid_revision: str = "def456",
+    comparison_outcome: str = "improved",
+    comparison_metrics: list[dict[str, object]] | None = None,
 ) -> None:
     root.mkdir(parents=True, exist_ok=True)
     best_candidate_mapping = best_candidate_mapping or _candidate_mapping(candidate_id)
@@ -232,7 +235,7 @@ def _write_search_evidence(
     comparison_summary = {
         "schema_version": 1,
         "status": "changed",
-        "outcome": "improved",
+        "outcome": comparison_outcome,
         "seed_candidate_fingerprint": seed_candidate_fingerprint,
         "best_candidate_fingerprint": resolved_candidate_fingerprint,
         "contract": {
@@ -245,7 +248,19 @@ def _write_search_evidence(
             ),
             "execution_modes": ["live"],
         },
-        "metrics": [
+        "metrics": comparison_metrics
+        if comparison_metrics is not None
+        else [
+            {
+                "key": "aggregate_score",
+                "label": "Aggregate score",
+                "before": 0.4,
+                "after": 0.6,
+                "delta": 0.2,
+                "result": "improved",
+                "integer": False,
+                "core": True,
+            },
             {
                 "key": "systemic_failures",
                 "label": "Systemic failures",
@@ -255,7 +270,7 @@ def _write_search_evidence(
                 "result": "unchanged",
                 "integer": True,
                 "core": True,
-            }
+            },
         ],
         "improved_count": 0,
         "unchanged_count": 1,
@@ -812,7 +827,9 @@ class TestCompareAndSwap:
         results: list[str] = []
         errors: list[Exception] = []
 
-        def synchronized_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        def synchronized_read_text(
+            self: Path, *args: Any, **kwargs: Any,
+        ) -> str:
             content = original_read_text(self, *args, **kwargs)
             if self.resolve() == path.resolve():
                 try:
@@ -940,3 +957,167 @@ class TestCaseRepetitionsCartesian:
         (root / "comparison-summary.json").write_text(json.dumps(comparison))
         with pytest.raises(ValueError, match="model mismatch"):
             load_round_outcome(root, _search_action(), control=_control(), state=_state())
+
+
+# ---------------------------------------------------------------------------
+# Core-metric regression derivation (final review finding 2)
+# ---------------------------------------------------------------------------
+
+
+_REGRESSED_CORE_METRICS: list[dict[str, object]] = [
+    {
+        "key": "aggregate_score",
+        "label": "Aggregate score",
+        "before": 0.4,
+        "after": 0.9,
+        "delta": 0.5,
+        "result": "improved",
+        "integer": False,
+        "core": True,
+    },
+    {
+        "key": "pass_at_3",
+        "label": "pass@3",
+        "before": 0.8,
+        "after": 0.2,
+        "delta": -0.6,
+        "result": "regressed",
+        "integer": False,
+        "core": True,
+    },
+]
+
+
+class TestCoreRegressionDerivation:
+    def test_core_regression_is_derived_from_comparison_metrics(
+        self, tmp_path: Path,
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(
+            root,
+            comparison_outcome="regressed",
+            comparison_metrics=_REGRESSED_CORE_METRICS,
+        )
+        outcome = load_round_outcome(
+            root, _search_action(), control=_control(), state=_state(),
+        )
+        assert outcome.core_regression is True
+
+    def test_no_core_regression_when_only_non_core_metric_regresses(
+        self, tmp_path: Path,
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(
+            root,
+            comparison_outcome="improved",
+            comparison_metrics=[
+                {
+                    "key": "aggregate_score",
+                    "label": "Aggregate score",
+                    "before": 0.4,
+                    "after": 0.6,
+                    "delta": 0.2,
+                    "result": "improved",
+                    "integer": False,
+                    "core": True,
+                },
+                {
+                    "key": "write_before_fresh_read",
+                    "label": "write_before_fresh_read",
+                    "before": 0,
+                    "after": 2,
+                    "delta": 2,
+                    "result": "regressed",
+                    "integer": True,
+                    "core": False,
+                },
+            ],
+        )
+        outcome = load_round_outcome(
+            root, _search_action(), control=_control(), state=_state(),
+        )
+        assert outcome.core_regression is False
+
+    def test_summary_outcome_contradicting_core_metrics_is_rejected(
+        self, tmp_path: Path,
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(
+            root,
+            comparison_outcome="improved",
+            comparison_metrics=_REGRESSED_CORE_METRICS,
+        )
+        with pytest.raises(ValueError, match="contradicts"):
+            load_round_outcome(
+                root, _search_action(), control=_control(), state=_state(),
+            )
+
+    def test_unchanged_status_with_regressed_core_metric_is_rejected(
+        self, tmp_path: Path,
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(
+            root,
+            comparison_outcome="unchanged",
+            comparison_metrics=_REGRESSED_CORE_METRICS,
+        )
+        comparison = json.loads((root / "comparison-summary.json").read_text())
+        comparison["status"] = "unchanged"
+        (root / "comparison-summary.json").write_text(json.dumps(comparison))
+        with pytest.raises(ValueError, match="contradicts"):
+            load_round_outcome(
+                root, _search_action(), control=_control(), state=_state(),
+            )
+
+    def test_core_regression_blocks_promotion_through_real_advance(
+        self, tmp_path: Path,
+    ) -> None:
+        """Ingestion -> advance: a core regression can never promote."""
+        from korvid_prompt_lab.campaigns import (
+            AttemptOutcome,
+            advance_state,
+            next_action,
+        )
+
+        control = _control()
+        champion = Candidate.from_mapping(_candidate_mapping("champion")).fingerprint
+        state = replace(
+            _state(champion_fingerprint=champion),
+            champion_score=CampaignScore(
+                fingerprint=champion,
+                aggregate=0.4,
+                hard_safety_failures=0,
+                core_regression=False,
+                systemic_failures=0,
+                pass_at_3=0.8,
+                pass_at_5=0.8,
+            ),
+        )
+        action = next_action(control, state, NOW)
+        assert action is not None
+
+        root = tmp_path / "evidence"
+        _write_search_evidence(
+            root,
+            campaign_action_id=action.action_id,
+            seed_candidate_fingerprint=champion,
+            comparison_outcome="regressed",
+            comparison_metrics=_REGRESSED_CORE_METRICS,
+        )
+        outcome = load_round_outcome(root, action, control=control, state=state)
+        assert outcome.core_regression is True
+
+        score = CampaignScore(
+            fingerprint=outcome.candidate_fingerprint,
+            aggregate=0.9,
+            hard_safety_failures=outcome.hard_safety_failures,
+            core_regression=outcome.core_regression,
+            systemic_failures=outcome.systemic_failures,
+            pass_at_3=outcome.pass_at_3,
+            pass_at_5=outcome.pass_at_5,
+        )
+        advanced = advance_state(
+            control, state, action, AttemptOutcome(kind="evidence", score=score), NOW,
+        )
+        assert advanced.champion_fingerprint == champion
+        assert advanced.champion_score.aggregate == 0.4

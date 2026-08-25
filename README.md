@@ -1109,13 +1109,26 @@ The default `qwen3-small-operator` manifest is fixed at:
 - refine: **24 calls × 2 seeds** (`3`, `4`);
 - final: **48 calls × 1 seed** (`5`);
 - at most **240 metric calls** and **21,600 seconds (6 hours)** overall;
-- a **1 infrastructure retry** limit and a stop after **3 consecutive
-  non-promoting attempts**; and
+- **1 infrastructure retry allowed per action** (a first transient system error
+  retries the same logical action; a second consecutive one stops the campaign,
+  and the counter resets after any valid evidence outcome) and a stop after
+  **3 consecutive non-promoting attempts**; and
 - a full milestone pass followed by **1 independent confirmation**.
 
 The controller stops at qualification, metric-call or wall-clock exhaustion,
-stagnation/tier exhaustion, milestone failure, configuration failure, or the
-infrastructure retry limit. Results for model tiers are independent: candidates,
+stagnation/tier exhaustion, a next model tier that no longer fits the remaining
+metric-call or wall-clock budget (`next_tier_budget_exhausted`), milestone
+failure, configuration failure, or the infrastructure retry limit. A regression
+in any core comparison metric never promotes a candidate, however far the
+aggregate score rose.
+
+Each run consumes exactly one prior state. After its evidence is uploaded and
+before it dispatches a continuation, a run claims a durable repository-scoped
+**lineage marker artifact** named from the validated campaign id and the prior
+state hash (`initial` for the first run). A later run that was handed the same
+prior state finds that marker through the GitHub API and stops before any
+expensive work, so duplicate lineages cannot be produced even from separately
+downloaded copies of the same state. Results for model tiers are independent: candidates,
 scores, and holdout evidence from one tier do not qualify another tier.
 `QUALIFIED` still requires explicit publication approval through the existing
 reviewed publication path; this workflow never publishes automatically.

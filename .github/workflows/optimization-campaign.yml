@@ -402,13 +402,17 @@ jobs:
           import hashlib
           import json
           import os
+          import re
           import shutil
           import sys
           from dataclasses import replace
           from datetime import UTC, datetime
           from pathlib import Path
 
-          from korvid_prompt_lab.campaign_artifacts import _serialize_state
+          from korvid_prompt_lab.campaign_artifacts import (
+              _serialize_state,
+              validate_safe_round_package,
+          )
           from korvid_prompt_lab.campaign_cli import _load_state
           from korvid_prompt_lab.campaigns import (
               CampaignScore,
@@ -418,6 +422,8 @@ jobs:
               state_hash,
           )
           from korvid_prompt_lab.config import load_campaign, load_candidate
+
+          _ACTION_ID_RE = re.compile(r"^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 
           root = Path.cwd().resolve()
           campaign_root = Path(os.environ["CAMPAIGN_ROOT"]).resolve()
@@ -447,6 +453,16 @@ jobs:
           if candidate_path.exists() or candidate_path.is_symlink():
               raise SystemExit("prior-candidate.yaml already exists")
           expected_state_hash = os.environ["EXPECTED_STATE_HASH"]
+          # Deterministic, repository-wide lineage key for the state this run
+          # consumes: a duplicate run for the same input resolves to the same
+          # marker artifact name and is stopped before any expensive work.
+          if os.environ["PRIOR_RUN_ID"]:
+              if not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_state_hash):
+                  raise SystemExit("expected_state_hash must be sha256:<64 lowercase hex>")
+              lineage_from_key = expected_state_hash.replace(":", "-")
+          else:
+              lineage_from_key = "initial"
+          lineage_marker_name = f"campaign-lineage-{control.campaign_id}-{lineage_from_key}"
           if os.environ["PRIOR_RUN_ID"]:
               prior_root = Path(os.environ["PRIOR_ROOT"]).resolve()
               safe_campaign = prior_root / "safe-campaign"
@@ -463,9 +479,20 @@ jobs:
               for item in prior_root.rglob("*"):
                   if item.is_symlink():
                       raise SystemExit("prior safe artifact contains a symlink")
-                  relative = item.relative_to(prior_root)
-                  if any(part.lower() in {"responses", "raw", "transcripts"} for part in relative.parts):
-                      raise SystemExit("prior artifact contains a forbidden raw evidence path")
+              top_level = {item.name for item in prior_root.iterdir()}
+              if not top_level <= {"safe-campaign", "safe-round"}:
+                  raise SystemExit("prior artifact contains an unexpected path")
+              safe_round = prior_root / "safe-round"
+              if safe_round.is_dir():
+                  for projection in sorted(safe_round.iterdir()):
+                      if not projection.is_dir():
+                          raise SystemExit("prior artifact contains an unexpected path")
+                      if not _ACTION_ID_RE.match(projection.name):
+                          raise SystemExit("prior artifact contains an unexpected path")
+                      try:
+                          validate_safe_round_package(projection)
+                      except ValueError as error:
+                          raise SystemExit(str(error)) from error
 
               identity = json.loads(
                   (safe_campaign / "manifest-identity.json").read_text(encoding="utf-8")
@@ -538,6 +565,121 @@ jobs:
               stream.write(f"state-path={state_path}\n")
               stream.write(f"candidate-path={candidate_path}\n")
               stream.write(f"action-kind={action.kind.value}\n")
+              stream.write(f"lineage-from-key={lineage_from_key}\n")
+              stream.write(f"lineage-marker-name={lineage_marker_name}\n")
+          PY
+
+      - name: Scan for an already-consumed campaign lineage input
+        id: lineage-scan
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
+        env:
+          MARKER_NAME: ${{ steps.prepare.outputs.lineage-marker-name }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const markerName = process.env.MARKER_NAME || '';
+            const namePattern =
+              /^campaign-lineage-[a-z0-9][a-z0-9._-]{0,62}-(initial|sha256-[0-9a-f]{64})$/;
+            if (!namePattern.test(markerName)) {
+              core.setFailed('lineage marker name is invalid');
+              return;
+            }
+            const currentRunId = String(process.env.CURRENT_RUN_ID || '');
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: markerName,
+                per_page: 100,
+              },
+            );
+            const claims = artifacts.filter((artifact) => {
+              if (!artifact || artifact.name !== markerName || artifact.expired) {
+                return false;
+              }
+              const producer = artifact.workflow_run && artifact.workflow_run.id;
+              return producer !== undefined
+                && producer !== null
+                && String(producer) !== currentRunId;
+            });
+            core.setOutput(
+              'marker-run-id',
+              claims.length ? String(claims[0].workflow_run.id) : '',
+            );
+
+      - name: Download the conflicting campaign lineage marker
+        id: lineage-download
+        if: steps.lineage-scan.outputs.marker-run-id != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ${{ steps.prepare.outputs.lineage-marker-name }}
+          path: prompt-lab/artifacts/optimization-campaign/lineage-conflict
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.lineage-scan.outputs.marker-run-id }}
+
+      - name: Stop a duplicate campaign lineage before any expensive work
+        id: lineage-reject
+        if: steps.lineage-scan.outputs.marker-run-id != ''
+        working-directory: prompt-lab
+        shell: bash
+        env:
+          CAMPAIGN_ID: ${{ needs.identity.outputs.campaign-id }}
+          LINEAGE_FROM_KEY: ${{ steps.prepare.outputs.lineage-from-key }}
+          EXPECTED_STATE_HASH: ${{ inputs.expected_state_hash }}
+          MARKER_RUN_ID: ${{ steps.lineage-scan.outputs.marker-run-id }}
+          LINEAGE_CONFLICT_ROOT: ${{ github.workspace }}/prompt-lab/artifacts/optimization-campaign/lineage-conflict
+        run: |
+          set -Eeuo pipefail
+          python3 - "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          conflict_root = Path(os.environ["LINEAGE_CONFLICT_ROOT"]).resolve()
+          marker_path = conflict_root / "lineage-marker.json"
+          if marker_path.is_symlink() or not marker_path.is_file():
+              raise SystemExit("conflicting lineage marker is not a regular file")
+          entries = {item.name for item in conflict_root.iterdir()}
+          if entries != {"lineage-marker.json"}:
+              raise SystemExit("conflicting lineage marker package has an invalid shape")
+          marker = json.loads(marker_path.read_text(encoding="utf-8"))
+          if not isinstance(marker, dict):
+              raise SystemExit("conflicting lineage marker is not a mapping")
+          if set(marker) != {
+              "schema_version",
+              "campaign_id",
+              "from_state_key",
+              "from_state_hash",
+              "to_state_hash",
+              "producer_run_id",
+              "prompt_lab_revision",
+              "korvid_revision",
+          }:
+              raise SystemExit("conflicting lineage marker has an invalid shape")
+          if marker["schema_version"] != 1:
+              raise SystemExit("conflicting lineage marker schema_version must be 1")
+          if marker["campaign_id"] != os.environ["CAMPAIGN_ID"]:
+              raise SystemExit("conflicting lineage marker campaign_id mismatch")
+          if marker["from_state_key"] != os.environ["LINEAGE_FROM_KEY"]:
+              raise SystemExit("conflicting lineage marker from_state_key mismatch")
+          if marker["from_state_hash"] != os.environ["EXPECTED_STATE_HASH"]:
+              raise SystemExit("conflicting lineage marker from_state_hash mismatch")
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(marker["to_state_hash"])):
+              raise SystemExit("conflicting lineage marker to_state_hash is invalid")
+          if str(marker["producer_run_id"]) != os.environ["MARKER_RUN_ID"]:
+              raise SystemExit("conflicting lineage marker producer_run_id mismatch")
+          for field in ("prompt_lab_revision", "korvid_revision"):
+              if not re.fullmatch(r"[0-9a-f]{40}", str(marker[field])):
+                  raise SystemExit(f"conflicting lineage marker {field} is invalid")
+          raise SystemExit(
+              "campaign lineage input was already consumed by run "
+              f"{marker['producer_run_id']}; refusing to duplicate "
+              f"{marker['from_state_key']} -> {marker['to_state_hash']}"
+          )
           PY
 
       - name: Get read-only Korvid app token
@@ -629,6 +771,7 @@ jobs:
           CAMPAIGN_CANDIDATE: ${{ steps.prepare.outputs.candidate-path }}
           CAMPAIGN_OUTPUT_ROOT: ${{ github.workspace }}/prompt-lab/artifacts/optimization-campaign/next
           CAMPAIGN_EXPECTED_PRIOR_HASH: ${{ steps.prepare.outputs.prior-state-hash }}
+          CAMPAIGN_MANIFEST_SHA256: ${{ needs.identity.outputs.manifest-sha256 }}
           GROUNDING_CAMPAIGN: ${{ needs.identity.outputs.evaluation-campaign }}
           GROUNDING_REFLECTION_MODEL: ${{ steps.prepare.outputs.action-kind == 'search' && vars.GROUNDING_REFLECTION_MODEL || '' }}
           GROUNDING_REFLECTION_CREDENTIAL: >-
@@ -676,6 +819,7 @@ jobs:
           import sys
           from pathlib import Path
 
+          from korvid_prompt_lab.campaign_artifacts import validate_safe_round_package
           from korvid_prompt_lab.campaign_cli import _load_state
           from korvid_prompt_lab.campaigns import state_hash
           from korvid_prompt_lab.config import load_candidate
@@ -746,13 +890,7 @@ jobs:
           if not isinstance(action_id, str) or not action_id:
               raise SystemExit("campaign action has no identity")
           if round_evidence.is_dir():
-              forbidden = {"responses", "raw", "transcripts"}
-              for item in round_evidence.rglob("*"):
-                  if item.is_symlink() or any(
-                      part.lower() in forbidden
-                      for part in item.relative_to(round_evidence).parts
-                  ):
-                      raise SystemExit("safe round package contains forbidden evidence")
+              validate_safe_round_package(round_evidence)
               shutil.copytree(round_evidence, safe_round / action_id)
 
           identity = {
@@ -798,6 +936,74 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+      - name: Record the consumed campaign lineage
+        id: lineage-write
+        if: steps.upload.outcome == 'success'
+        working-directory: prompt-lab
+        shell: bash
+        env:
+          CAMPAIGN_ID: ${{ needs.identity.outputs.campaign-id }}
+          LINEAGE_FROM_KEY: ${{ steps.prepare.outputs.lineage-from-key }}
+          EXPECTED_STATE_HASH: ${{ inputs.expected_state_hash }}
+          TO_STATE_HASH: ${{ steps.package.outputs.state-hash }}
+          PRODUCER_RUN_ID: ${{ github.run_id }}
+          PROMPT_LAB_REF: ${{ inputs.prompt_lab_ref }}
+          KORVID_REF: ${{ inputs.korvid_ref }}
+          LINEAGE_CLAIM_ROOT: ${{ github.workspace }}/prompt-lab/artifacts/optimization-campaign/lineage-claim
+        run: |
+          set -Eeuo pipefail
+          python3 - "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          claim_root = Path(os.environ["LINEAGE_CLAIM_ROOT"]).resolve()
+          if claim_root.exists() or claim_root.is_symlink():
+              raise SystemExit("lineage claim root already exists")
+          from_key = os.environ["LINEAGE_FROM_KEY"]
+          from_hash = os.environ["EXPECTED_STATE_HASH"]
+          to_hash = os.environ["TO_STATE_HASH"]
+          campaign_id = os.environ["CAMPAIGN_ID"]
+          expected_key = "initial" if not from_hash else from_hash.replace(":", "-")
+          if from_key != expected_key:
+              raise SystemExit("lineage from_state_key does not match the consumed state")
+          if from_hash and not re.fullmatch(r"sha256:[0-9a-f]{64}", from_hash):
+              raise SystemExit("lineage from_state_hash is invalid")
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", to_hash):
+              raise SystemExit("lineage to_state_hash is invalid")
+          marker = {
+              "schema_version": 1,
+              "campaign_id": campaign_id,
+              "from_state_key": from_key,
+              "from_state_hash": from_hash,
+              "to_state_hash": to_hash,
+              "producer_run_id": os.environ["PRODUCER_RUN_ID"],
+              "prompt_lab_revision": os.environ["PROMPT_LAB_REF"],
+              "korvid_revision": os.environ["KORVID_REF"],
+          }
+          for field in ("prompt_lab_revision", "korvid_revision"):
+              if not re.fullmatch(r"[0-9a-f]{40}", marker[field]):
+                  raise SystemExit(f"lineage {field} is invalid")
+          if not re.fullmatch(r"[0-9]+", marker["producer_run_id"]):
+              raise SystemExit("lineage producer_run_id is invalid")
+          claim_root.mkdir(parents=True)
+          marker_path = claim_root / "lineage-marker.json"
+          marker_path.write_text(json.dumps(marker, indent=2), encoding="utf-8")
+          if json.loads(marker_path.read_text(encoding="utf-8")) != marker:
+              raise SystemExit("lineage marker did not round-trip")
+          PY
+
+      - name: Claim the campaign lineage marker
+        id: lineage-claim
+        if: steps.lineage-write.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ steps.prepare.outputs.lineage-marker-name }}
+          path: prompt-lab/artifacts/optimization-campaign/lineage-claim/
+          retention-days: 90
+          if-no-files-found: error
+
       - name: Restore owned capacity and verify ARC cleanup
         id: cleanup
         if: always()
@@ -830,21 +1036,26 @@ jobs:
             echo "modeleval was never observed; no campaign-owned capacity to restore"
           fi
 
+          # Everything below only *observes* shared ARC lifecycle. Runner pods
+          # from unrelated runs are not owned by this campaign, so nothing here
+          # may fail the run: a healthy uploaded RUNNING state must stay
+          # resumable regardless of the shared scale set's state.
+          arc_status=0
           cleanup_kubeconfig="${RUNNER_TEMP}/campaign-cleanup-kubeconfig-${GITHUB_RUN_ID}"
           rm -f -- "$cleanup_kubeconfig"
           az aks get-credentials \
             --resource-group rg-pension-guard \
             --name aks-shared-runners \
             --file "$cleanup_kubeconfig" \
-            --overwrite-existing || cleanup_status=$?
-          if [[ -f "$cleanup_kubeconfig" ]]; then
+            --overwrite-existing || arc_status=$?
+          if [[ "$arc_status" == "0" && -f "$cleanup_kubeconfig" ]]; then
             export KUBECONFIG="$cleanup_kubeconfig"
-            kubelogin convert-kubeconfig -l azurecli || cleanup_status=$?
+            kubelogin convert-kubeconfig -l azurecli || arc_status=$?
             runner_json="$(kubectl --namespace arc-runners-prompt-lab get pods \
               --selector actions.github.com/scale-set-name=prompt-lab-runners \
-              --output json)" || cleanup_status=$?
+              --output json)" || arc_status=$?
             if [[ -n "${runner_json:-}" ]]; then
-              RUNNER_JSON="$runner_json" python3 - <<'PY' || cleanup_status=$?
+              RUNNER_JSON="$runner_json" python3 - <<'PY' || arc_status=$?
           import json
           import os
 
@@ -860,19 +1071,26 @@ jobs:
               ):
                   stale.append(name)
           if stale:
-              raise SystemExit(
-                  "ARC ephemeral runner cleanup is incomplete: " + ", ".join(stale)
+              # Advisory only: these pods belong to other runs on the shared
+              # scale set and are outside this campaign's ownership.
+              print(
+                  "::warning::unrelated ARC ephemeral runner pods are still "
+                  "completing or terminating: " + ", ".join(sorted(stale))
               )
-          print("ARC ephemeral runner cleanup verified; no stale runner pods")
+          else:
+              print("ARC ephemeral runner observation found no stale runner pods")
           PY
             fi
+          fi
+          if [[ "$arc_status" != "0" ]]; then
+            echo "::warning::ARC ephemeral runner observation was inconclusive (exit ${arc_status}); not failing the campaign"
           fi
           rm -f -- "$cleanup_kubeconfig"
           exit "$cleanup_status"
 
       - name: Continue only a persisted RUNNING campaign
         id: dispatch
-        if: steps.package.outputs.status == 'running' && steps.upload.outcome == 'success' && steps.cleanup.outcome == 'success'
+        if: steps.package.outputs.status == 'running' && steps.upload.outcome == 'success' && steps.lineage-claim.outcome == 'success' && steps.cleanup.outcome == 'success'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -898,12 +1116,14 @@ jobs:
           STATUS: ${{ steps.package.outputs.status }}
           PACKAGE_OUTCOME: ${{ steps.package.outcome }}
           UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+          LINEAGE_CLAIM_OUTCOME: ${{ steps.lineage-claim.outcome }}
           CLEANUP_OUTCOME: ${{ steps.cleanup.outcome }}
           DISPATCH_OUTCOME: ${{ steps.dispatch.outcome }}
         run: |
           set -Eeuo pipefail
           [[ "$PACKAGE_OUTCOME" == "success" ]] || exit 70
           [[ "$UPLOAD_OUTCOME" == "success" ]] || exit 70
+          [[ "$LINEAGE_CLAIM_OUTCOME" == "success" ]] || exit 70
           [[ "$CLEANUP_OUTCOME" == "success" ]] || exit 70
           case "$STATUS" in
             qualified) exit 0 ;;

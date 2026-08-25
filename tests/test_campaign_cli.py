@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from datetime import UTC, datetime
@@ -30,8 +31,41 @@ DIGEST_A = "sha256:" + "a" * 64
 # ---------------------------------------------------------------------------
 
 
-def _write_control(path: Path) -> None:
-    control = {
+def _write_evaluation_campaign(
+    path: Path,
+    *,
+    campaign_id: str = "test-campaign",
+    case_ids: tuple[str, ...] = ("case-a", "case-b", "case-c", "case-d"),
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.dump(
+            {
+                "schema_version": 1,
+                "campaign_id": campaign_id,
+                "repetitions": 5,
+                "bridge_timeout_seconds": 900,
+                "models": ["qwen3:0.6b"],
+                "cases": [
+                    {
+                        "case_id": case_id,
+                        "template_id": case_id,
+                        "prompt": f"do {case_id}",
+                        "models": ["qwen3:0.6b"],
+                    }
+                    for case_id in case_ids
+                ],
+                "serving": {
+                    "backend": "process",
+                    "command": ["echo", "{request}", "{response}"],
+                },
+            }
+        )
+    )
+
+
+def _write_control(path: Path, **overrides: object) -> None:
+    control: dict[str, object] = {
         "schema_version": 1,
         "campaign_id": "test-campaign",
         "evaluation_campaign": "test-campaign",
@@ -52,7 +86,14 @@ def _write_control(path: Path) -> None:
         "stagnation_attempt_limit": 30,
         "confirmation_runs": 1,
     }
+    control.update(overrides)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.dump(control))
+    evaluation_id = control["evaluation_campaign"]
+    if isinstance(evaluation_id, str):
+        evaluation_path = path.parent / f"{evaluation_id}.yaml"
+        if not evaluation_path.exists():
+            _write_evaluation_campaign(evaluation_path, campaign_id=evaluation_id)
 
 
 def _make_state(started_at: str | None = None) -> CampaignState:
@@ -188,6 +229,16 @@ def _write_evidence(
         },
         "metrics": [
             {
+                "key": "aggregate_score",
+                "label": "Aggregate score",
+                "before": 0.4,
+                "after": 0.6,
+                "delta": 0.2,
+                "result": "improved",
+                "integer": False,
+                "core": True,
+            },
+            {
                 "key": "systemic_failures",
                 "label": "Systemic failures",
                 "before": 0,
@@ -196,7 +247,7 @@ def _write_evidence(
                 "result": "unchanged",
                 "integer": True,
                 "core": True,
-            }
+            },
         ],
         "improved_count": 0,
         "unchanged_count": 1,
@@ -617,3 +668,227 @@ class TestCLIGithubOutput:
         assert gh_out.exists()
         content = gh_out.read_text()
         assert "action_id=" in content
+
+
+# ---------------------------------------------------------------------------
+# Strict control loading and state binding (final review finding 7)
+# ---------------------------------------------------------------------------
+
+
+class TestStrictControlLoading:
+    def _plan(self, tmp_path: Path, control_path: Path) -> int:
+        state_path = tmp_path / "state.json"
+        _write_state(state_path)
+        return main([
+            "plan",
+            "--control", str(control_path),
+            "--state", str(state_path),
+            "--output", str(tmp_path / "action.json"),
+        ])
+
+    def test_rejects_overlapping_case_sets(self, tmp_path: Path) -> None:
+        control_path = tmp_path / "control.yaml"
+        _write_control(
+            control_path,
+            train_case_ids=["case-a", "case-b", "case-c"],
+            validation_case_ids=["case-c"],
+            milestone_case_ids=["case-d"],
+        )
+        with pytest.raises(ValueError, match="pairwise disjoint"):
+            self._plan(tmp_path, control_path)
+
+    def test_rejects_case_sets_that_do_not_cover_the_evaluation_campaign(
+        self, tmp_path: Path,
+    ) -> None:
+        control_path = tmp_path / "control.yaml"
+        _write_control(control_path, milestone_case_ids=["case-d", "case-zzz"])
+        with pytest.raises(ValueError, match="unknown case_id"):
+            self._plan(tmp_path, control_path)
+
+    def test_rejects_mutable_model_digest(self, tmp_path: Path) -> None:
+        control_path = tmp_path / "control.yaml"
+        _write_control(
+            control_path,
+            model_tiers=[{"name": "small", "model": "qwen3:0.6b", "digest": "latest"}],
+        )
+        with pytest.raises(ValueError, match="sha256:<64 lowercase hex>"):
+            self._plan(tmp_path, control_path)
+
+    def test_rejects_non_positive_limits(self, tmp_path: Path) -> None:
+        control_path = tmp_path / "control.yaml"
+        _write_control(control_path, wall_clock_limit_seconds=0)
+        with pytest.raises(ValueError, match="wall_clock_limit_seconds"):
+            self._plan(tmp_path, control_path)
+
+    def test_rejects_duplicate_stage_seeds(self, tmp_path: Path) -> None:
+        control_path = tmp_path / "control.yaml"
+        _write_control(
+            control_path,
+            stages=[
+                {"name": "explore", "metric_calls": 12, "seeds": [0, 1, 2]},
+                {"name": "refine", "metric_calls": 24, "seeds": [2, 4]},
+            ],
+        )
+        with pytest.raises(ValueError, match="duplicate seed"):
+            self._plan(tmp_path, control_path)
+
+    def test_rejects_missing_evaluation_campaign(self, tmp_path: Path) -> None:
+        control_path = tmp_path / "control.yaml"
+        _write_control(control_path)
+        (tmp_path / "test-campaign.yaml").unlink()
+        with pytest.raises(ValueError, match="evaluation campaign"):
+            self._plan(tmp_path, control_path)
+
+    def test_rejects_evaluation_campaign_identity_traversal(
+        self, tmp_path: Path,
+    ) -> None:
+        control_path = tmp_path / "control.yaml"
+        _write_control(control_path, evaluation_campaign="../outside")
+        with pytest.raises(ValueError, match="evaluation_campaign"):
+            self._plan(tmp_path, control_path)
+
+    def test_rejects_symlinked_control(self, tmp_path: Path) -> None:
+        real = tmp_path / "real.yaml"
+        _write_control(real)
+        link = tmp_path / "control.yaml"
+        link.symlink_to(real)
+        with pytest.raises(ValueError, match="symlink"):
+            self._plan(tmp_path, link)
+
+    def test_advance_rejects_state_from_a_different_campaign(
+        self, tmp_path: Path,
+    ) -> None:
+        control_path = tmp_path / "control.yaml"
+        _write_control(control_path)
+        state_path = tmp_path / "state.json"
+        _write_state(state_path)
+        action_path = tmp_path / "action.json"
+        assert main([
+            "plan",
+            "--control", str(control_path),
+            "--state", str(state_path),
+            "--output", str(action_path),
+        ]) == 0
+
+        foreign_state = _make_state()
+        object.__setattr__(foreign_state, "campaign_id", "other-campaign")
+        foreign_hash = _write_state(state_path, foreign_state)
+
+        with pytest.raises(ValueError, match="campaign_id mismatch"):
+            main([
+                "plan",
+                "--control", str(control_path),
+                "--state", str(state_path),
+                "--output", str(tmp_path / "action2.json"),
+            ])
+
+        with pytest.raises(ValueError, match="campaign_id mismatch"):
+            main([
+                "advance",
+                "--control", str(control_path),
+                "--state", str(state_path),
+                "--action", str(action_path),
+                "--outcome-kind", "system_error",
+                "--output-state", str(tmp_path / "next.json"),
+                "--expected-prior-hash", foreign_hash,
+            ])
+        assert not (tmp_path / "next.json").exists()
+
+    def test_advance_rejects_state_with_out_of_range_tier_index(
+        self, tmp_path: Path,
+    ) -> None:
+        control_path = tmp_path / "control.yaml"
+        _write_control(control_path)
+        state_path = tmp_path / "state.json"
+        _write_state(state_path)
+        data = json.loads(state_path.read_text())
+        data["tier_index"] = 7
+        state_path.write_text(json.dumps(data))
+        with pytest.raises(ValueError, match="tier_index 7 is outside"):
+            main([
+                "plan",
+                "--control", str(control_path),
+                "--state", str(state_path),
+                "--output", str(tmp_path / "action.json"),
+            ])
+
+    def test_advance_rejects_evidence_with_wrong_revisions(
+        self, tmp_path: Path,
+    ) -> None:
+        control_path = tmp_path / "control.yaml"
+        _write_control(control_path)
+        state_path = tmp_path / "state.json"
+        current_hash = _write_state(state_path)
+        action_path = tmp_path / "action.json"
+        assert main([
+            "plan",
+            "--control", str(control_path),
+            "--state", str(state_path),
+            "--output", str(action_path),
+        ]) == 0
+        action = json.loads(action_path.read_text())
+        evidence_path = tmp_path / "evidence"
+        _write_evidence(evidence_path, action)
+        round_summary = json.loads(
+            (evidence_path / "round-summary.json").read_text()
+        )
+        round_summary["korvid_revision"] = "0" * 40
+        (evidence_path / "round-summary.json").write_text(json.dumps(round_summary))
+
+        rc = main([
+            "advance",
+            "--control", str(control_path),
+            "--state", str(state_path),
+            "--action", str(action_path),
+            "--evidence", str(evidence_path),
+            "--output-state", str(tmp_path / "next.json"),
+            "--expected-prior-hash", current_hash,
+        ])
+        assert rc == 1
+        assert not (tmp_path / "next.json").exists()
+
+    def test_plan_rejects_manifest_identity_mismatch(self, tmp_path: Path) -> None:
+        control_path = tmp_path / "control.yaml"
+        _write_control(control_path)
+        state_path = tmp_path / "state.json"
+        _write_state(state_path)
+        with pytest.raises(ValueError, match="manifest identity mismatch"):
+            main([
+                "plan",
+                "--control", str(control_path),
+                "--state", str(state_path),
+                "--output", str(tmp_path / "action.json"),
+                "--expected-manifest-sha256", "sha256:" + "0" * 64,
+            ])
+
+    def test_plan_accepts_matching_manifest_identity_and_revisions(
+        self, tmp_path: Path,
+    ) -> None:
+        control_path = tmp_path / "control.yaml"
+        _write_control(control_path)
+        state_path = tmp_path / "state.json"
+        _write_state(state_path)
+        digest = "sha256:" + hashlib.sha256(control_path.read_bytes()).hexdigest()
+        assert main([
+            "plan",
+            "--control", str(control_path),
+            "--state", str(state_path),
+            "--output", str(tmp_path / "action.json"),
+            "--expected-manifest-sha256", digest,
+            "--expected-prompt-lab-revision", "abc123",
+            "--expected-korvid-revision", "def456",
+        ]) == 0
+
+    def test_plan_rejects_wrong_expected_revisions(self, tmp_path: Path) -> None:
+        control_path = tmp_path / "control.yaml"
+        _write_control(control_path)
+        state_path = tmp_path / "state.json"
+        _write_state(state_path)
+        with pytest.raises(ValueError, match="korvid_revision mismatch"):
+            main([
+                "plan",
+                "--control", str(control_path),
+                "--state", str(state_path),
+                "--output", str(tmp_path / "action.json"),
+                "--expected-korvid-revision", "0" * 40,
+            ])

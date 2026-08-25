@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import textwrap
 import uuid
 from pathlib import Path
 from typing import Any
@@ -342,7 +344,13 @@ def test_prepare_initialization_executes_and_writes_github_output() -> None:
             "state-path",
             "candidate-path",
             "action-kind",
+            "lineage-from-key",
+            "lineage-marker-name",
         }
+        assert entries["lineage-from-key"] == "initial"
+        assert entries["lineage-marker-name"] == (
+            "campaign-lineage-qwen3-small-operator-initial"
+        )
         assert re.fullmatch(r"sha256:[0-9a-f]{64}", entries["prior-state-hash"])
         assert entries["action-kind"] == "search"
         assert Path(entries["state-path"]).is_file()
@@ -398,7 +406,8 @@ def test_run_executes_one_action_packages_safe_evidence_and_appends_summary() ->
     assert "state_hash(state)" in package_body
     assert "safe-campaign-evidence-" in package_body
     assert 'new_hash.replace(":", "-")' in package_body
-    assert '{"responses", "raw", "transcripts"}' in package_body
+    assert "validate_safe_round_package(round_evidence)" in package_body
+    assert '{"responses", "raw", "transcripts"}' not in package_body
 
     assert summary["if"] == (
         "always() && steps.package.outcome == 'success'"
@@ -450,6 +459,111 @@ def test_cleanup_is_always_owned_idempotent_and_non_destructive() -> None:
     assert "pkill" not in body
 
 
+def embedded_arc_python(item: dict[str, Any]) -> str:
+    """Extract the ARC observation heredoc from the cleanup step."""
+    body = str(item["run"])
+    marker = 'RUNNER_JSON="$runner_json" python3 - <<\'PY\''
+    _, _, rest = body.partition(marker)
+    assert rest, "ARC observation heredoc not found"
+    rest = rest.partition("\n")[2]
+    code, _, _ = rest.partition("\nPY\n")
+    return textwrap.dedent(code) + "\n"
+
+
+def test_unrelated_arc_runner_pods_are_advisory_only() -> None:
+    workflow = load_workflow()
+    code = embedded_arc_python(step(workflow, "campaign", "cleanup"))
+    runner_json = json.dumps(
+        {
+            "items": [
+                {
+                    "metadata": {"name": "prompt-lab-runners-abcde"},
+                    "status": {"phase": "Running"},
+                },
+                {
+                    "metadata": {"name": "prompt-lab-runners-unrelated-1"},
+                    "status": {"phase": "Succeeded"},
+                },
+                {
+                    "metadata": {
+                        "name": "prompt-lab-runners-unrelated-2",
+                        "deletionTimestamp": "2026-08-26T00:00:00Z",
+                    },
+                    "status": {"phase": "Running"},
+                },
+            ]
+        }
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "CURRENT_RUNNER_POD": "prompt-lab-runners-abcde",
+            "RUNNER_JSON": runner_json,
+        }
+    )
+    result = subprocess.run(
+        [sys.executable, "-"],
+        input=code,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "::warning::" in result.stdout
+    assert "prompt-lab-runners-unrelated-1" in result.stdout
+    assert "prompt-lab-runners-unrelated-2" in result.stdout
+
+
+def test_clean_arc_observation_reports_success() -> None:
+    workflow = load_workflow()
+    code = embedded_arc_python(step(workflow, "campaign", "cleanup"))
+    env = os.environ.copy()
+    env.update(
+        {
+            "CURRENT_RUNNER_POD": "prompt-lab-runners-abcde",
+            "RUNNER_JSON": json.dumps(
+                {
+                    "items": [
+                        {
+                            "metadata": {"name": "prompt-lab-runners-abcde"},
+                            "status": {"phase": "Running"},
+                        }
+                    ]
+                }
+            ),
+        }
+    )
+    result = subprocess.run(
+        [sys.executable, "-"],
+        input=code,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "::warning::" not in result.stdout
+
+
+def test_only_owned_capacity_restoration_can_fail_cleanup() -> None:
+    workflow = load_workflow()
+    body = str(step(workflow, "campaign", "cleanup")["run"])
+
+    owned, _, observation = body.partition("cleanup_kubeconfig=")
+    assert observation, "cleanup step no longer separates observation from restoration"
+    # Owned modeleval restoration remains fatal…
+    assert owned.count("cleanup_status=$?") >= 1
+    # …but nothing in the advisory ARC observation may touch cleanup_status.
+    assert "cleanup_status" not in observation.replace(
+        'exit "$cleanup_status"', ""
+    )
+    assert "arc_status" in observation
+    assert "::warning::" in observation
+
+
 def test_dispatch_is_running_only_after_upload_and_cleanup() -> None:
     workflow = load_workflow()
     dispatch = step(workflow, "campaign", "dispatch")
@@ -457,6 +571,7 @@ def test_dispatch_is_running_only_after_upload_and_cleanup() -> None:
     assert dispatch["if"] == (
         "steps.package.outputs.status == 'running' && "
         "steps.upload.outcome == 'success' && "
+        "steps.lineage-claim.outcome == 'success' && "
         "steps.cleanup.outcome == 'success'"
     )
     assert dispatch["env"] == {

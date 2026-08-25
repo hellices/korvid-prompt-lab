@@ -9,6 +9,7 @@ import textwrap
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from korvid_prompt_lab.campaign_artifacts import _serialize_state
 from korvid_prompt_lab.campaigns import (
@@ -172,7 +173,8 @@ def run_step(
     real_round: bool = False,
     campaign_command_mode: str = "delegate",
     expected_hash: str | None = None,
-) -> tuple[subprocess.CompletedProcess[str], list[dict[str, str | None]], Path]:
+    extra_env: dict[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], list[Any], Path]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     state = _state(kind)
     state_path = tmp_path / "state.json"
@@ -207,6 +209,8 @@ def run_step(
             "KORVID_REVISION": "b" * 40,
         }
     )
+    if extra_env:
+        env.update(extra_env)
     if real_round:
         fake_bin = _grounding_process_fakes(tmp_path, calls)
         env["PATH"] = f"{fake_bin}:{env['PATH']}"
@@ -372,6 +376,7 @@ def test_missing_safe_evidence_advances_system_error_once(tmp_path: Path) -> Non
 
     assert result.returncode == 70
     campaign_calls = calls[-1]["_campaign_calls"]
+    assert campaign_calls is not None
     assert campaign_calls.count("validate-evidence") == 1
     assert campaign_calls.count("advance") == 1
     state = json.loads((output / "campaign-state.json").read_text())
@@ -391,6 +396,7 @@ def test_grounding_exit_70_directly_advances_system_error_once(
 
     assert result.returncode == 70
     campaign_calls = calls[-1]["_campaign_calls"]
+    assert campaign_calls is not None
     assert "validate-evidence" not in campaign_calls
     assert campaign_calls.count("advance") == 1
     state = json.loads((output / "campaign-state.json").read_text())
@@ -411,6 +417,7 @@ def test_malformed_safe_evidence_advances_system_error_once(
 
     assert result.returncode == 70
     campaign_calls = calls[-1]["_campaign_calls"]
+    assert campaign_calls is not None
     assert campaign_calls.count("validate-evidence") == 1
     assert campaign_calls.count("advance") == 1
     state = json.loads((output / "campaign-state.json").read_text())
@@ -433,6 +440,7 @@ def test_contradictory_safe_evidence_advances_system_error_once(
 
     assert result.returncode == 70
     campaign_calls = calls[-1]["_campaign_calls"]
+    assert campaign_calls is not None
     assert campaign_calls.count("validate-evidence") == 1
     assert campaign_calls.count("advance") == 1
     state = json.loads((output / "campaign-state.json").read_text())
@@ -453,7 +461,48 @@ def test_ambiguous_evidence_advance_failure_never_falls_back(
 
     assert result.returncode == 70
     campaign_calls = calls[-1]["_campaign_calls"]
+    assert campaign_calls is not None
     assert campaign_calls.count("validate-evidence") == 1
     assert campaign_calls.count("advance") == 1
     assert "render" not in campaign_calls
     assert not output.exists()
+
+
+def test_wrapper_binds_manifest_identity_to_the_cli(tmp_path: Path) -> None:
+    """A manifest that changed under the wrapper aborts before any round."""
+    result, _calls, output = run_step(
+        tmp_path,
+        extra_env={"CAMPAIGN_MANIFEST_SHA256": "sha256:" + "0" * 64},
+    )
+
+    assert result.returncode == 70
+    assert "manifest identity mismatch" in (result.stderr + result.stdout)
+    assert not output.exists()
+
+
+def test_wrapper_binds_revisions_to_the_cli(tmp_path: Path) -> None:
+    result, _calls, output = run_step(
+        tmp_path,
+        extra_env={"KORVID_REVISION": "c" * 40},
+    )
+
+    assert result.returncode == 70
+    assert "korvid_revision mismatch" in (result.stderr + result.stdout)
+    assert not output.exists()
+
+
+def test_wrapper_accepts_the_exact_manifest_identity(tmp_path: Path) -> None:
+    import hashlib
+
+    digest = "sha256:" + hashlib.sha256(_CONTROL.read_bytes()).hexdigest()
+    result, calls, output = run_step(
+        tmp_path,
+        round_exit=70,
+        extra_env={"CAMPAIGN_MANIFEST_SHA256": digest},
+    )
+
+    # The matching identity is accepted: the round actually ran and the
+    # transient failure was recorded as a normal system-error transition.
+    assert "manifest identity mismatch" not in (result.stderr + result.stdout)
+    assert calls
+    assert (output / "campaign-state.json").is_file()

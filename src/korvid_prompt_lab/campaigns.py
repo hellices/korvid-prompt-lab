@@ -461,6 +461,9 @@ def _is_strictly_better(candidate: CampaignScore, champion: CampaignScore) -> bo
     """Candidate must be strictly better on core dimensions to promote."""
     if candidate.systemic_failures > 0:
         return False
+    if candidate.core_regression:
+        # A core-metric regression never promotes, however far the aggregate rose.
+        return False
     return _score_rank_key_no_fp(candidate) < _score_rank_key_no_fp(champion)
 
 
@@ -590,6 +593,26 @@ def _budget_exceeded(control: OptimizationCampaign, state: CampaignState) -> boo
     return state.stagnation_attempts >= control.stagnation_attempt_limit
 
 
+def validate_state_binding(control: OptimizationCampaign, state: CampaignState) -> None:
+    """Bind a state to its control manifest before any planning decision."""
+    if state.campaign_id != control.campaign_id:
+        raise ValueError(
+            f"campaign_id mismatch: state has {state.campaign_id!r}, "
+            f"control declares {control.campaign_id!r}"
+        )
+    if not 0 <= state.tier_index < len(control.model_tiers):
+        raise ValueError(
+            f"tier_index {state.tier_index} is outside the declared model tiers "
+            f"(0..{len(control.model_tiers) - 1})"
+        )
+    if not 0 <= state.stage_index <= len(control.stages):
+        raise ValueError(
+            f"stage_index {state.stage_index} is outside the declared stages "
+            f"(0..{len(control.stages)})"
+        )
+    _validate_model_identity(control, state)
+
+
 def _validate_model_identity(control: OptimizationCampaign, state: CampaignState) -> None:
     """Ensure model_identity is consistent with tier_index."""
     tier = control.model_tiers[state.tier_index]
@@ -610,10 +633,10 @@ def next_action(
     now: datetime,
 ) -> CampaignAction | None:
     """Determine next action or None if terminal/budget-exceeded."""
+    validate_state_binding(control, state)
+
     if _is_terminal(state):
         return None
-
-    _validate_model_identity(control, state)
 
     if _budget_exceeded(control, state):
         return None
@@ -664,14 +687,14 @@ def _validate_action(
     Pure deterministic check. Replay prevention against the persisted advanced
     state relies on expected_state_hash mismatch (CAS semantics).
     """
+    validate_state_binding(control, state)
+
     current_hash = state_hash(state)
     if action.expected_state_hash != current_hash:
         raise ValueError(
             f"stale action: expected state_hash {action.expected_state_hash}, "
             f"got {current_hash}"
         )
-
-    _validate_model_identity(control, state)
 
     planned = next_action(control, state, datetime.fromisoformat(state.started_at))
     if planned is None:
@@ -737,6 +760,23 @@ def _make_fresh_tier_state(
     )
 
 
+def _next_tier_action_fits(
+    control: OptimizationCampaign, candidate_state: CampaignState,
+) -> bool:
+    """Does the next tier have budget for at least one legal action?"""
+    if candidate_state.elapsed_seconds >= control.wall_clock_limit_seconds:
+        return False
+    planned = next_action(
+        control, candidate_state, datetime.fromisoformat(candidate_state.started_at)
+    )
+    if planned is None:
+        return False
+    return (
+        candidate_state.metric_calls_used + planned.metric_calls
+        <= control.total_metric_call_limit
+    )
+
+
 def _handle_tier_exhaustion(
     state: CampaignState,
     control: OptimizationCampaign,
@@ -752,9 +792,14 @@ def _handle_tier_exhaustion(
         status=CampaignStatus.NOT_CONVERGED,
     )
     if state.tier_index < len(control.model_tiers) - 1:
-        return _make_fresh_tier_state(
+        rolled = _make_fresh_tier_state(
             state, control, state.tier_index + 1, elapsed, new_metric_calls, tier_result
         )
+        if _next_tier_action_fits(control, rolled):
+            return rolled
+        # No legal next-tier action fits the remaining budget: stop cleanly as
+        # NOT_CONVERGED instead of persisting a RUNNING state with no action.
+        stop_reason = "next_tier_budget_exhausted"
     return CampaignState(
         schema_version=state.schema_version,
         campaign_id=state.campaign_id,
@@ -770,7 +815,7 @@ def _handle_tier_exhaustion(
         metric_calls_used=new_metric_calls,
         elapsed_seconds=elapsed,
         stagnation_attempts=state.stagnation_attempts,
-        retries_used=state.retries_used,
+        retries_used=0,
         started_at=state.started_at,
         milestone_passed=state.milestone_passed,
         confirmations_passed=state.confirmations_passed,
@@ -821,7 +866,10 @@ def advance_state(
     if outcome.kind == "system_error":
         new_retries = state.retries_used + 1
         wall_clock_exceeded = elapsed > control.wall_clock_limit_seconds
-        if new_retries >= control.infrastructure_retry_limit or wall_clock_exceeded:
+        # `infrastructure_retry_limit` is the number of retries *allowed* per
+        # attempt: the limit-th consecutive system error still retries the same
+        # logical action; the next one terminates.
+        if new_retries > control.infrastructure_retry_limit or wall_clock_exceeded:
             stop = "wall_clock_limit_exceeded" if wall_clock_exceeded else "infrastructure_retry_limit_exhausted"
             return CampaignState(
                 schema_version=state.schema_version,
@@ -925,7 +973,7 @@ def advance_state(
                 metric_calls_used=new_metric_calls,
                 elapsed_seconds=elapsed,
                 stagnation_attempts=new_stagnation,
-                retries_used=state.retries_used,
+                retries_used=0,
                 started_at=state.started_at,
                 milestone_passed=state.milestone_passed,
                 confirmations_passed=state.confirmations_passed,
@@ -950,7 +998,7 @@ def advance_state(
             metric_calls_used=new_metric_calls,
             elapsed_seconds=elapsed,
             stagnation_attempts=new_stagnation,
-            retries_used=state.retries_used,
+            retries_used=0,
             started_at=state.started_at,
             milestone_passed=state.milestone_passed,
             confirmations_passed=state.confirmations_passed,
@@ -984,7 +1032,7 @@ def advance_state(
                 metric_calls_used=new_metric_calls,
                 elapsed_seconds=elapsed,
                 stagnation_attempts=state.stagnation_attempts,
-                retries_used=state.retries_used,
+                retries_used=0,
                 started_at=state.started_at,
                 milestone_passed=state.milestone_passed,
                 confirmations_passed=state.confirmations_passed,
@@ -1011,7 +1059,7 @@ def advance_state(
             metric_calls_used=new_metric_calls,
             elapsed_seconds=elapsed,
             stagnation_attempts=state.stagnation_attempts,
-            retries_used=state.retries_used,
+            retries_used=0,
             started_at=state.started_at,
             milestone_passed=True,
             confirmations_passed=state.confirmations_passed,
@@ -1044,7 +1092,7 @@ def advance_state(
                 metric_calls_used=new_metric_calls,
                 elapsed_seconds=elapsed,
                 stagnation_attempts=state.stagnation_attempts,
-                retries_used=state.retries_used,
+                retries_used=0,
                 started_at=state.started_at,
                 milestone_passed=state.milestone_passed,
                 confirmations_passed=state.confirmations_passed,
@@ -1073,7 +1121,7 @@ def advance_state(
                 metric_calls_used=new_metric_calls,
                 elapsed_seconds=elapsed,
                 stagnation_attempts=state.stagnation_attempts,
-                retries_used=state.retries_used,
+                retries_used=0,
                 started_at=state.started_at,
                 milestone_passed=state.milestone_passed,
                 confirmations_passed=new_confirmations,
@@ -1095,7 +1143,7 @@ def advance_state(
             metric_calls_used=new_metric_calls,
             elapsed_seconds=elapsed,
             stagnation_attempts=state.stagnation_attempts,
-            retries_used=state.retries_used,
+            retries_used=0,
             started_at=state.started_at,
             milestone_passed=state.milestone_passed,
             confirmations_passed=new_confirmations,

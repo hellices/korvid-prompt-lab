@@ -37,11 +37,24 @@ cleanup_step() {
 }
 trap cleanup_step EXIT
 
+# Identity bindings enforced inside the CLI itself, not only by this wrapper.
+_binding_args=()
+if [[ -n "${CAMPAIGN_MANIFEST_SHA256:-}" ]]; then
+  _binding_args+=(--expected-manifest-sha256 "$CAMPAIGN_MANIFEST_SHA256")
+fi
+if [[ -n "${PROMPT_LAB_REVISION:-}" ]]; then
+  _binding_args+=(--expected-prompt-lab-revision "$PROMPT_LAB_REVISION")
+fi
+if [[ -n "${KORVID_REVISION:-}" ]]; then
+  _binding_args+=(--expected-korvid-revision "$KORVID_REVISION")
+fi
+
 _action_path="${_work_root}/action.json"
 if ! korvid-campaign plan \
     --control "$CAMPAIGN_CONTROL" \
     --state "$CAMPAIGN_STATE" \
-    --output "$_action_path"; then
+    --output "$_action_path" \
+    "${_binding_args[@]+"${_binding_args[@]}"}"; then
   echo "campaign planning failed" >&2
   exit 70
 fi
@@ -214,7 +227,8 @@ case "$_round_exit" in
         --state "$CAMPAIGN_STATE" \
         --action "$_action_path" \
         --evidence "$_safe_evidence" \
-        --expected-prior-hash "$CAMPAIGN_EXPECTED_PRIOR_HASH"; then
+        --expected-prior-hash "$CAMPAIGN_EXPECTED_PRIOR_HASH" \
+        "${_binding_args[@]+"${_binding_args[@]}"}"; then
       _advance_args+=(--evidence "$_safe_evidence")
     else
       echo "grounding safe evidence failed strict validation" >&2
@@ -247,7 +261,8 @@ if ! korvid-campaign advance \
     --action "$_action_path" \
     "${_advance_args[@]}" \
     --output-state "$_next_state" \
-    --expected-prior-hash "$CAMPAIGN_EXPECTED_PRIOR_HASH"; then
+    --expected-prior-hash "$CAMPAIGN_EXPECTED_PRIOR_HASH" \
+    "${_binding_args[@]+"${_binding_args[@]}"}"; then
   echo "campaign state advance failed" >&2
   exit 70
 fi
