@@ -20,6 +20,7 @@ from korvid_prompt_lab.campaigns import (
     ModelIdentity,
     state_hash,
 )
+from korvid_prompt_lab.contracts import Candidate
 
 DIGEST_A = "sha256:" + "a" * 64
 
@@ -102,10 +103,17 @@ def _write_evidence(
 ) -> None:
     """Write evidence matching an action for SEARCH kind."""
     evidence_path.mkdir(parents=True, exist_ok=True)
+    candidate = Candidate.from_mapping({
+        "schema_version": 1,
+        "candidate_id": "cand-1",
+        "components": {"system": "system prompt"},
+        "metadata": {},
+    })
+    candidate_fingerprint = candidate.fingerprint
     eval_summary = {
         "bundle_kind": "validation",
         "candidate_id": "cand-1",
-        "candidate_fingerprint": "new_fp",
+        "candidate_fingerprint": candidate_fingerprint,
         "campaign_id": "test-campaign",
         "campaign_case_ids": ["case-c"],
         "evaluated_case_ids": ["case-c"],
@@ -138,7 +146,7 @@ def _write_evidence(
         "schema_version": 1,
         "campaign_id": "test-campaign",
         "candidate_id": "cand-1",
-        "candidate_fingerprint": "new_fp",
+        "candidate_fingerprint": candidate_fingerprint,
         "models": ["qwen3:0.6b"],
         "aggregate_score": 0.6,
         "model_scores": {"qwen3:0.6b": 0.6},
@@ -150,7 +158,13 @@ def _write_evidence(
         "status_counts": {"completed": 1},
         "hard_failure_counts": {},
         "runs": [],
-        "artifact_refs": ["round-summary.json", "evaluation-summary.json"],
+        "artifact_refs": [
+            "round-summary.json",
+            "evaluation-summary.json",
+            "comparison-summary.json",
+            "optimization-summary.json",
+            "best-candidate.yaml",
+        ],
         "evaluation_artifact_refs": ["evaluation-summary.json"],
         "prompt_lab_revision": "abc123",
         "korvid_revision": "def456",
@@ -159,6 +173,37 @@ def _write_evidence(
         "action_id": action.get("action_id", "unknown"),
     }
     (evidence_path / "round-summary.json").write_text(json.dumps(round_summary))
+
+    comparison_summary = {
+        "schema_version": 1,
+        "status": "changed",
+        "outcome": "improved",
+        "seed_candidate_fingerprint": "seed.yaml",
+        "best_candidate_fingerprint": candidate_fingerprint,
+        "contract": {
+            "campaign_id": "test-campaign",
+            "models": ["qwen3:0.6b"],
+            "case_repetitions": [["case-c", 5]],
+            "execution_modes": ["live"],
+        },
+        "metrics": [
+            {
+                "key": "systemic_failures",
+                "label": "Systemic failures",
+                "before": 0,
+                "after": 0,
+                "delta": 0,
+                "result": "unchanged",
+                "integer": True,
+                "core": True,
+            }
+        ],
+        "improved_count": 0,
+        "unchanged_count": 1,
+        "regressed_count": 0,
+        "not_comparable_count": 0,
+    }
+    (evidence_path / "comparison-summary.json").write_text(json.dumps(comparison_summary))
 
     opt_summary = {
         "run_id": "run-001",
@@ -174,10 +219,10 @@ def _write_evidence(
             "seed": 0,
             "proposal_source": "dspy",
         },
-        "invocation_dir": "",
+        "invocation_dir": "artifacts/run-001",
         "best_idx": 1,
         "best_validation_score": 0.6,
-        "best_candidate_fingerprint": "new_fp",
+        "best_candidate_fingerprint": candidate_fingerprint,
         "seed_candidate_fingerprint": "seed.yaml",
         "best_candidate_differs_from_seed": True,
         "train_case_ids": ["case-a", "case-b"],
@@ -186,14 +231,19 @@ def _write_evidence(
         "num_candidates": 5,
         "total_metric_calls": 10,
         "num_full_val_evals": 2,
-        "run_dir": "",
+        "run_dir": "artifacts/run-001",
     }
     (evidence_path / "optimization-summary.json").write_text(
         json.dumps(opt_summary),
     )
 
-    bc = {"schema_version": 1, "candidate_id": "cand-1", "components": {}}
-    (evidence_path / "best-candidate.yaml").write_text(yaml.dump(bc))
+    best_candidate = {
+        "schema_version": 1,
+        "candidate_id": "cand-1",
+        "components": {"system": "system prompt"},
+        "metadata": {},
+    }
+    (evidence_path / "best-candidate.yaml").write_text(yaml.dump(best_candidate))
 
 
 # ---------------------------------------------------------------------------

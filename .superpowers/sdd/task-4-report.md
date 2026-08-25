@@ -4,66 +4,65 @@
 
 **Commits:**
 - `fbfe523` — `feat(campaigns): emit safe campaign decisions`
-- `465336a` — `fix(campaigns): strict evidence contract, CAS, atomic writes`
+- `3dcb4a3` — `fix(campaigns): strict evidence contract, CAS, atomic writes`
+- `57f9555` — `fix(campaigns): cross-process CAS, strict schemas, artifact validation`
 
 ## RED → GREEN
 
 | Phase | Command | Result |
 |-------|---------|--------|
-| RED | `uv run --python 3.12 pytest tests/test_campaign_artifacts.py tests/test_campaign_cli.py -q` | ModuleNotFoundError |
-| GREEN | same | 31 passed in 0.35s |
-| Lint | `uv run --python 3.12 ruff check src/korvid_prompt_lab/campaign_artifacts.py src/korvid_prompt_lab/campaign_cli.py tests/test_campaign_artifacts.py tests/test_campaign_cli.py` | All checks passed |
-| Types | `uv run --python 3.12 mypy src/korvid_prompt_lab/campaign_artifacts.py src/korvid_prompt_lab/campaign_cli.py` | Success: no issues found in 2 source files |
-| Task 3 compat | `uv run --python 3.12 pytest tests/test_campaign_state.py -q` | 34 passed |
-| Full suite | all three test files | 65 passed in 0.26s |
+| RED (wave 2) | `pytest tests/test_campaign_artifacts.py tests/test_campaign_cli.py -q` | ImportError / assertion failures on new tests |
+| GREEN | same + state tests | 77 passed in 1.50s |
+| Lint | `ruff check src/korvid_prompt_lab/campaign_artifacts.py src/korvid_prompt_lab/campaign_cli.py tests/test_campaign_artifacts.py tests/test_campaign_cli.py` | All checks passed |
+| Types | `mypy src/korvid_prompt_lab/campaign_artifacts.py src/korvid_prompt_lab/campaign_cli.py` | Success: no issues found in 2 source files |
 
-## Safe-Boundary Invariants
+## CAS Invariants (cross-process)
 
-1. **Allowlisted files only**: `_ALLOWED_FILES` frozenset enforced before any read.
-2. **Symlink rejection**: `_reject_symlink()` checks every path and ancestors.
-3. **Path containment**: `_resolve_safe_path()` verifies resolved path is under root.
-4. **No responses/ traversal**: never opened or listed.
-5. **Action/model/revision/case contract**: `load_round_outcome` validates all identity fields against `control` + `state` — action_id, kind, evaluated case IDs (validation for SEARCH, milestone for MILESTONE/CONFIRM), model name, prompt_lab_revision, korvid_revision, candidate fingerprint, execution_modes include "live", repetitions_per_case positive int.
-6. **MILESTONE/CONFIRM champion binding**: candidate_fingerprint must equal state.champion_fingerprint.
-7. **SEARCH optimization validation**: requires optimization-summary.json + best-candidate.yaml, validates seed against action stage/seed_index, total_metric_calls ≤ action.metric_calls, seed_candidate_fingerprint = champion, train/validation case IDs match control, run_identity exact keys + values.
-8. **MILESTONE/CONFIRM rejects optimization files**: presence of optimization-summary.json or best-candidate.yaml raises ValueError.
-9. **GitHub output trust boundary**: CLI never reads GITHUB_OUTPUT env; writes only to explicit --github-output.
+1. `write_campaign_state` acquires exclusive advisory lock (`fcntl.flock(LOCK_EX)`) on adjacent `.lock` file inside validated state root.
+2. Under lock: re-reads target, verifies expected_prior_hash against stored state_hash, writes to uuid-named temp in same directory, `os.fsync` fd, `os.replace` atomic, `os.fsync` directory fd, cleans temp in finally.
+3. Two threads/processes with same expected_prior_hash: exactly one succeeds; second re-reads the new hash and raises ValueError.
+4. Deterministic concurrent test uses `threading.Barrier(2)` — both threads wait, then race CAS; asserts exactly one ValueError.
+5. Lock file opened safely; path validated within state_root; temp cleaned on any BaseException.
 
-## CAS (Compare-and-Swap) Invariants
+## Strict Schema Invariants
 
-1. `--expected-prior-hash` is **required** on advance CLI (argparse enforced).
-2. CLI validates `expected_prior_hash == state_hash(loaded_state)` before any advance attempt.
-3. `write_campaign_state` on existing file: rejects if file's `state_hash` ≠ expected_prior_hash.
-4. Two workers loading same prior: first succeeds writing output; second's advance attempt fails because the output file now has the first worker's new hash.
-5. Temp file (`*.cas_tmp`) cleaned in `finally` block on any BaseException.
-6. Original state file preserved intact when write/replace fails.
+1. `_ROUND_SUMMARY_REQUIRED_KEYS` and `_EVAL_SUMMARY_REQUIRED_KEYS` define exact allowed key sets; unknown/missing keys rejected.
+2. prompt_lab_revision and korvid_revision required non-empty in evidence; must match state exactly.
+3. evaluated_models must contain exactly the expected model (state.model_identity.model); extras/duplicates rejected.
+4. All numeric fields validated as finite, non-negative where required; bool-as-int rejected; empty strings rejected.
 
-## Strict Types
+## Artifact Refs Validation
 
-- No `str()`, `float()`, `int()` coercion on untrusted values.
-- `_require_int`: rejects bool, non-int.
-- `_require_finite_float`: rejects bool, str, NaN, Inf.
-- `_require_str`: rejects non-str, empty.
-- `_require_bool`: rejects non-bool.
-- `_require_string_list`: rejects non-list, non-str items, empty items.
-- `_ensure_exact_keys`: rejects missing or unknown keys.
+1. Every ref in `artifact_refs` is: non-empty, relative, no `..` traversal, no absolute path, unique.
+2. Each ref resolves under evidence root to non-symlink path (stat only, never read content).
+3. SEARCH requires comparison-summary.json present; loaded and validated.
+4. MILESTONE/CONFIRM rejects comparison-summary.json and optimization files.
 
-## Atomic Write Safety
+## Best Candidate Fingerprint Binding
 
-- `write_campaign_state`: writes to `.cas_tmp`, replaces target in finally-guarded block; unlinks temp on any failure.
-- `write_campaign_artifacts`: creates output dir, catches BaseException, removes partial files and attempts rmdir on failure.
-- Tests inject `OSError` on `Path.replace` and `Path.write_text`; verify no temp leftovers and original state preservation.
+1. best-candidate.yaml parsed via `Candidate.from_mapping()` with full schema validation.
+2. Fingerprint recomputed from candidate structure; verified equal to optimization-summary.best_candidate_fingerprint, round-summary.candidate_fingerprint, eval-summary.candidate_fingerprint.
+3. candidate_id cross-validated across all sources.
+4. seed_candidate_fingerprint + best_candidate_differs_from_seed flag consistency verified.
+
+## Summary Rendering
+
+1. Headline includes stage suffix for RUNNING: `## 🔄 RUNNING — {stage_name} stage`.
+2. Terminal states omit suffix: `## ✅ QUALIFIED`.
+3. Next action text derived exclusively from `next_action()`.
+4. Budget/progress from control values, never guessed.
+5. Failure movement section present (empty representation when no data).
 
 ## Self-Review
 
-- All 7 review findings addressed with tests.
-- Render uses `next_action()` from the state machine for exact stage name and budget in markdown.
-- No defaults/fallbacks for missing required fields — strict `_require_*` validators raise on any mismatch.
-- CLI advance passes explicit `state_root` to `write_campaign_state` for path containment.
-- Test coverage: wrong action_id, wrong case set, wrong model, wrong revision, symlinks, malformed JSON, bool-as-int, non-finite float, missing optimization-summary, wrong seed, budget exceeded, wrong seed fingerprint, milestone rejects optimization files, CAS stale/concurrent/failure.
+- All 6 wave-2 findings addressed with tests.
+- Concurrent CAS test is deterministic (barrier sync, not timing-based).
+- Schema validation matches rounds.py patterns without duplicating unsafe loaders.
+- Fingerprint recomputation uses established `Candidate.from_mapping()` + `.fingerprint` property.
+- No downstream assumptions about candidate content.
 
 ## Concerns
 
-- `write_campaign_state` uses `Path.replace()` for atomic rename which is not atomic across filesystems on some platforms; production deployments should ensure state file and temp are on same filesystem.
-- For truly concurrent multi-worker safety on shared state, an advisory file lock or server-side compare-and-swap would be stronger than file-based CAS.
-- `_load_control` in CLI reconstructs `OptimizationCampaign` without the full `Campaign` evaluation cross-validation (case ID coverage check); this is acceptable because the control file was already validated at campaign initialization time.
+- `fcntl.flock` is advisory only; a process that doesn't use the lock can still overwrite. Production may want mandatory locking or server-side CAS.
+- Lock file cleanup is left to the OS; lock files accumulate but are zero-size.
+- `_load_control` in CLI reconstructs `OptimizationCampaign` without full `Campaign` case-coverage cross-validation (acceptable — validated at campaign init time).
