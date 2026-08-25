@@ -16,7 +16,8 @@
 - Milestone evidence must never be supplied to GEPA or the reflection model.
 - Every campaign declares positive metric-call, wall-clock, stagnation, and infrastructure-retry limits.
 - Exit `1` is validated hard-safety evidence; exit `70` is systemic evidence failure and never updates candidate scores.
-- System and configuration failures do not consume campaign experiment budget.
+- System and configuration failures do not consume metric-call budget or update
+  scores, but they do count toward the total wall-clock safety limit.
 - A campaign may end only as `QUALIFIED`, `NOT_CONVERGED`, or `SYSTEM_ERROR`; only `QUALIFIED` can become publication-eligible.
 - GitHub safe artifacts must exclude raw answers, raw requests, audit journals, kubeconfig, credentials, reflection transcripts, and GEPA state.
 - The existing `Grounding Round Outcome` remains authoritative for each constituent round.
@@ -456,6 +457,7 @@ def test_system_error_does_not_consume_experiment_budget() -> None:
     )
     assert advanced.metric_calls_used == 12
     assert advanced.retries_used == 1
+    assert advanced.elapsed_seconds > state.elapsed_seconds
     assert advanced.status is CampaignStatus.RUNNING
 
 

@@ -223,9 +223,10 @@ Attempt outcomes are classified as:
   unsupported inputs.
 
 System and configuration failures never update candidate scores, consume GEPA
-metric-call budget, or trigger model escalation. A system failure may use only
-the manifest's bounded retry allowance. Cleanup and restoration remain mandatory
-after every attempt.
+metric-call budget, or trigger model escalation. They still count toward the
+campaign's wall-clock safety limit, which bounds total operator and AKS exposure
+rather than model evidence. A system failure may use only the manifest's bounded
+retry allowance. Cleanup and restoration remain mandatory after every attempt.
 
 Unexpected optimizer failure never falls back to the seed as if optimization
 succeeded.
