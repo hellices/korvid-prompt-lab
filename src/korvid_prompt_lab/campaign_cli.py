@@ -33,6 +33,7 @@ from .campaigns import (
     TierResult,
     advance_state,
     next_action,
+    state_hash,
 )
 
 
@@ -54,15 +55,14 @@ def build_parser() -> argparse.ArgumentParser:
     adv_p.add_argument("--action", type=Path, required=True)
     adv_p.add_argument("--evidence", type=Path, required=True)
     adv_p.add_argument("--output-state", type=Path, required=True)
+    adv_p.add_argument("--expected-prior-hash", type=str, required=True)
     adv_p.add_argument("--github-output", type=Path, default=None)
 
     # render
     rend_p = sub.add_parser("render", help="Render campaign summary.")
+    rend_p.add_argument("--control", type=Path, required=True)
     rend_p.add_argument("--state", type=Path, required=True)
     rend_p.add_argument("--output-dir", type=Path, required=True)
-    rend_p.add_argument("--total-metric-call-limit", type=int, required=True)
-    rend_p.add_argument("--wall-clock-limit-seconds", type=int, required=True)
-    rend_p.add_argument("--stages-count", type=int, required=True)
     rend_p.add_argument("--github-output", type=Path, default=None)
 
     return parser
@@ -129,12 +129,16 @@ def _load_state(path: Path) -> CampaignState:
 
 
 def _load_control(path: Path) -> OptimizationCampaign:
-    """Load optimization campaign control from YAML (lightweight, no eval campaign validation)."""
+    """Load optimization campaign control from YAML."""
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     from .campaigns import ModelTier, SearchStage
 
     stages = tuple(
-        SearchStage(name=s["name"], metric_calls=s["metric_calls"], seeds=tuple(s["seeds"]))
+        SearchStage(
+            name=s["name"],
+            metric_calls=s["metric_calls"],
+            seeds=tuple(s["seeds"]),
+        )
         for s in data["stages"]
     )
     model_tiers = tuple(
@@ -159,7 +163,9 @@ def _load_control(path: Path) -> OptimizationCampaign:
     )
 
 
-def _write_github_output(gh_output_path: Path | None, entries: dict[str, str]) -> None:
+def _write_github_output(
+    gh_output_path: Path | None, entries: dict[str, str],
+) -> None:
     """Write GitHub Actions output entries to explicit path only."""
     if gh_output_path is None:
         return
@@ -175,8 +181,13 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     action = next_action(control, state, now)
     if action is None:
         result: dict[str, Any] = {"terminal": True, "status": state.status.value}
-        args.output.write_text(json.dumps(result, indent=2), encoding="utf-8")
-        _write_github_output(args.github_output, {"terminal": "true", "status": state.status.value})
+        args.output.write_text(
+            json.dumps(result, indent=2), encoding="utf-8",
+        )
+        _write_github_output(
+            args.github_output,
+            {"terminal": "true", "status": state.status.value},
+        )
         return 0
 
     result = {
@@ -200,6 +211,18 @@ def _cmd_plan(args: argparse.Namespace) -> int:
 def _cmd_advance(args: argparse.Namespace) -> int:
     control = _load_control(args.control)
     state = _load_state(args.state)
+
+    # CAS: validate expected-prior-hash against loaded state
+    current_hash = state_hash(state)
+    expected_prior = args.expected_prior_hash
+    if expected_prior != current_hash:
+        print(
+            f"Error: --expected-prior-hash mismatch: "
+            f"got {expected_prior!r}, state has {current_hash!r}",
+            file=sys.stderr,
+        )
+        return 1
+
     action_data = json.loads(args.action.read_text(encoding="utf-8"))
 
     action = CampaignAction(
@@ -212,23 +235,25 @@ def _cmd_advance(args: argparse.Namespace) -> int:
         metric_calls=action_data.get("metric_calls", 0),
     )
 
-    # Load evidence
+    # Load evidence with full contract validation
     evidence_root = args.evidence
     try:
-        outcome_data = load_round_outcome(evidence_root, action)
+        outcome_data = load_round_outcome(
+            evidence_root, action, control=control, state=state,
+        )
     except ValueError as exc:
         print(f"Error loading evidence: {exc}", file=sys.stderr)
         return 1
 
-    # Build AttemptOutcome
+    # Build AttemptOutcome from validated evidence
     score = CampaignScore(
         fingerprint=outcome_data.candidate_fingerprint,
         aggregate=outcome_data.aggregate_score,
         hard_safety_failures=outcome_data.hard_safety_failures,
         core_regression=outcome_data.core_regression,
         systemic_failures=outcome_data.systemic_failures,
-        pass_at_3=outcome_data.pass_at_3 if outcome_data.pass_at_3 is not None else 0.0,
-        pass_at_5=outcome_data.pass_at_5 if outcome_data.pass_at_5 is not None else 0.0,
+        pass_at_3=outcome_data.pass_at_3,
+        pass_at_5=outcome_data.pass_at_5,
     )
     attempt = AttemptOutcome(kind="evidence", score=score)
 
@@ -239,8 +264,17 @@ def _cmd_advance(args: argparse.Namespace) -> int:
         print(f"Error advancing state: {exc}", file=sys.stderr)
         return 1
 
-    # Write new state with CAS
-    write_campaign_state(new_state, args.output_state, expected_prior_hash=None)
+    # Write new state with CAS against the loaded state's hash
+    try:
+        write_campaign_state(
+            new_state,
+            args.output_state,
+            expected_prior_hash=current_hash,
+            state_root=args.output_state.parent,
+        )
+    except ValueError as exc:
+        print(f"Error writing state (CAS): {exc}", file=sys.stderr)
+        return 1
 
     _write_github_output(args.github_output, {
         "status": new_state.status.value,
@@ -250,14 +284,9 @@ def _cmd_advance(args: argparse.Namespace) -> int:
 
 
 def _cmd_render(args: argparse.Namespace) -> int:
+    control = _load_control(args.control)
     state = _load_state(args.state)
-    write_campaign_artifacts(
-        state,
-        args.output_dir,
-        total_metric_call_limit=args.total_metric_call_limit,
-        wall_clock_limit_seconds=args.wall_clock_limit_seconds,
-        stages_count=args.stages_count,
-    )
+    write_campaign_artifacts(state, args.output_dir, control)
     _write_github_output(args.github_output, {"rendered": "true"})
     return 0
 

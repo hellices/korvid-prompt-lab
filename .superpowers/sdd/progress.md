@@ -20,3 +20,8 @@ Grounding comparison Task 2: complete (commits f889efa..7d31558, review clean af
 Grounding comparison Task 3: complete (commits 7d31558..47d1340, review approved; final review to triage malformed-JSON traceback and evaluate-only systemic exit flattening).
 Grounding comparison Task 4: complete (commits 47d1340..845d22c, review clean after documentation/test evidence fixes).
 Grounding comparison final-review fix wave: complete (all 6 confirmed findings; 7 new regression tests; focused suite 100 passed, full suite 703 passed/6 skipped; ruff/mypy clean; bash -n + git diff --check clean). See grounding-comparison-final-fix-report.md.
+
+Bounded optimization campaign: started from 81c444d; baseline 703 passed, 6 skipped.
+Bounded campaign Task 1: complete (commits 81c444d..c43265a, review clean after four fixes; local checkout runtime probe blocked before execution by repeated PyPI socket failures, exact runner preflight retained for Task 7 live canary).
+Bounded campaign Task 2: complete (commits c43265a..7e22f6d, review clean after canonical digest fixes; live qwen3:0.6b digest verified, modeleval restored to 0/Succeeded, ARC pods 0).
+Bounded campaign Task 3: complete (commits 7e22f6d..62d92d6, review clean after three fix waves; systemic safety, evidence identity, qualification, tier rollover, budgets, and model identity verified; persistence CAS remains Tasks 4/6).

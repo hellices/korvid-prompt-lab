@@ -5,7 +5,7 @@ COMPLETE
 
 ## Commit
 - `80500397c4b0dbf33048552fef7715d05d6ed301` — `feat(campaigns): define bounded qualification inputs`
-- `8d75196d59f878d6605c08c059b97ccce8d37b70` — `fix(campaigns): canonicalize model digests`
+- `e3d3de4e14ca465b8e083e064f6939f2af6999c6` — `fix(campaigns): canonicalize model digests`
 
 ## Files Changed
 - `examples/campaigns/aks-small-operator-qualification.yaml`
@@ -168,7 +168,7 @@ no matching port-forward processes left
    - Result: created commit `80500397c4b0dbf33048552fef7715d05d6ed301`
 5. Review-fix commit:
    - `git commit -m "fix(campaigns): canonicalize model digests" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"`
-   - Result: created commit `8d75196d59f878d6605c08c059b97ccce8d37b70`
+   - Result: created commit `e3d3de4e14ca465b8e083e064f6939f2af6999c6`
 
 ## Self-Review
 - Confirmed the evaluation campaign contains exactly the 12 required case IDs, template IDs, and prompts.
