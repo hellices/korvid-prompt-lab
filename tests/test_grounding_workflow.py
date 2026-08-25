@@ -1649,6 +1649,36 @@ def test_grounding_workflow_has_tool_verification_step_before_node_count() -> No
         assert tool in body, f"tool verification step must check for '{tool}'"
 
 
+def test_grounding_workflow_preflights_korvid_runtime_imports_before_azure_and_scaling() -> None:
+    workflow = load_workflow()
+    all_steps = steps(workflow)
+    preflight_indexes = [
+        index
+        for index, step in enumerate(all_steps)
+        if "korvid-bridge --check-imports" in str(step.get("run", ""))
+    ]
+    assert preflight_indexes, (
+        "workflow must preflight `korvid-bridge --check-imports` before Azure/model "
+        "credentials or any AKS node-pool operation"
+    )
+
+    preflight_index = preflight_indexes[0]
+    provision_index = next(
+        index
+        for index, step in enumerate(all_steps)
+        if "Provision Korvid uv environment out of tree" in str(step.get("name", ""))
+    )
+    azure_login_index = step_index(workflow, "azure/login")
+    node_count_index = next(
+        index
+        for index, step in enumerate(all_steps)
+        if "Record original modeleval node count" in str(step.get("name", ""))
+    )
+
+    assert provision_index < preflight_index < azure_login_index
+    assert preflight_index < node_count_index
+
+
 # ---------------------------------------------------------------------------
 # Trust boundary: korvid_ref provenance in the authoritative Korvid repository
 #

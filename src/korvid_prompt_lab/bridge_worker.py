@@ -84,6 +84,10 @@ _CREDENTIAL_PHRASE = re.compile(
     r"(?:[\s:=]*\b(?:authorization|bearer|api[-_]?key|apikey|token|secret|password)\b)*"
     r"[\s:=]*\S+"
 )
+_CANNOT_IMPORT_NAME = re.compile(r"cannot import name ['\"]([^'\"]+)['\"] from ['\"]([^'\"]+)['\"]")
+_MISSING_MODULE_ATTRIBUTE = re.compile(
+    r"module ['\"]([^'\"]+)['\"] has no attribute ['\"]([^'\"]+)['\"]"
+)
 
 
 class WorkerConfigurationError(Exception):
@@ -523,6 +527,21 @@ def sanitize_error(error: BaseException | str, env: Mapping[str, str] | None = N
     return text or "unspecified bridge failure"
 
 
+def sanitize_import_error(error: BaseException, env: Mapping[str, str] | None = None) -> str:
+    """Return a bounded import/symbol-resolution error without paths or secrets."""
+    text = sanitize_error(error, env)
+
+    if match := _CANNOT_IMPORT_NAME.search(str(error)):
+        return f"{match.group(2)}: {match.group(1)}"
+    if match := _MISSING_MODULE_ATTRIBUTE.search(str(error)):
+        return f"{match.group(1)}: {match.group(2)}"
+    if isinstance(error, ModuleNotFoundError) and error.name:
+        return error.name
+    if isinstance(error, ImportError) and error.name:
+        return error.name
+    return text
+
+
 # --- atomic response write --------------------------------------------------------
 
 
@@ -649,26 +668,20 @@ class _Korvid:
 def _import_korvid() -> _Korvid:
     # Every symbol below lives in the checkout named by KORVID_SOURCE_ROOT, so it
     # is resolvable only in the worker's uv environment, never in this one.
-    try:
-        import httpx
-        from korvid.agent.profiles import PromptOverrides
-        from korvid.evals.operation import (
-            LIFECYCLE_CHECKPOINTS,
-            bundled_operations_dir,
-            load_operation_journeys,
-        )
-        from korvid.evals.scripted import ScriptedProvider
-        from korvid.providers.openai_compat import OpenAICompatProvider, ProviderError
-        from korvid.providers.static_creds import StaticHeaderSource
-        from tests.evals import operation_app
-        from tests.evals.operation_campaign import approval_timeout_for
-        from tests.evals.operation_scripts import OPERATION_SCRIPTS
-        from tests.ui.waits import WaitTimeout
-    except ImportError as exc:
-        raise WorkerConfigurationError(
-            "korvid operation harness is not importable; KORVID_SOURCE_ROOT must point at a"
-            " Korvid source checkout whose uv environment is installed"
-        ) from exc
+    import httpx
+    from korvid.agent.profiles import PromptOverrides
+    from korvid.evals.operation import (
+        LIFECYCLE_CHECKPOINTS,
+        bundled_operations_dir,
+        load_operation_journeys,
+    )
+    from korvid.evals.scripted import ScriptedProvider
+    from korvid.providers.openai_compat import OpenAICompatProvider, ProviderError
+    from korvid.providers.static_creds import StaticHeaderSource
+    from tests.evals import operation_app
+    from tests.evals.operation_campaign import approval_timeout_for
+    from tests.evals.operation_scripts import OPERATION_SCRIPTS
+    from tests.ui.waits import WaitTimeout
 
     return _Korvid(
         operation_app=operation_app,
@@ -789,6 +802,20 @@ def run_bridge(
     )
 
 
+def check_korvid_imports() -> int:
+    """Exit zero only when every runtime symbol resolves inside the Korvid checkout."""
+    try:
+        _import_korvid()
+    except (ImportError, AttributeError) as exc:
+        print(f"korvid import failed: {sanitize_import_error(exc)}", file=sys.stderr)
+        return EXIT_SYSTEMIC_FAILURE
+    except WorkerConfigurationError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_SYSTEMIC_FAILURE
+    print("korvid runtime imports: OK")
+    return 0
+
+
 # --- entry point --------------------------------------------------------------------
 
 
@@ -797,8 +824,13 @@ def build_parser() -> argparse.ArgumentParser:
         prog="korvid-bridge-worker",
         description="Run one graded Korvid operation journey for a prompt candidate.",
     )
-    parser.add_argument("--request", required=True, type=Path, help="Path to the bridge request JSON.")
-    parser.add_argument("--response", required=True, type=Path, help="Path to write the bridge response JSON.")
+    parser.add_argument(
+        "--check-imports",
+        action="store_true",
+        help="Resolve the pinned Korvid runtime imports and exit without reading bridge artifacts.",
+    )
+    parser.add_argument("--request", type=Path, help="Path to the bridge request JSON.")
+    parser.add_argument("--response", type=Path, help="Path to write the bridge response JSON.")
     parser.add_argument(
         "--scripted",
         action="store_true",
@@ -822,6 +854,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.check_imports:
+        if args.request is not None or args.response is not None:
+            print(
+                "korvid-bridge-worker: --check-imports does not accept --request or --response",
+                file=sys.stderr,
+            )
+            return EXIT_SYSTEMIC_FAILURE
+        return check_korvid_imports()
+    if args.request is None or args.response is None:
+        print(
+            "korvid-bridge-worker: --request and --response are required unless --check-imports is used",
+            file=sys.stderr,
+        )
+        return EXIT_SYSTEMIC_FAILURE
 
     request: BridgeRequest | None = None
     execution_mode: str | None = None
@@ -842,6 +888,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"korvid-bridge-worker: {sanitize_error(exc)}", file=sys.stderr)
             return EXIT_SYSTEMIC_FAILURE
         payload = build_model_failure_response(request, exc, execution_mode=execution_mode)
+    except (ImportError, AttributeError) as exc:
+        print(f"korvid-bridge-worker: korvid import failed: {sanitize_import_error(exc)}", file=sys.stderr)
+        return EXIT_SYSTEMIC_FAILURE
     except WorkerConfigurationError as exc:
         print(f"korvid-bridge-worker: {sanitize_error(exc)}", file=sys.stderr)
         return EXIT_SYSTEMIC_FAILURE

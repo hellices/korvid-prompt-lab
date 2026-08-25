@@ -28,13 +28,12 @@ name: Grounding Round
         description: "Korvid commit SHA to check out (exact 40-hex commit SHA, proven authoritative before any credential)"
         required: true
         type: string
-        # The operation-journey harness the bridge imports is not on the Korvid
-        # default branch yet, so this pin is a commit of the open pull request
-        # that introduces it.  `src/korvid_prompt_lab/korvid_pin.py` is the
-        # reviewed declaration of this SHA, its provenance, and the bridge
-        # dependencies it must contain; `scripts/verify-korvid-pin.sh` re-proves
-        # both against the live GitHub API.
-        default: "fc7eece2adb66a5b2a18d378bdfd7503ddbdd2ca"
+        # `src/korvid_prompt_lab/korvid_pin.py` is the reviewed declaration of
+        # this SHA, its authoritative provenance, and the bridge import contract
+        # it must satisfy. `scripts/verify-korvid-pin.sh` re-proves both against
+        # the live GitHub API, and the workflow preflights `korvid-bridge
+        # --check-imports` before Azure/model credentials or any AKS scaling.
+        default: "62bd3cbee2e27369bb81abc0957dae341c2aa434"
       model:
         description: "Ollama model tag to evaluate"
         type: choice
@@ -515,17 +514,7 @@ jobs:
           persist-credentials: false
 
       # -----------------------------------------------------------------------
-      # 6. Azure OIDC login (no client secret)
-      # -----------------------------------------------------------------------
-      - name: Azure login (OIDC)
-        uses: azure/login@a65d910e8af852a8061c627c456678983e180302  # v2.2.0
-        with:
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-
-      # -----------------------------------------------------------------------
-      # 7. Python toolchain
+      # 6. Python toolchain
       # -----------------------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
@@ -538,7 +527,7 @@ jobs:
           version: "latest"
 
       # -----------------------------------------------------------------------
-      # 8. Install Prompt Lab into an environment outside both checkouts
+      # 7. Install Prompt Lab into an environment outside both checkouts
       # -----------------------------------------------------------------------
       - name: Install Prompt Lab
         working-directory: prompt-lab
@@ -554,7 +543,7 @@ jobs:
           printf '%s\n' "$UV_PROJECT_ENVIRONMENT/bin" >> "$GITHUB_PATH"
 
       # -----------------------------------------------------------------------
-      # 9. Provision the Korvid uv environment out of tree
+      # 8. Provision the Korvid uv environment out of tree
       #
       # The bridge launches its worker with `uv run --project <korvid> --no-sync`,
       # which needs a complete environment for that checkout.  The checkout stays
@@ -579,7 +568,35 @@ jobs:
           fi
 
       # -----------------------------------------------------------------------
-      # 10. Verify required CLI tools before node-pool operations
+      # 9. Preflight Korvid runtime imports before Azure/model credentials
+      #
+      # Source-path existence alone is insufficient: the checked-out Korvid
+      # revision must also resolve every bridge runtime symbol in its own uv
+      # environment before Azure OIDC, model credentials, or node-pool work can
+      # begin.
+      # -----------------------------------------------------------------------
+      - name: Preflight Korvid bridge imports
+        working-directory: prompt-lab
+        shell: bash
+        env:
+          KORVID_SOURCE_ROOT: ${{ github.workspace }}/korvid
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/korvid-uv-env
+        run: |
+          set -Eeuo pipefail
+          korvid-bridge --check-imports
+
+      # -----------------------------------------------------------------------
+      # 10. Azure OIDC login (no client secret)
+      # -----------------------------------------------------------------------
+      - name: Azure login (OIDC)
+        uses: azure/login@a65d910e8af852a8061c627c456678983e180302  # v2.2.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # -----------------------------------------------------------------------
+      # 11. Verify required CLI tools before node-pool operations
       # -----------------------------------------------------------------------
       - name: Verify required CLI tools
         shell: bash
@@ -593,7 +610,7 @@ jobs:
           done
 
       # -----------------------------------------------------------------------
-      # 11. Record the original modeleval node count
+      # 12. Record the original modeleval node count
       #
       # Captured as a step output *before* anything can scale the pool, so the
       # always() cleanup step at the end restores the exact original count even
@@ -619,7 +636,7 @@ jobs:
           printf 'original-count=%s\n' "$count" >> "$GITHUB_OUTPUT"
 
       # -----------------------------------------------------------------------
-      # 12. Run the grounding orchestrator
+      # 13. Run the grounding orchestrator
       # -----------------------------------------------------------------------
       - name: Run grounding round
         working-directory: prompt-lab
@@ -658,7 +675,7 @@ jobs:
         run: bash scripts/run-grounding-round.sh
 
       # -----------------------------------------------------------------------
-      # 13. Append the safe round summary to the Job Summary
+      # 14. Append the safe round summary to the Job Summary
       # -----------------------------------------------------------------------
       - name: Append round summary to Job Summary
         if: always() && hashFiles('prompt-lab/artifacts/grounding-round/safe-evidence/round-summary.md') != ''

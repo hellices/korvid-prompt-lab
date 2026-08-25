@@ -12,6 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from korvid_prompt_lab import bridge_worker
 from korvid_prompt_lab.bridge_worker import (
     EXECUTION_MODE_LIVE,
     EXECUTION_MODE_SCRIPTED,
@@ -958,3 +959,21 @@ def test_worker_writes_a_model_failure_response_when_a_started_turn_times_out(
     assert response["status"] == "model_failure"
     assert response["execution_mode"] == "live"
     assert response["grade"] is None
+
+
+def test_worker_check_imports_reports_missing_name_without_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        bridge_worker,
+        "_import_korvid",
+        lambda: (_ for _ in ()).throw(
+            ImportError("cannot import name 'LIFECYCLE_CHECKPOINTS' from 'korvid.evals.operation'")
+        ),
+    )
+
+    assert bridge_worker.main(["--check-imports"]) == bridge_worker.EXIT_SYSTEMIC_FAILURE
+    captured = capsys.readouterr()
+    assert "korvid.evals.operation" in captured.err
+    assert "LIFECYCLE_CHECKPOINTS" in captured.err
+    assert "Traceback" not in captured.err

@@ -850,7 +850,7 @@ and fill in:
 | Input | Required | Default | Notes |
 | --- | --- | --- | --- |
 | `prompt_lab_ref` | yes | — | Exact 40-hex SHA of the Prompt Lab commit to evaluate; must be contained in the default branch, or be the head of the same-repository PR named by `pr_number` |
-| `korvid_ref` | yes | `fc7eece2adb66a5b2a18d378bdfd7503ddbdd2ca` | Exact 40-hex SHA of the Korvid commit to use; must be proven authoritative `hellices/korvid` code — contained in its default branch, or in the head of one of its own **open** pull requests targeting that default branch. Fork heads, closed pull requests, and unknown SHAs are rejected |
+| `korvid_ref` | yes | `62bd3cbee2e27369bb81abc0957dae341c2aa434` | Exact 40-hex SHA of the Korvid commit to use; must be proven authoritative `hellices/korvid` code — contained in its default branch, or in the head of one of its own **open** pull requests targeting that default branch. Fork heads, closed pull requests, and unknown SHAs are rejected, and the workflow runs `korvid-bridge --check-imports` before Azure/model credentials or any AKS node-pool work |
 | `model` | yes | `qwen3:1.7b` | Ollama tag from the closed allowlist |
 | `round_type` | yes | `evaluate` | `evaluate` or `optimize-evaluate` |
 | `candidate` | yes | shipped-small | Relative path inside the Prompt Lab checkout |
@@ -922,8 +922,8 @@ requires write access); fork heads never are.
 ### Trust boundary for `korvid_ref`
 
 `korvid_ref` must be an exact 40-hex SHA **and** must be proven to be
-authoritative code in `hellices/korvid` before any credential exists. The check
-runs in the same pre-credential `actions/github-script` trust step, using only
+authoritative code in `hellices/korvid` before any credential exists. The trust
+check runs in the same pre-credential `actions/github-script` step, using only
 the job's own read-only `GITHUB_TOKEN` against the public Korvid repository —
 before the Korvid GitHub App token, Azure login, or any checkout.
 
@@ -940,39 +940,47 @@ experiment commits, and API failures are all refused — an unprovable ref fails
 closed. The Korvid repo identity (`{owner}/korvid`) is derived from
 `github.repository_owner`; it is never user-controlled.
 
-#### Why the pull-request route exists
+#### Why the import preflight still exists
 
-The pinned default
-`fc7eece2adb66a5b2a18d378bdfd7503ddbdd2ca` is deliberately *not* a default-branch
-commit. The operation-journey harness the bridge imports —
-`korvid.evals.operation`, `tests.evals.operation_app`,
-`tests.evals.operation_campaign` and `tests.evals.operation_scripts` — has never
-existed on `hellices/korvid` `main`; it is introduced by open pull request
-**#312** (`feat/307-small-operator-foundation` → `main`). Repinning to a `main`
-commit would clear a default-branch-only gate and then fail at run time with
-"korvid operation harness is not importable", *after* the Korvid app token, the
-Azure OIDC session, and the GPU node pool had already been spent.
+The pinned default `62bd3cbee2e27369bb81abc0957dae341c2aa434` is the reviewed
+squash merge of pull request **#312** and is now on `hellices/korvid` `main`, so
+the default-branch trust route is sufficient for provenance. That still does
+*not* prove the bridge can run it: the worker imports specific Korvid symbols,
+and a file path existing does not guarantee that names such as
+`LIFECYCLE_CHECKPOINTS`, `approval_timeout_for`, `run_operation_journey`, and
+the patchable `build_profile` binding still resolve at runtime.
 
-A same-repository branch already requires write access to `hellices/korvid`,
-which is the same trust argument this workflow already accepts for
-`prompt_lab_ref` pull request heads — so the pull-request route reuses that
-boundary rather than widening it to anonymous code.
+The workflow therefore performs a second, local preflight after the Korvid
+checkout and dependency setup but before Azure OIDC, model credentials, or
+node-pool operations:
+
+```bash
+korvid-bridge --check-imports
+```
+
+That command runs the bridge worker's `_import_korvid()` inside the pinned
+checkout's own `uv` environment and exits `0` only when every runtime symbol
+resolves. A same-repository pull request route still exists for future Korvid
+refs that are authoritative but not yet merged; fork heads, closed pull
+requests, arbitrary experiment commits, and API failures still fail closed.
 
 The pin is declared once, in
-[`src/korvid_prompt_lab/korvid_pin.py`](src/korvid_prompt_lab/korvid_pin.py): the
-approved SHA, a dated snapshot of its provenance, and the exact Korvid modules
-the bridge imports. Contract tests bind the workflow default, this README, and
-the bridge worker's own imports to that declaration, so none of them can drift
-apart again. To re-prove the pin against the live GitHub API:
+[`src/korvid_prompt_lab/korvid_pin.py`](src/korvid_prompt_lab/korvid_pin.py):
+the approved SHA, a dated snapshot of its provenance, and the exact Korvid
+modules the bridge imports. Contract tests bind the workflow default, this
+README, and the bridge worker's own imports to that declaration, so none of
+them can drift apart again. To re-prove the pin against the live GitHub API:
 
 ```bash
 scripts/verify-korvid-pin.sh
 ```
 
-It re-runs the provenance compares and confirms every required Korvid source
-path still exists at the pinned commit. Run it after the Korvid pull request is
-merged, force pushed, or closed — and repin (updating `korvid_pin.py`) once the
-harness lands on `main`.
+It re-runs the provenance compares, confirms every required Korvid source path
+still exists at the pinned commit, and checks that the bridge's runtime import
+contract is still satisfied from the source text there. Run it after the Korvid
+pull request is merged, force pushed, or closed — and repin (updating
+`korvid_pin.py`) whenever the authoritative, runtime-importable revision
+changes.
 
 ### Result locations
 

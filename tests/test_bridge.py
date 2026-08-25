@@ -20,6 +20,7 @@ from korvid_prompt_lab.bridge import (
     BridgeConfigurationError,
     LauncherTerminated,
     _run_worker_process_group,
+    build_worker_import_check,
     build_worker_invocation,
     main,
     resolve_source_root,
@@ -155,6 +156,18 @@ def test_build_worker_invocation_forwards_runtime_policy_flags(tmp_path: Path) -
     assert command[command.index("--profile") + 1] == "full"
     assert command[command.index("--approval-timeout") + 1] == "1.5"
     assert command[command.index("--turn-timeout") + 1] == "30.0"
+
+
+def test_bridge_check_imports_builds_worker_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("korvid_prompt_lab.bridge.shutil.which", lambda _name, path=None: "/usr/bin/uv")
+
+    command, env = build_worker_import_check(
+        source_root=Path("/korvid"),
+        env={"PATH": "/usr/bin"},
+    )
+
+    assert command[-1] == "--check-imports"
+    assert env["PYTHONPATH"] == "/korvid"
 
 
 def test_build_worker_invocation_requires_a_uv_executable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

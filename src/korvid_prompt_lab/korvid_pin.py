@@ -16,18 +16,16 @@ reviewed source of truth offline.  Nothing here touches the network: the
 provenance facts are a dated snapshot recorded from the GitHub API, and
 ``scripts/verify-korvid-pin.sh`` re-verifies them live when a maintainer asks.
 
-Why the pin is *not* a default-branch commit
---------------------------------------------
-The harness the bridge imports — ``korvid.evals.operation``,
-``tests.evals.operation_app``, ``tests.evals.operation_campaign`` and
-``tests.evals.operation_scripts`` — has never existed on ``hellices/korvid``
-``main``.  It is introduced by the open pull request recorded below.  Repinning
-to a ``main`` commit would satisfy a default-branch-only provenance gate and then
-fail at run time with "korvid operation harness is not importable", *after* the
-Korvid app token, the Azure OIDC session, and the GPU node pool had been spent.
-Trading a cheap pre-credential rejection for an expensive post-credential failure
-is strictly worse, so the pin stays on the reviewed pull-request commit and the
-provenance gate proves that commit is authoritative Korvid code.
+Why provenance and runtime importability are both recorded
+----------------------------------------------------------
+The pinned commit now *is* the reviewed squash merge on ``hellices/korvid``
+``main``, so the workflow's default-branch provenance route can trust it
+durably. That alone is still insufficient: the bridge imports specific Korvid
+symbols at run time, and a file path existing says nothing about whether names
+such as ``LIFECYCLE_CHECKPOINTS`` still resolve. This declaration therefore
+records both the authoritative provenance snapshot *and* the exact import
+contract the bridge and maintainer verifier must prove before any Azure/model
+credential or AKS scaling occurs.
 """
 
 from __future__ import annotations
@@ -46,12 +44,10 @@ KORVID_DEFAULT_BRANCH = "main"
 
 #: The exact Korvid commit a grounding round defaults to.
 #:
-#: It is the newest commit on the reviewed branch that is *both* fully green in
-#: Korvid CI *and* contains every bridge dependency.  The branch has advanced past
-#: it, but every later commit either fails CI or leaves the bridge dependencies
-#: byte-identical, so moving the pin forward would buy nothing and give up the
-#: green signal.
-APPROVED_KORVID_SHA = "fc7eece2adb66a5b2a18d378bdfd7503ddbdd2ca"
+#: It is the reviewed squash-merge commit that landed the operation harness on
+#: Korvid's default branch while still satisfying the bridge's runtime import
+#: contract.
+APPROVED_KORVID_SHA = "62bd3cbee2e27369bb81abc0957dae341c2aa434"
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,11 +55,8 @@ class KorvidProvenance:
     """A dated snapshot of how :data:`APPROVED_KORVID_SHA` is proven authoritative.
 
     ``kind`` names the acceptance route the workflow's pre-credential trust gate
-    must take for this pin.  ``default_branch_compare_status`` is the recorded
-    ``compare/<sha>...<default_branch>`` status — keeping the *failing* status in
-    the declaration is deliberate: it is the fact that makes the default-branch
-    route insufficient, and a test replays it so the gate can never silently
-    regress to a rule the shipped default cannot pass.
+    must take for this pin. ``default_branch_compare_status`` is the recorded
+    ``compare/<sha>...<default_branch>`` status when the snapshot was taken.
     """
 
     #: Acceptance route: containment in an open same-repository pull request head.
@@ -94,15 +87,15 @@ PROVENANCE_OPEN_PULL_REQUEST = "open_pull_request_containment"
 
 #: Recorded provenance of :data:`APPROVED_KORVID_SHA`.
 APPROVED_KORVID_PROVENANCE = KorvidProvenance(
-    kind=PROVENANCE_OPEN_PULL_REQUEST,
+    kind=PROVENANCE_DEFAULT_BRANCH,
     pull_request=312,
-    branch="feat/307-small-operator-foundation",
+    branch=KORVID_DEFAULT_BRANCH,
     base_branch=KORVID_DEFAULT_BRANCH,
     head_repository=KORVID_REPOSITORY,
-    head_sha="525378f09e76fc7e869335a6f38133b0d3558407",
-    head_compare_status="ahead",
-    default_branch_compare_status="diverged",
-    verified_on="2026-08-22",
+    head_sha=APPROVED_KORVID_SHA,
+    head_compare_status="identical",
+    default_branch_compare_status="identical",
+    verified_on="2026-08-26",
 )
 
 #: Every module :func:`korvid_prompt_lab.bridge_worker._import_korvid` imports,
@@ -156,6 +149,7 @@ def approved_pin_summary() -> str:
     provenance = APPROVED_KORVID_PROVENANCE
     return (
         f"{KORVID_REPOSITORY}@{APPROVED_KORVID_SHA} "
-        f"(open PR #{provenance.pull_request} {provenance.branch} -> {provenance.base_branch}; "
-        f"compare vs {KORVID_DEFAULT_BRANCH}: {provenance.default_branch_compare_status})"
+        f"(default branch {KORVID_DEFAULT_BRANCH}; "
+        f"compare vs {KORVID_DEFAULT_BRANCH}: {provenance.default_branch_compare_status}; "
+        f"verified {provenance.verified_on})"
     )
