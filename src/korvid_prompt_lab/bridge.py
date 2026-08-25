@@ -103,9 +103,9 @@ def _resolve_uv(env: Mapping[str, str]) -> str:
 def _build_worker_environment(source_root: Path, env: Mapping[str, str]) -> dict[str, str]:
     worker_env = dict(env)
     existing = worker_env.get("PYTHONPATH", "")
-    # `tests.evals.operation_app` lives in the checkout, outside its installed package.
+    source_paths = os.pathsep.join((str(source_root / "src"), str(source_root)))
     worker_env["PYTHONPATH"] = (
-        f"{source_root}{os.pathsep}{existing}" if existing else str(source_root)
+        f"{source_paths}{os.pathsep}{existing}" if existing else source_paths
     )
     worker_env["PYTHONDONTWRITEBYTECODE"] = "1"
     return worker_env
