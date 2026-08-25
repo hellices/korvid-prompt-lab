@@ -105,6 +105,13 @@ approval denial, postcondition verification, and non-mutating request cases.
 Each model family and immutable model digest has its own campaign leaderboard.
 Evidence from one model cannot qualify a prompt for another model.
 
+Campaign state stores model digests in canonical
+`sha256:<64 lowercase hex>` form, matching the publication domain. Ollama
+`/api/tags` may return the same SHA-256 bytes as either bare 64-hex or canonical
+text; pre-allocation validation canonicalizes those two wire representations
+before exact comparison. Missing, duplicate, uppercase, malformed, unsupported,
+or mismatched values are configuration errors.
+
 ## Campaign Architecture
 
 ### Campaign manifest

@@ -393,17 +393,26 @@ from the tag. After the existing AKS preflight establishes a loopback endpoint,
 run:
 
 ```bash
-model_digest="$(
+live_model_digest="$(
   curl --fail --silent --show-error "${KORVID_MODEL_ENDPOINT}/api/tags" |
     jq -er '.models[] | select(.name == "qwen3:0.6b") | .digest'
 )"
-[[ "$model_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+if [[ "$live_model_digest" =~ ^[0-9a-f]{64}$ ]]; then
+  model_digest="sha256:${live_model_digest}"
+elif [[ "$live_model_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  model_digest="$live_model_digest"
+else
+  echo "Ollama returned a malformed qwen3:0.6b digest" >&2
+  exit 2
+fi
 ```
 
-Write that exact value into `model_tiers[0].digest`, commit it with the
-manifest, and add a pre-allocation validation that the live `/api/tags` digest
-still matches. A missing, duplicate, or mismatched digest is a configuration
-error, not an experiment attempt.
+Write that canonical value into `model_tiers[0].digest`, commit it with the
+manifest, and add a pre-allocation validation that canonicalizes the same two
+live wire representations and compares the result exactly. This adds only the
+SHA-256 algorithm label; the hash bytes must be the exact live value. A missing,
+duplicate, uppercase, malformed, unsupported, or mismatched digest is a
+configuration error, not an experiment attempt.
 
 - [ ] **Step 5: Verify tests and static checks**
 
