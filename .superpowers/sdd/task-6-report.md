@@ -2,7 +2,7 @@
 
 ## Status
 
-READY — implemented and locally verified. Live dispatch remains Task 7.
+DONE — implemented, review-fixed, and locally verified. Live dispatch remains Task 7.
 
 ## Files
 
@@ -115,3 +115,22 @@ git diff --check
   validated campaign ID.
 - No live workflow was dispatched in Task 6. Task 7 must validate environment
   approval, external APIs, artifact transfer, ARC observation, and self-dispatch.
+
+## Review fix: prepare-state runtime import
+
+- Verified the finding directly: the `prepare` embedded Python referenced
+  `sys.argv[1]` without importing `sys`. Compilation passed because name
+  resolution occurs only when the block executes.
+- RED:
+  `uv run --python 3.12 pytest tests/test_optimization_campaign_workflow.py::test_prepare_initialization_executes_and_writes_github_output -q`
+  failed with `NameError: name 'sys' is not defined`.
+- GREEN: added `import sys`; the same focused command passed.
+- The regression structurally extracts the exact `campaign.prepare` heredoc from
+  parsed workflow YAML, executes its no-prior-state initialization path with the
+  real campaign loaders and controlled project-local inputs, and verifies all
+  four `GITHUB_OUTPUT` entries plus the created state and candidate files.
+- Review-fix verification:
+  `uv run --python 3.12 pytest tests/test_optimization_campaign_workflow.py tests/test_grounding_workflow.py tests/test_optimization_campaign_script.py -q`
+  passed with `95 passed`.
+- Every workflow shell block passed `bash -n`; all four embedded Python blocks
+  compiled; `git diff --check` was clean.

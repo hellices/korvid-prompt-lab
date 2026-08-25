@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
+import shutil
+import subprocess
+import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
 import yaml  # type: ignore[import-untyped]
-
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = ROOT / ".github" / "workflows" / "optimization-campaign.yml"
@@ -64,6 +69,15 @@ def all_script_bodies(workflow: dict[str, Any]) -> list[str]:
             if script:
                 bodies.append(str(script))
     return bodies
+
+
+def embedded_python(item: dict[str, Any]) -> str:
+    body = str(item["run"])
+    marker = "python3 - \"$GITHUB_OUTPUT\" <<'PY'\n"
+    assert body.count(marker) == 1
+    block = body.split(marker, 1)[1]
+    assert block.endswith("PY\n")
+    return block[: -len("PY\n")]
 
 
 def test_trigger_inputs_permissions_and_protected_job_are_exact() -> None:
@@ -275,6 +289,66 @@ def test_campaign_preflight_downloads_and_verifies_exact_prior_artifact() -> Non
     )
     assert app_token["with"]["permission-contents"] == "read"
     assert azure["uses"] == "azure/login@" + ACTION_PINS["azure/login"]
+
+
+def test_prepare_initialization_executes_and_writes_github_output() -> None:
+    workflow = load_workflow()
+    code = embedded_python(step(workflow, "campaign", "prepare"))
+    scratch = ROOT / "artifacts" / f"workflow-prepare-test-{uuid.uuid4().hex}"
+    output = scratch / "github-output"
+    campaign_root = scratch / "campaign"
+    manifest = ROOT / "examples/optimization-campaigns/qwen3-small-operator.yaml"
+    env = os.environ.copy()
+    env.update(
+        {
+            "MANIFEST": manifest.relative_to(ROOT).as_posix(),
+            "CAMPAIGN_ID": "qwen3-small-operator",
+            "MANIFEST_SHA256": (
+                "sha256:" + hashlib.sha256(manifest.read_bytes()).hexdigest()
+            ),
+            "EVALUATION_CAMPAIGN": (
+                "examples/campaigns/aks-small-operator-qualification.yaml"
+            ),
+            "INITIAL_CANDIDATE": "examples/candidates/shipped-small.yaml",
+            "PROMPT_LAB_REF": "a" * 40,
+            "KORVID_REF": "b" * 40,
+            "PRIOR_RUN_ID": "",
+            "EXPECTED_STATE_HASH": "",
+            "PRIOR_ROOT": str(scratch / "prior"),
+            "CAMPAIGN_ROOT": str(campaign_root),
+            "KORVID_AKS_NAMESPACE": "ollama",
+            "KORVID_AKS_SERVICE": "ollama",
+        }
+    )
+
+    scratch.mkdir(parents=True)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-", str(output)],
+            input=code,
+            cwd=ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        entries = dict(
+            line.split("=", 1)
+            for line in output.read_text(encoding="utf-8").splitlines()
+        )
+        assert set(entries) == {
+            "prior-state-hash",
+            "state-path",
+            "candidate-path",
+            "action-kind",
+        }
+        assert re.fullmatch(r"sha256:[0-9a-f]{64}", entries["prior-state-hash"])
+        assert entries["action-kind"] == "search"
+        assert Path(entries["state-path"]).is_file()
+        assert Path(entries["candidate-path"]).is_file()
+    finally:
+        shutil.rmtree(scratch)
 
 
 def test_exact_revisions_are_checked_out_and_imported_before_azure() -> None:
