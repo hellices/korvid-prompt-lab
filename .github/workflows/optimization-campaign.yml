@@ -1032,7 +1032,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          for tool in az gh kubectl kubelogin uv; do
+          for tool in az kubectl kubelogin uv; do
             command -v "$tool" >/dev/null 2>&1 || {
               echo "::error::required tool not found: $tool"
               exit 1
@@ -1401,23 +1401,29 @@ jobs:
       - name: Continue only a persisted RUNNING campaign
         id: dispatch
         if: steps.package.outputs.status == 'running' && steps.upload.outcome == 'success' && steps.lineage-claim.outcome == 'success' && steps.cleanup.outcome == 'success'
-        shell: bash
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
         env:
-          GH_TOKEN: ${{ github.token }}
           MANIFEST: ${{ inputs.manifest }}
           PROMPT_LAB_REF: ${{ inputs.prompt_lab_ref }}
           KORVID_REF: ${{ inputs.korvid_ref }}
           PRIOR_RUN_ID: ${{ github.run_id }}
           EXPECTED_STATE_HASH: ${{ steps.package.outputs.state-hash }}
-        run: |
-          set -Eeuo pipefail
-          gh workflow run optimization-campaign.yml \
-            --ref "$GITHUB_REF_NAME" \
-            --field manifest="$MANIFEST" \
-            --field prompt_lab_ref="$PROMPT_LAB_REF" \
-            --field korvid_ref="$KORVID_REF" \
-            --field prior_run_id="$PRIOR_RUN_ID" \
-            --field expected_state_hash="$EXPECTED_STATE_HASH"
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'optimization-campaign.yml',
+              ref: context.ref.replace(/^refs\/heads\//, ''),
+              inputs: {
+                manifest: process.env.MANIFEST,
+                prompt_lab_ref: process.env.PROMPT_LAB_REF,
+                korvid_ref: process.env.KORVID_REF,
+                prior_run_id: process.env.PRIOR_RUN_ID,
+                expected_state_hash: process.env.EXPECTED_STATE_HASH,
+              },
+            });
 
       - name: Enforce terminal and persistence result
         if: always()

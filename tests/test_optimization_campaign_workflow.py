@@ -593,15 +593,17 @@ def test_dispatch_is_running_only_after_upload_and_cleanup() -> None:
         "steps.cleanup.outcome == 'success'"
     )
     assert dispatch["env"] == {
-        "GH_TOKEN": "${{ github.token }}",
         "MANIFEST": "${{ inputs.manifest }}",
         "PROMPT_LAB_REF": "${{ inputs.prompt_lab_ref }}",
         "KORVID_REF": "${{ inputs.korvid_ref }}",
         "PRIOR_RUN_ID": "${{ github.run_id }}",
         "EXPECTED_STATE_HASH": "${{ steps.package.outputs.state-hash }}",
     }
-    body = str(dispatch["run"])
-    assert "gh workflow run optimization-campaign.yml" in body
+    assert dispatch["uses"] == "actions/github-script@" + ACTION_PINS["actions/github-script"]
+    assert dispatch["with"]["github-token"] == "${{ github.token }}"
+    body = str(dispatch["with"]["script"])
+    assert "github.rest.actions.createWorkflowDispatch" in body
+    assert "workflow_id: 'optimization-campaign.yml'" in body
     for field in (
         "manifest",
         "prompt_lab_ref",
@@ -609,9 +611,17 @@ def test_dispatch_is_running_only_after_upload_and_cleanup() -> None:
         "prior_run_id",
         "expected_state_hash",
     ):
-        assert f"--field {field}=" in body
+        assert field in body
     assert "GH_TOKEN" not in body
     assert "github.token" not in body
+    required_tools = next(
+        item
+        for item in steps(workflow, "campaign")
+        if item.get("name") == "Verify required tools"
+    )
+    tools_body = str(required_tools["run"])
+    assert "for tool in az kubectl kubelogin uv" in tools_body
+    assert "az gh kubectl" not in tools_body
     assert index(workflow, "campaign", "upload") < index(
         workflow, "campaign", "cleanup"
     ) < index(workflow, "campaign", "dispatch")
