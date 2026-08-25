@@ -9,6 +9,7 @@ advanced through one cooperative-CAS transition.
 
 - `6c1c970` — `feat(campaigns): execute one holdout-safe action`
 - `cbd3fcd` — `fix(campaigns): safely classify campaign evidence`
+- `8c953b5` — `fix(workflow): gate GEPA budget to optimization`
 
 ## RED / GREEN
 
@@ -30,7 +31,7 @@ advanced through one cooperative-CAS transition.
 
 ```text
 uv run --python 3.12 pytest tests/test_grounding_script.py tests/test_grounding_workflow.py tests/test_optimization_campaign_script.py tests/test_campaign_artifacts.py tests/test_campaign_cli.py tests/test_cli.py -q
-# 262 passed in 71.96s
+# 262 passed in 72.80s
 
 bash -n scripts/run-grounding-round.sh scripts/run-optimization-campaign-step.sh
 
