@@ -39,6 +39,23 @@ def load_workflow() -> dict[str, Any]:
     return raw
 
 
+def test_frozen_workflows_have_a_tracked_uv_lockfile() -> None:
+    workflows = (
+        WORKFLOW_PATH,
+        ROOT / ".github" / "workflows" / "grounding-round.yml",
+    )
+    assert all("uv sync --python 3.12 --frozen" in path.read_text(encoding="utf-8") for path in workflows)
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "uv.lock"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert tracked.returncode == 0, "uv.lock must be tracked when workflows use uv sync --frozen"
+
+
 def job(workflow: dict[str, Any], name: str) -> dict[str, Any]:
     return workflow["jobs"][name]
 
