@@ -1087,6 +1087,39 @@ Local runs use the same `--turn-timeout 300` declared in the campaign. The
 models with unbounded generation will exhaust this budget and must be served
 with a bounded policy before selection.
 
+## Bounded optimization campaigns
+
+GitHub Actions run `32761941498` was a **pipeline canary**: it proved that the
+two-case path executed and preserved its safety gates, but it did not improve the
+prompt. The two-case campaign is explicitly not qualification evidence.
+
+The protected `Optimization Campaign` workflow advances one compare-and-swap
+state transition per run:
+
+| State | Operator meaning |
+|---|---|
+| `RUNNING` | Safe state was persisted and uploaded; the workflow may dispatch exactly one continuation. |
+| `QUALIFIED` | The milestone gate and the required independent confirmation passed. The result is eligible for review, not publication. |
+| `NOT_CONVERGED` | The declared search/stagnation budget or a model tier was exhausted without qualification. This is useful negative evidence and never permits publication. |
+| `SYSTEM_ERROR` | Configuration, infrastructure retries, or infrastructure wall-clock safety limits stopped the controller. Experimental scores are not updated from system failures. |
+
+The default `qwen3-small-operator` manifest is fixed at:
+
+- explore: **12 calls × 3 seeds** (`0`, `1`, `2`);
+- refine: **24 calls × 2 seeds** (`3`, `4`);
+- final: **48 calls × 1 seed** (`5`);
+- at most **240 metric calls** and **21,600 seconds (6 hours)** overall;
+- a **1 infrastructure retry** limit and a stop after **3 consecutive
+  non-promoting attempts**; and
+- a full milestone pass followed by **1 independent confirmation**.
+
+The controller stops at qualification, metric-call or wall-clock exhaustion,
+stagnation/tier exhaustion, milestone failure, configuration failure, or the
+infrastructure retry limit. Results for model tiers are independent: candidates,
+scores, and holdout evidence from one tier do not qualify another tier.
+`QUALIFIED` still requires explicit publication approval through the existing
+reviewed publication path; this workflow never publishes automatically.
+
 ## Measured baseline — qwen3:0.6b
 
 These figures are aggregate observations from 10 live runs against the

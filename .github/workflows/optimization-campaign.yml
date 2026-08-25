@@ -1,0 +1,915 @@
+name: Optimization Campaign
+
+"on":
+  workflow_dispatch:
+    inputs:
+      manifest:
+        description: "Optimization campaign manifest in the trusted Prompt Lab revision"
+        required: true
+        type: string
+        default: "examples/optimization-campaigns/qwen3-small-operator.yaml"
+      prompt_lab_ref:
+        description: "Trusted Prompt Lab commit (exact 40-hex SHA)"
+        required: true
+        type: string
+      korvid_ref:
+        description: "Trusted Korvid commit (exact 40-hex SHA)"
+        required: true
+        type: string
+      prior_run_id:
+        description: "Exact prior successful run ID; must be paired with expected_state_hash"
+        required: false
+        type: string
+      expected_state_hash:
+        description: "Exact sha256 state hash from prior_run_id; must be paired"
+        required: false
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+  id-token: write
+
+concurrency:
+  group: optimization-campaign-dispatch-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  identity:
+    name: Validate immutable campaign identity
+    runs-on: ubuntu-latest
+    outputs:
+      campaign-id: ${{ steps.manifest.outputs.campaign-id }}
+      manifest-sha256: ${{ steps.manifest.outputs.manifest-sha256 }}
+      evaluation-campaign: ${{ steps.manifest.outputs.evaluation-campaign }}
+      initial-candidate: ${{ steps.manifest.outputs.initial-candidate }}
+      expected-artifact-hash: ${{ steps.validate.outputs.expected-artifact-hash }}
+    steps:
+      - name: Validate dispatch input shapes
+        id: validate
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          WORKFLOW_REF_NAME: ${{ github.ref_name }}
+          MANIFEST: ${{ inputs.manifest }}
+          PROMPT_LAB_REF: ${{ inputs.prompt_lab_ref }}
+          KORVID_REF: ${{ inputs.korvid_ref }}
+          PRIOR_RUN_ID: ${{ inputs.prior_run_id }}
+          EXPECTED_STATE_HASH: ${{ inputs.expected_state_hash }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$WORKFLOW_REF_NAME" == "$DEFAULT_BRANCH" ]] || {
+            echo "::error::optimization campaigns must be dispatched from the default branch"
+            exit 1
+          }
+          [[ "$PROMPT_LAB_REF" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::prompt_lab_ref must be an exact 40-hex commit SHA"
+            exit 1
+          }
+          [[ "$KORVID_REF" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::korvid_ref must be an exact 40-hex commit SHA"
+            exit 1
+          }
+          if [[ ( -n "$PRIOR_RUN_ID" && -z "$EXPECTED_STATE_HASH" ) \
+              || ( -z "$PRIOR_RUN_ID" && -n "$EXPECTED_STATE_HASH" ) ]]; then
+            echo "::error::prior_run_id and expected_state_hash must be supplied together"
+            exit 1
+          fi
+          if [[ -n "$PRIOR_RUN_ID" && ! "$PRIOR_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]; then
+            echo "::error::prior_run_id must be a positive integer"
+            exit 1
+          fi
+          if [[ -n "$EXPECTED_STATE_HASH" \
+              && ! "$EXPECTED_STATE_HASH" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::expected_state_hash must be an exact sha256 state hash"
+            exit 1
+          fi
+          if [[ -n "$EXPECTED_STATE_HASH" ]]; then
+            echo "expected-artifact-hash=sha256-${EXPECTED_STATE_HASH#sha256:}" \
+              >> "$GITHUB_OUTPUT"
+          fi
+          if [[ ! "$MANIFEST" =~ ^[A-Za-z0-9._/-]+\.(yaml|yml)$ ]] \
+              || [[ "$MANIFEST" == /* ]] || [[ "$MANIFEST" == *".."* ]]; then
+            echo "::error::manifest must be a relative YAML path without aliases or traversal"
+            exit 1
+          fi
+
+      - name: Verify trusted revisions and prior run
+        id: trust
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
+        env:
+          PROMPT_LAB_REF: ${{ inputs.prompt_lab_ref }}
+          KORVID_REF: ${{ inputs.korvid_ref }}
+          PRIOR_RUN_ID: ${{ inputs.prior_run_id }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          KORVID_REPOSITORY: ${{ github.repository_owner }}/korvid
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const expectedRepository = process.env.EXPECTED_REPOSITORY || '';
+            const defaultBranch = process.env.DEFAULT_BRANCH || '';
+            const promptLabRef = process.env.PROMPT_LAB_REF || '';
+            const korvidRef = process.env.KORVID_REF || '';
+            const priorRunId = process.env.PRIOR_RUN_ID || '';
+            const currentRunId = process.env.CURRENT_RUN_ID || '';
+            const [owner, repo] = expectedRepository.split('/');
+            const [korvidOwner, korvidRepo] =
+              (process.env.KORVID_REPOSITORY || '').split('/');
+
+            if (!owner || !repo || !korvidOwner || !korvidRepo || !defaultBranch) {
+              core.setFailed('repository trust boundary could not be established');
+              return;
+            }
+
+            async function containedIn(ownerName, repoName, sha, head) {
+              try {
+                const response = github.rest.repos.compareCommitsWithBasehead
+                  ? await github.rest.repos.compareCommitsWithBasehead({
+                      owner: ownerName,
+                      repo: repoName,
+                      basehead: sha + '...' + head,
+                    })
+                  : await github.rest.repos.compareCommits({
+                      owner: ownerName,
+                      repo: repoName,
+                      base: sha,
+                      head,
+                    });
+                const status = (response.data && response.data.status) || '';
+                return status === 'identical' || status === 'ahead';
+              } catch (error) {
+                return false;
+              }
+            }
+
+            if (!(await containedIn(owner, repo, promptLabRef, defaultBranch))) {
+              core.setFailed(
+                'prompt_lab_ref is not contained in the trusted default branch'
+              );
+              return;
+            }
+
+            let korvidRepository;
+            try {
+              korvidRepository = await github.rest.repos.get({
+                owner: korvidOwner,
+                repo: korvidRepo,
+              });
+            } catch (error) {
+              core.setFailed('the authoritative Korvid repository is unavailable');
+              return;
+            }
+            const korvidDefault =
+              (korvidRepository.data && korvidRepository.data.default_branch) || '';
+            let korvidTrusted = Boolean(korvidDefault) &&
+              await containedIn(korvidOwner, korvidRepo, korvidRef, korvidDefault);
+            if (!korvidTrusted) {
+              let pulls = [];
+              try {
+                const response = await github.rest.pulls.list({
+                  owner: korvidOwner,
+                  repo: korvidRepo,
+                  state: 'open',
+                  base: korvidDefault,
+                  per_page: 100,
+                });
+                pulls = response.data || [];
+              } catch (error) {
+                pulls = [];
+              }
+              for (const pull of pulls) {
+                const head = pull.head || {};
+                const headRepository =
+                  (head.repo && head.repo.full_name) || '';
+                if (headRepository.toLowerCase() !==
+                    (korvidOwner + '/' + korvidRepo).toLowerCase()) {
+                  continue;
+                }
+                if (await containedIn(
+                    korvidOwner, korvidRepo, korvidRef, String(head.sha || '')
+                )) {
+                  korvidTrusted = true;
+                  break;
+                }
+              }
+            }
+            if (!korvidTrusted) {
+              core.setFailed(
+                'korvid_ref is not contained in the authoritative default branch ' +
+                'or an open same-repository pull request'
+              );
+              return;
+            }
+
+            if (priorRunId) {
+              const numericRunId = Number(priorRunId);
+              if (!Number.isSafeInteger(numericRunId) || numericRunId <= 0 ||
+                  String(numericRunId) !== priorRunId ||
+                  priorRunId === currentRunId) {
+                core.setFailed('prior_run_id is not a trusted integer run ID');
+                return;
+              }
+              let prior;
+              try {
+                prior = await github.rest.actions.getWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: numericRunId,
+                });
+              } catch (error) {
+                core.setFailed('prior_run_id does not identify a run in this repository');
+                return;
+              }
+              const headRepository =
+                (prior.data.head_repository &&
+                 prior.data.head_repository.full_name) || '';
+              if (headRepository.toLowerCase() !== expectedRepository.toLowerCase() ||
+                  prior.data.path !== '.github/workflows/optimization-campaign.yml' ||
+                  prior.data.event !== 'workflow_dispatch' ||
+                  prior.data.head_branch !== defaultBranch ||
+                  prior.data.conclusion !== 'success') {
+                core.setFailed(
+                  'prior_run_id is not a successful trusted optimization campaign run'
+                );
+                return;
+              }
+            }
+
+      - name: Checkout trusted Prompt Lab identity
+        id: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.prompt_lab_ref }}
+          path: prompt-lab-identity
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc
+        with:
+          version: "latest"
+
+      - name: Resolve validated campaign identity
+        id: manifest
+        working-directory: prompt-lab-identity
+        shell: bash
+        env:
+          MANIFEST: ${{ inputs.manifest }}
+          PROMPT_LAB_REF: ${{ inputs.prompt_lab_ref }}
+          KORVID_REF: ${{ inputs.korvid_ref }}
+          KORVID_AKS_NAMESPACE: ${{ vars.KORVID_AKS_NAMESPACE }}
+          KORVID_AKS_SERVICE: ${{ vars.KORVID_AKS_SERVICE }}
+        run: |
+          set -Eeuo pipefail
+          uv sync --python 3.12 --frozen
+          uv run --frozen python - "$MANIFEST" "$GITHUB_OUTPUT" <<'PY'
+          import hashlib
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          import yaml
+
+          from korvid_prompt_lab.campaigns import load_optimization_campaign
+          from korvid_prompt_lab.config import load_campaign, load_candidate
+
+          root = Path.cwd().resolve()
+          manifest_relative = Path(sys.argv[1])
+          manifest_path = (root / manifest_relative).resolve()
+          if root not in manifest_path.parents or not manifest_path.is_file():
+              raise SystemExit("manifest does not resolve to a trusted repository file")
+          raw = manifest_path.read_bytes()
+          mapping = yaml.safe_load(raw)
+          if not isinstance(mapping, dict):
+              raise SystemExit("optimization manifest must be a mapping")
+          model_tiers = mapping.get("model_tiers")
+          if not isinstance(model_tiers, list) or not model_tiers:
+              raise SystemExit("optimization manifest has no model tiers")
+          first_tier = model_tiers[0]
+          if not isinstance(first_tier, dict) or not isinstance(first_tier.get("model"), str):
+              raise SystemExit("optimization manifest first model tier is invalid")
+          os.environ["KORVID_AKS_MODEL"] = first_tier["model"]
+
+          evaluation_id = mapping.get("evaluation_campaign")
+          if not isinstance(evaluation_id, str) or not re.fullmatch(
+              r"[a-z0-9][a-z0-9._-]{0,62}", evaluation_id
+          ):
+              raise SystemExit("evaluation_campaign has an invalid identity")
+          evaluation_relative = Path("examples/campaigns") / f"{evaluation_id}.yaml"
+          evaluation_path = (root / evaluation_relative).resolve()
+          control = load_optimization_campaign(
+              manifest_path, load_campaign(evaluation_path)
+          )
+          if not re.fullmatch(r"^[a-z0-9][a-z0-9._-]{0,62}$", control.campaign_id):
+              raise SystemExit("campaign_id is not safe for concurrency and artifacts")
+          candidate_path = (root / control.initial_candidate).resolve()
+          if root not in candidate_path.parents:
+              raise SystemExit("initial_candidate leaves the trusted checkout")
+          load_candidate(candidate_path)
+
+          digest = hashlib.sha256(raw).hexdigest()
+          output = Path(sys.argv[2])
+          with output.open("a", encoding="utf-8") as stream:
+              stream.write(f"campaign-id={control.campaign_id}\n")
+              stream.write(f"manifest-sha256=sha256:{digest}\n")
+              stream.write(f"evaluation-campaign={evaluation_relative.as_posix()}\n")
+              stream.write(f"initial-candidate={control.initial_candidate}\n")
+          PY
+
+  campaign:
+    name: Execute one campaign action
+    needs: identity
+    runs-on: prompt-lab-runners
+    environment: aks-grounding
+    timeout-minutes: 180
+    concurrency:
+      group: optimization-campaign-${{ needs.identity.outputs.campaign-id }}
+      cancel-in-progress: false
+    env:
+      CAMPAIGN_ROOT: ${{ github.workspace }}/prompt-lab/artifacts/optimization-campaign
+      SAFE_UPLOAD_ROOT: ${{ github.workspace }}/prompt-lab/artifacts/optimization-campaign/safe-upload
+    steps:
+      - name: Checkout trusted Prompt Lab revision
+        id: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.prompt_lab_ref }}
+          path: prompt-lab
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc
+        with:
+          version: "latest"
+
+      - name: Install trusted Prompt Lab
+        working-directory: prompt-lab
+        shell: bash
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/prompt-lab-uv-env
+        run: |
+          set -Eeuo pipefail
+          uv venv --python 3.12 "$UV_PROJECT_ENVIRONMENT"
+          uv pip install --python "$UV_PROJECT_ENVIRONMENT/bin/python" .
+          test -x "$UV_PROJECT_ENVIRONMENT/bin/korvid-campaign"
+          test -x "$UV_PROJECT_ENVIRONMENT/bin/korvid-bridge"
+          printf '%s\n' "$UV_PROJECT_ENVIRONMENT/bin" >> "$GITHUB_PATH"
+
+      - name: Download exact prior safe campaign
+        id: download
+        if: inputs.prior_run_id != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: safe-campaign-evidence-${{ needs.identity.outputs.campaign-id }}-${{ needs.identity.outputs.expected-artifact-hash }}
+          path: prompt-lab/artifacts/optimization-campaign/prior
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.prior_run_id }}
+
+      - name: Verify or initialize exact prior state
+        id: prepare
+        working-directory: prompt-lab
+        shell: bash
+        env:
+          MANIFEST: ${{ inputs.manifest }}
+          CAMPAIGN_ID: ${{ needs.identity.outputs.campaign-id }}
+          MANIFEST_SHA256: ${{ needs.identity.outputs.manifest-sha256 }}
+          EVALUATION_CAMPAIGN: ${{ needs.identity.outputs.evaluation-campaign }}
+          INITIAL_CANDIDATE: ${{ needs.identity.outputs.initial-candidate }}
+          PROMPT_LAB_REF: ${{ inputs.prompt_lab_ref }}
+          KORVID_REF: ${{ inputs.korvid_ref }}
+          PRIOR_RUN_ID: ${{ inputs.prior_run_id }}
+          EXPECTED_STATE_HASH: ${{ inputs.expected_state_hash }}
+          PRIOR_ROOT: ${{ github.workspace }}/prompt-lab/artifacts/optimization-campaign/prior
+          CAMPAIGN_ROOT: ${{ github.workspace }}/prompt-lab/artifacts/optimization-campaign
+          KORVID_AKS_NAMESPACE: ${{ vars.KORVID_AKS_NAMESPACE }}
+          KORVID_AKS_SERVICE: ${{ vars.KORVID_AKS_SERVICE }}
+        run: |
+          set -Eeuo pipefail
+          python3 - "$GITHUB_OUTPUT" <<'PY'
+          import hashlib
+          import json
+          import os
+          import shutil
+          from dataclasses import replace
+          from datetime import UTC, datetime
+          from pathlib import Path
+
+          from korvid_prompt_lab.campaign_artifacts import _serialize_state
+          from korvid_prompt_lab.campaign_cli import _load_state
+          from korvid_prompt_lab.campaigns import (
+              CampaignScore,
+              initial_state,
+              load_optimization_campaign,
+              next_action,
+              state_hash,
+          )
+          from korvid_prompt_lab.config import load_campaign, load_candidate
+
+          root = Path.cwd().resolve()
+          campaign_root = Path(os.environ["CAMPAIGN_ROOT"]).resolve()
+          campaign_root.mkdir(parents=True, exist_ok=True)
+          control_path = (root / os.environ["MANIFEST"]).resolve()
+          evaluation_path = (root / os.environ["EVALUATION_CAMPAIGN"]).resolve()
+          initial_candidate_path = (root / os.environ["INITIAL_CANDIDATE"]).resolve()
+
+          raw = control_path.read_bytes()
+          actual_manifest_hash = "sha256:" + hashlib.sha256(raw).hexdigest()
+          if actual_manifest_hash != os.environ["MANIFEST_SHA256"]:
+              raise SystemExit("manifest identity changed after trusted preflight")
+
+          import yaml
+          mapping = yaml.safe_load(raw)
+          os.environ["KORVID_AKS_MODEL"] = mapping["model_tiers"][0]["model"]
+          control = load_optimization_campaign(
+              control_path, load_campaign(evaluation_path)
+          )
+          if control.campaign_id != os.environ["CAMPAIGN_ID"]:
+              raise SystemExit("campaign_id changed after trusted preflight")
+
+          state_path = campaign_root / "prior-state.json"
+          candidate_path = campaign_root / "prior-candidate.yaml"
+          if state_path.exists() or state_path.is_symlink():
+              raise SystemExit("prior-state.json already exists")
+          if candidate_path.exists() or candidate_path.is_symlink():
+              raise SystemExit("prior-candidate.yaml already exists")
+          expected_state_hash = os.environ["EXPECTED_STATE_HASH"]
+          if os.environ["PRIOR_RUN_ID"]:
+              prior_root = Path(os.environ["PRIOR_ROOT"]).resolve()
+              safe_campaign = prior_root / "safe-campaign"
+              required = {
+                  "campaign-action.json",
+                  "campaign-state.json",
+                  "campaign-summary.md",
+                  "champion-candidate.yaml",
+                  "manifest-identity.json",
+              }
+              actual = {item.name for item in safe_campaign.iterdir()}
+              if actual != required:
+                  raise SystemExit("prior safe campaign package has an invalid shape")
+              for item in prior_root.rglob("*"):
+                  if item.is_symlink():
+                      raise SystemExit("prior safe artifact contains a symlink")
+                  relative = item.relative_to(prior_root)
+                  if any(part.lower() in {"responses", "raw", "transcripts"} for part in relative.parts):
+                      raise SystemExit("prior artifact contains a forbidden raw evidence path")
+
+              identity = json.loads(
+                  (safe_campaign / "manifest-identity.json").read_text(encoding="utf-8")
+              )
+              expected_identity = {
+                  "schema_version": 1,
+                  "campaign_id": control.campaign_id,
+                  "manifest": os.environ["MANIFEST"],
+                  "manifest_sha256": os.environ["MANIFEST_SHA256"],
+                  "prompt_lab_revision": os.environ["PROMPT_LAB_REF"],
+                  "korvid_revision": os.environ["KORVID_REF"],
+                  "state_hash": expected_state_hash,
+              }
+              if identity != expected_identity:
+                  raise SystemExit("prior artifact manifest identity mismatch")
+
+              source_state_path = safe_campaign / "campaign-state.json"
+              state_payload = json.loads(source_state_path.read_text(encoding="utf-8"))
+              state = _load_state(source_state_path)
+              actual_state_hash = state_hash(state)
+              if actual_state_hash != expected_state_hash or \
+                      state_payload.get("state_hash") != expected_state_hash:
+                  raise SystemExit("expected_state_hash does not match prior safe state")
+              if state.campaign_id != control.campaign_id:
+                  raise SystemExit("prior state campaign_id mismatch")
+              if state.prompt_lab_revision != os.environ["PROMPT_LAB_REF"] or \
+                      state.korvid_revision != os.environ["KORVID_REF"]:
+                  raise SystemExit("prior state revision mismatch")
+              if state.status.value != "running":
+                  raise SystemExit("only a RUNNING prior state may continue")
+              candidate = load_candidate(safe_campaign / "champion-candidate.yaml")
+              if candidate.fingerprint != state.champion_fingerprint:
+                  raise SystemExit("prior champion candidate does not match state")
+              shutil.copyfile(source_state_path, state_path)
+              shutil.copyfile(
+                  safe_campaign / "champion-candidate.yaml", candidate_path
+              )
+          else:
+              candidate = load_candidate(initial_candidate_path)
+              state = initial_state(
+                  control,
+                  prompt_lab_revision=os.environ["PROMPT_LAB_REF"],
+                  korvid_revision=os.environ["KORVID_REF"],
+                  started_at=datetime.now(tz=UTC),
+              )
+              state = replace(
+                  state,
+                  champion_fingerprint=candidate.fingerprint,
+                  champion_score=CampaignScore(
+                      fingerprint=candidate.fingerprint,
+                      aggregate=0.0,
+                      hard_safety_failures=0,
+                      core_regression=False,
+                      systemic_failures=0,
+                      pass_at_3=0.0,
+                      pass_at_5=0.0,
+                  ),
+              )
+              expected_state_hash = state_hash(state)
+              state_path.write_text(
+                  json.dumps(_serialize_state(state), indent=2), encoding="utf-8"
+              )
+              shutil.copyfile(initial_candidate_path, candidate_path)
+
+          action = next_action(control, state, datetime.now(tz=UTC))
+          if action is None:
+              raise SystemExit("RUNNING state did not produce an action")
+          with Path(sys.argv[1]).open("a", encoding="utf-8") as stream:
+              stream.write(f"prior-state-hash={expected_state_hash}\n")
+              stream.write(f"state-path={state_path}\n")
+              stream.write(f"candidate-path={candidate_path}\n")
+              stream.write(f"action-kind={action.kind.value}\n")
+          PY
+
+      - name: Get read-only Korvid app token
+        id: korvid-token
+        uses: actions/create-github-app-token@df432ceedc7162793a195dd1713ff69aefc7379e
+        with:
+          app-id: ${{ vars.KORVID_APP_ID }}
+          private-key: ${{ secrets.KORVID_APP_PRIVATE_KEY }}
+          repositories: korvid
+          permission-contents: read
+
+      - name: Checkout trusted Korvid revision
+        id: korvid-checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ${{ github.repository_owner }}/korvid
+          ref: ${{ inputs.korvid_ref }}
+          token: ${{ steps.korvid-token.outputs.token }}
+          path: korvid
+          persist-credentials: false
+
+      - name: Provision Korvid environment out of tree
+        working-directory: korvid
+        shell: bash
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/korvid-uv-env
+        run: |
+          set -Eeuo pipefail
+          uv sync --python 3.12 --frozen --dev --all-extras --no-editable
+          test -x "$UV_PROJECT_ENVIRONMENT/bin/python"
+          test ! -e .venv
+          test -z "$(git status --porcelain)"
+
+      - name: Preflight Korvid bridge imports
+        id: korvid-imports
+        working-directory: prompt-lab
+        shell: bash
+        env:
+          KORVID_SOURCE_ROOT: ${{ github.workspace }}/korvid
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/korvid-uv-env
+        run: |
+          set -Eeuo pipefail
+          korvid-bridge --check-imports
+
+      - name: Azure login with OIDC
+        id: azure
+        uses: azure/login@a65d910e8af852a8061c627c456678983e180302
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify required tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for tool in az gh kubectl kubelogin uv; do
+            command -v "$tool" >/dev/null 2>&1 || {
+              echo "::error::required tool not found: $tool"
+              exit 1
+            }
+          done
+
+      - name: Record original modeleval capacity
+        id: modeleval
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          count="$(az aks nodepool show \
+            --resource-group rg-pension-guard \
+            --cluster-name aks-shared-runners \
+            --name modeleval \
+            --query count \
+            --output tsv)"
+          case "$count" in
+            0|1) ;;
+            *) echo "::error::unexpected modeleval node count: $count"; exit 1 ;;
+          esac
+          printf 'original-count=%s\n' "$count" >> "$GITHUB_OUTPUT"
+
+      - name: Execute exactly one bounded campaign action
+        id: attempt
+        working-directory: prompt-lab
+        shell: bash
+        timeout-minutes: 150
+        env:
+          CAMPAIGN_CONTROL: ${{ inputs.manifest }}
+          CAMPAIGN_STATE: ${{ steps.prepare.outputs.state-path }}
+          CAMPAIGN_CANDIDATE: ${{ steps.prepare.outputs.candidate-path }}
+          CAMPAIGN_OUTPUT_ROOT: ${{ github.workspace }}/prompt-lab/artifacts/optimization-campaign/next
+          CAMPAIGN_EXPECTED_PRIOR_HASH: ${{ steps.prepare.outputs.prior-state-hash }}
+          GROUNDING_CAMPAIGN: ${{ needs.identity.outputs.evaluation-campaign }}
+          GROUNDING_REFLECTION_MODEL: ${{ steps.prepare.outputs.action-kind == 'search' && vars.GROUNDING_REFLECTION_MODEL || '' }}
+          GROUNDING_REFLECTION_CREDENTIAL: >-
+            ${{ steps.prepare.outputs.action-kind == 'search'
+                && !startsWith(vars.GROUNDING_REFLECTION_MODEL, 'ollama/')
+                && !startsWith(vars.GROUNDING_REFLECTION_MODEL, 'ollama_chat/')
+                && secrets.GROUNDING_REFLECTION_CREDENTIAL
+                || '' }}
+          KORVID_SOURCE_ROOT: ${{ github.workspace }}/korvid
+          KORVID_AKS_NAMESPACE: ${{ vars.KORVID_AKS_NAMESPACE }}
+          KORVID_AKS_SERVICE: ${{ vars.KORVID_AKS_SERVICE }}
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/korvid-uv-env
+          PROMPT_LAB_REVISION: ${{ inputs.prompt_lab_ref }}
+          KORVID_REVISION: ${{ inputs.korvid_ref }}
+          WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +e
+          bash scripts/run-optimization-campaign-step.sh
+          wrapper_exit=$?
+          set -e
+          printf 'wrapper-exit=%s\n' "$wrapper_exit" >> "$GITHUB_OUTPUT"
+          test -f "$CAMPAIGN_OUTPUT_ROOT/campaign-state.json" || exit 70
+          test -f "$CAMPAIGN_OUTPUT_ROOT/campaign-summary.md" || exit 70
+
+      - name: Build allowlisted safe upload
+        id: package
+        working-directory: prompt-lab
+        shell: bash
+        env:
+          MANIFEST: ${{ inputs.manifest }}
+          CAMPAIGN_ID: ${{ needs.identity.outputs.campaign-id }}
+          MANIFEST_SHA256: ${{ needs.identity.outputs.manifest-sha256 }}
+          PROMPT_LAB_REF: ${{ inputs.prompt_lab_ref }}
+          KORVID_REF: ${{ inputs.korvid_ref }}
+          CURRENT_CANDIDATE: ${{ steps.prepare.outputs.candidate-path }}
+          NEXT_ROOT: ${{ github.workspace }}/prompt-lab/artifacts/optimization-campaign/next
+          SAFE_UPLOAD_ROOT: ${{ github.workspace }}/prompt-lab/artifacts/optimization-campaign/safe-upload
+          WRAPPER_EXIT: ${{ steps.attempt.outputs.wrapper-exit }}
+        run: |
+          set -Eeuo pipefail
+          python3 - "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+          import shutil
+          import sys
+          from pathlib import Path
+
+          from korvid_prompt_lab.campaign_cli import _load_state
+          from korvid_prompt_lab.campaigns import state_hash
+          from korvid_prompt_lab.config import load_candidate
+
+          next_root = Path(os.environ["NEXT_ROOT"]).resolve()
+          upload_root = Path(os.environ["SAFE_UPLOAD_ROOT"]).resolve()
+          if upload_root.exists() or upload_root.is_symlink():
+              raise SystemExit("safe upload root already exists")
+          safe_campaign = upload_root / "safe-campaign"
+          safe_round = upload_root / "safe-round"
+          safe_campaign.mkdir(parents=True)
+          safe_round.mkdir()
+
+          expected_next = {
+              "campaign-action.json",
+              "campaign-state.json",
+              "campaign-summary.md",
+          }
+          actual_files = {item.name for item in next_root.iterdir() if item.is_file()}
+          if actual_files != expected_next:
+              raise SystemExit("campaign output contains an unexpected decision file")
+          for item in next_root.rglob("*"):
+              if item.is_symlink():
+                  raise SystemExit("campaign output contains a symlink")
+
+          state_path = next_root / "campaign-state.json"
+          state_payload = json.loads(state_path.read_text(encoding="utf-8"))
+          state = _load_state(state_path)
+          new_hash = state_hash(state)
+          if state_payload.get("state_hash") != new_hash:
+              raise SystemExit("rendered state hash is inconsistent")
+          if state.campaign_id != os.environ["CAMPAIGN_ID"] or \
+                  state.prompt_lab_revision != os.environ["PROMPT_LAB_REF"] or \
+                  state.korvid_revision != os.environ["KORVID_REF"]:
+              raise SystemExit("rendered campaign identity changed")
+          if state.status.value not in {
+              "running", "qualified", "not_converged", "system_error"
+          }:
+              raise SystemExit("rendered campaign status is invalid")
+
+          for filename in expected_next:
+              shutil.copyfile(next_root / filename, safe_campaign / filename)
+
+          candidates = []
+          round_evidence = next_root / "round-evidence"
+          if round_evidence.is_dir():
+              best = round_evidence / "best-candidate.yaml"
+              if best.is_file():
+                  candidates.append(best)
+          candidates.append(Path(os.environ["CURRENT_CANDIDATE"]).resolve())
+          champion_source = None
+          for candidate_path in candidates:
+              if candidate_path.is_symlink() or not candidate_path.is_file():
+                  continue
+              if load_candidate(candidate_path).fingerprint == state.champion_fingerprint:
+                  champion_source = candidate_path
+                  break
+          if champion_source is None:
+              raise SystemExit("no safe candidate matches the new champion")
+          shutil.copyfile(
+              champion_source, safe_campaign / "champion-candidate.yaml"
+          )
+
+          action = json.loads(
+              (next_root / "campaign-action.json").read_text(encoding="utf-8")
+          )
+          action_id = action.get("action_id")
+          if not isinstance(action_id, str) or not action_id:
+              raise SystemExit("campaign action has no identity")
+          if round_evidence.is_dir():
+              forbidden = {"responses", "raw", "transcripts"}
+              for item in round_evidence.rglob("*"):
+                  if item.is_symlink() or any(
+                      part.lower() in forbidden
+                      for part in item.relative_to(round_evidence).parts
+                  ):
+                      raise SystemExit("safe round package contains forbidden evidence")
+              shutil.copytree(round_evidence, safe_round / action_id)
+
+          identity = {
+              "schema_version": 1,
+              "campaign_id": state.campaign_id,
+              "manifest": os.environ["MANIFEST"],
+              "manifest_sha256": os.environ["MANIFEST_SHA256"],
+              "prompt_lab_revision": state.prompt_lab_revision,
+              "korvid_revision": state.korvid_revision,
+              "state_hash": new_hash,
+          }
+          (safe_campaign / "manifest-identity.json").write_text(
+              json.dumps(identity, indent=2), encoding="utf-8"
+          )
+
+          artifact_hash = new_hash.replace(":", "-")
+          artifact_name = (
+              f"safe-campaign-evidence-{state.campaign_id}-{artifact_hash}"
+          )
+          with Path(sys.argv[1]).open("a", encoding="utf-8") as stream:
+              stream.write(f"artifact-name={artifact_name}\n")
+              stream.write(f"state-hash={new_hash}\n")
+              stream.write(f"status={state.status.value}\n")
+              stream.write(f"wrapper-exit={os.environ['WRAPPER_EXIT']}\n")
+          PY
+
+      - name: Append exact campaign decision summary
+        id: summary
+        if: always() && steps.package.outcome == 'success'
+        shell: bash
+        run: |
+          cat "$SAFE_UPLOAD_ROOT/safe-campaign/campaign-summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload immutable safe campaign evidence
+        id: upload
+        if: steps.package.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ steps.package.outputs.artifact-name }}
+          path: |
+            prompt-lab/artifacts/optimization-campaign/safe-upload/safe-campaign/
+            prompt-lab/artifacts/optimization-campaign/safe-upload/safe-round/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Restore owned capacity and verify ARC cleanup
+        id: cleanup
+        if: always()
+        shell: bash
+        env:
+          ORIGINAL_NODE_COUNT: ${{ steps.modeleval.outputs.original-count }}
+          CURRENT_RUNNER_POD: ${{ runner.name }}
+        run: |
+          set -uo pipefail
+          cleanup_status=0
+          if [[ -n "$ORIGINAL_NODE_COUNT" ]]; then
+            if [[ "$ORIGINAL_NODE_COUNT" == "0" ]]; then
+              current="$(az aks nodepool show \
+                --resource-group rg-pension-guard \
+                --cluster-name aks-shared-runners \
+                --name modeleval \
+                --query count \
+                --output tsv)" || cleanup_status=$?
+              if [[ "$cleanup_status" == "0" && "$current" != "0" ]]; then
+                az aks nodepool scale \
+                  --resource-group rg-pension-guard \
+                  --cluster-name aks-shared-runners \
+                  --name modeleval \
+                  --node-count 0 || cleanup_status=$?
+              fi
+            else
+              echo "modeleval was already owned by another workload; leaving it untouched"
+            fi
+          else
+            echo "modeleval was never observed; no campaign-owned capacity to restore"
+          fi
+
+          cleanup_kubeconfig="${RUNNER_TEMP}/campaign-cleanup-kubeconfig-${GITHUB_RUN_ID}"
+          rm -f -- "$cleanup_kubeconfig"
+          az aks get-credentials \
+            --resource-group rg-pension-guard \
+            --name aks-shared-runners \
+            --file "$cleanup_kubeconfig" \
+            --overwrite-existing || cleanup_status=$?
+          if [[ -f "$cleanup_kubeconfig" ]]; then
+            export KUBECONFIG="$cleanup_kubeconfig"
+            kubelogin convert-kubeconfig -l azurecli || cleanup_status=$?
+            runner_json="$(kubectl --namespace arc-runners-prompt-lab get pods \
+              --selector actions.github.com/scale-set-name=prompt-lab-runners \
+              --output json)" || cleanup_status=$?
+            if [[ -n "${runner_json:-}" ]]; then
+              RUNNER_JSON="$runner_json" python3 - <<'PY' || cleanup_status=$?
+          import json
+          import os
+
+          current = os.environ["CURRENT_RUNNER_POD"]
+          data = json.loads(os.environ["RUNNER_JSON"])
+          stale = []
+          for item in data.get("items", []):
+              metadata = item.get("metadata", {})
+              name = metadata.get("name", "")
+              phase = item.get("status", {}).get("phase", "")
+              if name != current and (
+                  metadata.get("deletionTimestamp") or phase in {"Succeeded", "Failed"}
+              ):
+                  stale.append(name)
+          if stale:
+              raise SystemExit(
+                  "ARC ephemeral runner cleanup is incomplete: " + ", ".join(stale)
+              )
+          print("ARC ephemeral runner cleanup verified; no stale runner pods")
+          PY
+            fi
+          fi
+          rm -f -- "$cleanup_kubeconfig"
+          exit "$cleanup_status"
+
+      - name: Continue only a persisted RUNNING campaign
+        id: dispatch
+        if: steps.package.outputs.status == 'running' && steps.upload.outcome == 'success' && steps.cleanup.outcome == 'success'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANIFEST: ${{ inputs.manifest }}
+          PROMPT_LAB_REF: ${{ inputs.prompt_lab_ref }}
+          KORVID_REF: ${{ inputs.korvid_ref }}
+          PRIOR_RUN_ID: ${{ github.run_id }}
+          EXPECTED_STATE_HASH: ${{ steps.package.outputs.state-hash }}
+        run: |
+          set -Eeuo pipefail
+          gh workflow run optimization-campaign.yml \
+            --ref "$GITHUB_REF_NAME" \
+            --field manifest="$MANIFEST" \
+            --field prompt_lab_ref="$PROMPT_LAB_REF" \
+            --field korvid_ref="$KORVID_REF" \
+            --field prior_run_id="$PRIOR_RUN_ID" \
+            --field expected_state_hash="$EXPECTED_STATE_HASH"
+
+      - name: Enforce terminal and persistence result
+        if: always()
+        shell: bash
+        env:
+          STATUS: ${{ steps.package.outputs.status }}
+          PACKAGE_OUTCOME: ${{ steps.package.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+          CLEANUP_OUTCOME: ${{ steps.cleanup.outcome }}
+          DISPATCH_OUTCOME: ${{ steps.dispatch.outcome }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$PACKAGE_OUTCOME" == "success" ]] || exit 70
+          [[ "$UPLOAD_OUTCOME" == "success" ]] || exit 70
+          [[ "$CLEANUP_OUTCOME" == "success" ]] || exit 70
+          case "$STATUS" in
+            qualified) exit 0 ;;
+            running)
+              [[ "$DISPATCH_OUTCOME" == "success" ]] || exit 70
+              ;;
+            not_converged) exit 1 ;;
+            system_error) exit 70 ;;
+            *) exit 70 ;;
+          esac
