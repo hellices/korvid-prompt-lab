@@ -850,7 +850,7 @@ and fill in:
 | Input | Required | Default | Notes |
 | --- | --- | --- | --- |
 | `prompt_lab_ref` | yes | — | Exact 40-hex SHA of the Prompt Lab commit to evaluate; must be contained in the default branch, or be the head of the same-repository PR named by `pr_number` |
-| `korvid_ref` | yes | `fc7eece2adb66a5b2a18d378bdfd7503ddbdd2ca` | Exact 40-hex SHA of the Korvid commit to use; must be proven authoritative `hellices/korvid` code — contained in its default branch, or in the head of one of its own **open** pull requests targeting that default branch. Fork heads, closed pull requests, and unknown SHAs are rejected |
+| `korvid_ref` | yes | `62bd3cbee2e27369bb81abc0957dae341c2aa434` | Exact 40-hex SHA of the Korvid commit to use; must be proven authoritative `hellices/korvid` code — contained in its default branch, or in the head of one of its own **open** pull requests targeting that default branch. Fork heads, closed pull requests, and unknown SHAs are rejected, and the workflow runs `korvid-bridge --check-imports` before Azure/model credentials or any AKS node-pool work |
 | `model` | yes | `qwen3:1.7b` | Ollama tag from the closed allowlist |
 | `round_type` | yes | `evaluate` | `evaluate` or `optimize-evaluate` |
 | `candidate` | yes | shipped-small | Relative path inside the Prompt Lab checkout |
@@ -922,8 +922,8 @@ requires write access); fork heads never are.
 ### Trust boundary for `korvid_ref`
 
 `korvid_ref` must be an exact 40-hex SHA **and** must be proven to be
-authoritative code in `hellices/korvid` before any credential exists. The check
-runs in the same pre-credential `actions/github-script` trust step, using only
+authoritative code in `hellices/korvid` before any credential exists. The trust
+check runs in the same pre-credential `actions/github-script` step, using only
 the job's own read-only `GITHUB_TOKEN` against the public Korvid repository —
 before the Korvid GitHub App token, Azure login, or any checkout.
 
@@ -940,39 +940,47 @@ experiment commits, and API failures are all refused — an unprovable ref fails
 closed. The Korvid repo identity (`{owner}/korvid`) is derived from
 `github.repository_owner`; it is never user-controlled.
 
-#### Why the pull-request route exists
+#### Why the import preflight still exists
 
-The pinned default
-`fc7eece2adb66a5b2a18d378bdfd7503ddbdd2ca` is deliberately *not* a default-branch
-commit. The operation-journey harness the bridge imports —
-`korvid.evals.operation`, `tests.evals.operation_app`,
-`tests.evals.operation_campaign` and `tests.evals.operation_scripts` — has never
-existed on `hellices/korvid` `main`; it is introduced by open pull request
-**#312** (`feat/307-small-operator-foundation` → `main`). Repinning to a `main`
-commit would clear a default-branch-only gate and then fail at run time with
-"korvid operation harness is not importable", *after* the Korvid app token, the
-Azure OIDC session, and the GPU node pool had already been spent.
+The pinned default `62bd3cbee2e27369bb81abc0957dae341c2aa434` is the reviewed
+squash merge of pull request **#312** and is now on `hellices/korvid` `main`, so
+the default-branch trust route is sufficient for provenance. That still does
+*not* prove the bridge can run it: the worker imports specific Korvid symbols,
+and a file path existing does not guarantee that names such as
+`LIFECYCLE_CHECKPOINTS`, `approval_timeout_for`, `run_operation_journey`, and
+the patchable `build_profile` binding still resolve at runtime.
 
-A same-repository branch already requires write access to `hellices/korvid`,
-which is the same trust argument this workflow already accepts for
-`prompt_lab_ref` pull request heads — so the pull-request route reuses that
-boundary rather than widening it to anonymous code.
+The workflow therefore performs a second, local preflight after the Korvid
+checkout and dependency setup but before Azure OIDC, model credentials, or
+node-pool operations:
+
+```bash
+korvid-bridge --check-imports
+```
+
+That command runs the bridge worker's `_import_korvid()` inside the pinned
+checkout's own `uv` environment and exits `0` only when every runtime symbol
+resolves. A same-repository pull request route still exists for future Korvid
+refs that are authoritative but not yet merged; fork heads, closed pull
+requests, arbitrary experiment commits, and API failures still fail closed.
 
 The pin is declared once, in
-[`src/korvid_prompt_lab/korvid_pin.py`](src/korvid_prompt_lab/korvid_pin.py): the
-approved SHA, a dated snapshot of its provenance, and the exact Korvid modules
-the bridge imports. Contract tests bind the workflow default, this README, and
-the bridge worker's own imports to that declaration, so none of them can drift
-apart again. To re-prove the pin against the live GitHub API:
+[`src/korvid_prompt_lab/korvid_pin.py`](src/korvid_prompt_lab/korvid_pin.py):
+the approved SHA, a dated snapshot of its provenance, and the exact Korvid
+modules the bridge imports. Contract tests bind the workflow default, this
+README, and the bridge worker's own imports to that declaration, so none of
+them can drift apart again. To re-prove the pin against the live GitHub API:
 
 ```bash
 scripts/verify-korvid-pin.sh
 ```
 
-It re-runs the provenance compares and confirms every required Korvid source
-path still exists at the pinned commit. Run it after the Korvid pull request is
-merged, force pushed, or closed — and repin (updating `korvid_pin.py`) once the
-harness lands on `main`.
+It re-runs the provenance compares, confirms every required Korvid source path
+still exists at the pinned commit, and checks that the bridge's runtime import
+contract is still satisfied from the source text there. Run it after the Korvid
+pull request is merged, force pushed, or closed — and repin (updating
+`korvid_pin.py`) whenever the authoritative, runtime-importable revision
+changes.
 
 ### Result locations
 
@@ -1078,6 +1086,72 @@ Local runs use the same `--turn-timeout 300` declared in the campaign. The
 300 s worker timeout is sized for `qwen3:0.6b` initial rounds only; larger
 models with unbounded generation will exhaust this budget and must be served
 with a bounded policy before selection.
+
+## Bounded optimization campaigns
+
+GitHub Actions run `32761941498` was a **pipeline canary**: it proved that the
+two-case path executed and preserved its safety gates, but it did not improve the
+prompt. The two-case campaign is explicitly not qualification evidence.
+
+The protected `Optimization Campaign` workflow advances one compare-and-swap
+state transition per run:
+
+| State | Operator meaning |
+|---|---|
+| `RUNNING` | Safe state was persisted and uploaded; the workflow may dispatch exactly one continuation. |
+| `QUALIFIED` | The milestone gate and the required independent confirmation passed. The result is eligible for review, not publication. |
+| `NOT_CONVERGED` | The declared search/stagnation budget or a model tier was exhausted without qualification. This is useful negative evidence and never permits publication. |
+| `SYSTEM_ERROR` | Configuration, infrastructure retries, or infrastructure wall-clock safety limits stopped the controller. Experimental scores are not updated from system failures. |
+
+The default `qwen3-small-operator` manifest is fixed at:
+
+- explore: **12 calls × 3 seeds** (`0`, `1`, `2`);
+- refine: **24 calls × 2 seeds** (`3`, `4`);
+- final: **48 calls × 1 seed** (`5`);
+- at most **240 metric calls** and **21,600 seconds (6 hours)** overall;
+- **1 infrastructure retry allowed per action** (a first transient system error
+  retries the same logical action; a second consecutive one stops the campaign,
+  and the counter resets after any valid evidence outcome) and a stop after
+  **3 consecutive non-promoting attempts**; and
+- a full milestone pass followed by **1 independent confirmation**.
+
+The controller stops at qualification, metric-call or wall-clock exhaustion,
+stagnation/tier exhaustion, a next model tier that no longer fits the remaining
+metric-call or wall-clock budget (`next_tier_budget_exhausted`), milestone
+failure, configuration failure, or the infrastructure retry limit. A regression
+in any core comparison metric never promotes a candidate, however far the
+aggregate score rose.
+
+Each run consumes exactly one prior state. After its evidence is uploaded and
+before it dispatches a continuation, a run claims a durable repository-scoped
+**lineage marker artifact** named from the validated campaign id and the prior
+state hash (`initial` for the first run). A later run that was handed the same
+prior state finds that marker through the GitHub API and stops before any
+expensive work, so duplicate lineages cannot be produced even from separately
+downloaded copies of the same state. Only this repository's own
+`workflow_dispatch` runs of `.github/workflows/optimization-campaign.yml` on the
+default branch can produce a trusted marker; artifacts uploaded from forks,
+other workflows, other events, or other repositories are ignored rather than
+allowed to consume a lineage.
+
+If a run fails *after* it uploaded its state and claimed its marker, the
+campaign is recoverable rather than wedged. Dispatch a continuation with
+`prior_run_id` set to the failed producer run and `expected_state_hash` set to
+the `to_state_hash` that run reported (the failure message of a re-run names
+both). The continuation is admitted only when the exact safe campaign artifact
+for that state **and** a trusted lineage marker produced by that same run both
+validate and agree on campaign id, revisions, and the produced state hash; every
+other failed prior run stays rejected. Re-running the failed job itself is
+refused early — before any expensive wrapper call — with that same recovery
+instruction, so no GPU time is burned twice. A campaign id is therefore
+single-use per lineage step for the 90-day artifact retention window; deleting a
+lineage marker artifact deliberately re-opens that step and must be treated as a
+trusted operator action.
+
+Results for model tiers are independent: candidates,
+scores, and holdout evidence from one tier do not qualify another tier.
+`QUALIFIED` still requires explicit publication approval through the existing
+reviewed publication path; this workflow never publishes automatically.
 
 ## Measured baseline — qwen3:0.6b
 

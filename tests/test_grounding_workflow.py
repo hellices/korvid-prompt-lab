@@ -237,6 +237,8 @@ def test_grounding_workflow_declares_typed_inputs() -> None:
     assert inputs["model"]["type"] == "choice"
     assert inputs["round_type"]["type"] == "choice"
     assert set(inputs["round_type"]["options"]) == {"evaluate", "optimize-evaluate"}
+    assert inputs["round_type"]["default"] == "evaluate"
+    assert "action_kind" not in inputs
     assert inputs["pr_number"]["type"] == "number", (
         "pr_number must be typed so a free-form string can never reach the API call"
     )
@@ -1165,9 +1167,10 @@ def test_grounding_workflow_declares_campaign_case_and_budget_inputs() -> None:
 
     for name in (
         "campaign",
-        "train_case_id",
-        "validation_case_id",
+        "train_case_ids",
+        "validation_case_ids",
         "milestone_case_ids",
+        "evaluation_case_ids",
         "max_metric_calls",
         "seed",
     ):
@@ -1179,19 +1182,21 @@ def test_grounding_workflow_declares_campaign_case_and_budget_inputs() -> None:
 
     assert inputs["campaign"]["type"] == "string"
     assert inputs["campaign"]["default"].endswith(".yaml")
-    assert inputs["train_case_id"]["type"] == "string"
-    assert inputs["validation_case_id"]["type"] == "string"
+    assert inputs["train_case_ids"]["type"] == "string"
+    assert inputs["validation_case_ids"]["type"] == "string"
     assert inputs["milestone_case_ids"]["type"] == "string"
+    assert inputs["evaluation_case_ids"]["type"] == "string"
     assert inputs["max_metric_calls"]["type"] == "number"
     assert inputs["seed"]["type"] == "number"
 
     assert (
-        inputs["train_case_id"]["default"] != inputs["validation_case_id"]["default"]
+        set(inputs["train_case_ids"]["default"].splitlines()).isdisjoint(
+            inputs["validation_case_ids"]["default"].splitlines()
+        )
     ), "the shipped defaults must keep the train and validation splits disjoint"
     assert (
-        "," in inputs["milestone_case_ids"]["description"].lower()
-        or "comma" in str(inputs["milestone_case_ids"]["description"]).lower()
-    ), "milestone_case_ids must document that it is a comma-separated list"
+        "line" in str(inputs["milestone_case_ids"]["description"]).lower()
+    ), "milestone_case_ids must document that it is a newline-separated list"
 
 
 def test_grounding_workflow_validates_campaign_case_and_budget_inputs_first() -> None:
@@ -1202,9 +1207,10 @@ def test_grounding_workflow_validates_campaign_case_and_budget_inputs_first() ->
 
     expected = {
         "CAMPAIGN": "${{ inputs.campaign }}",
-        "TRAIN_CASE_ID": "${{ inputs.train_case_id }}",
-        "VALIDATION_CASE_ID": "${{ inputs.validation_case_id }}",
+        "TRAIN_CASE_IDS": "${{ inputs.train_case_ids }}",
+        "VALIDATION_CASE_IDS": "${{ inputs.validation_case_ids }}",
         "MILESTONE_CASE_IDS": "${{ inputs.milestone_case_ids }}",
+        "EVALUATION_CASE_IDS": "${{ inputs.evaluation_case_ids }}",
         "MAX_METRIC_CALLS": "${{ inputs.max_metric_calls }}",
         "SEED": "${{ inputs.seed }}",
     }
@@ -1223,6 +1229,7 @@ def test_grounding_workflow_validates_campaign_case_and_budget_inputs_first() ->
     assert "disjoint" in body.lower(), (
         "the train and validation splits must be proven disjoint before cluster time"
     )
+    assert 'if [[ "$ROUND_TYPE" == "optimize-evaluate" ]]' in body
 
 
 def test_grounding_workflow_wires_campaign_cases_and_budget_to_the_orchestrator() -> (
@@ -1232,10 +1239,14 @@ def test_grounding_workflow_wires_campaign_cases_and_budget_to_the_orchestrator(
     env = effective_env(workflow, orchestrator_step(workflow))
 
     assert env["GROUNDING_CAMPAIGN"] == "${{ inputs.campaign }}"
-    assert env["GROUNDING_TRAIN_CASE_ID"] == "${{ inputs.train_case_id }}"
-    assert env["GROUNDING_VALIDATION_CASE_ID"] == "${{ inputs.validation_case_id }}"
+    assert "GROUNDING_ACTION_KIND" not in env
+    assert env["GROUNDING_TRAIN_CASE_IDS"] == "${{ inputs.train_case_ids }}"
+    assert env["GROUNDING_VALIDATION_CASE_IDS"] == "${{ inputs.validation_case_ids }}"
     assert env["GROUNDING_MILESTONE_CASE_IDS"] == "${{ inputs.milestone_case_ids }}"
-    assert env["GROUNDING_MAX_METRIC_CALLS"] == "${{ inputs.max_metric_calls }}"
+    assert env["GROUNDING_EVALUATION_CASE_IDS"] == "${{ inputs.evaluation_case_ids }}"
+    assert "inputs.round_type == 'optimize-evaluate'" in env[
+        "GROUNDING_MAX_METRIC_CALLS"
+    ]
     assert env["GROUNDING_SEED"] == "${{ inputs.seed }}"
 
 
@@ -1647,6 +1658,36 @@ def test_grounding_workflow_has_tool_verification_step_before_node_count() -> No
     body = str(tool_step.get("run", ""))
     for tool in ("az", "kubectl", "kubelogin", "uv"):
         assert tool in body, f"tool verification step must check for '{tool}'"
+
+
+def test_grounding_workflow_preflights_korvid_runtime_imports_before_azure_and_scaling() -> None:
+    workflow = load_workflow()
+    all_steps = steps(workflow)
+    preflight_indexes = [
+        index
+        for index, step in enumerate(all_steps)
+        if "korvid-bridge --check-imports" in str(step.get("run", ""))
+    ]
+    assert preflight_indexes, (
+        "workflow must preflight `korvid-bridge --check-imports` before Azure/model "
+        "credentials or any AKS node-pool operation"
+    )
+
+    preflight_index = preflight_indexes[0]
+    provision_index = next(
+        index
+        for index, step in enumerate(all_steps)
+        if "Provision Korvid uv environment out of tree" in str(step.get("name", ""))
+    )
+    azure_login_index = step_index(workflow, "azure/login")
+    node_count_index = next(
+        index
+        for index, step in enumerate(all_steps)
+        if "Record original modeleval node count" in str(step.get("name", ""))
+    )
+
+    assert provision_index < preflight_index < azure_login_index
+    assert preflight_index < node_count_index
 
 
 # ---------------------------------------------------------------------------

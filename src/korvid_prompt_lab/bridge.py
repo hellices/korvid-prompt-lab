@@ -100,6 +100,30 @@ def _resolve_uv(env: Mapping[str, str]) -> str:
     return found
 
 
+def _build_worker_environment(source_root: Path, env: Mapping[str, str]) -> dict[str, str]:
+    worker_env = dict(env)
+    existing = worker_env.get("PYTHONPATH", "")
+    # `tests.evals.operation_app` lives in the checkout, outside its installed package.
+    worker_env["PYTHONPATH"] = (
+        f"{source_root}{os.pathsep}{existing}" if existing else str(source_root)
+    )
+    worker_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return worker_env
+
+
+def _build_worker_command(source_root: Path, env: Mapping[str, str]) -> list[str]:
+    return [
+        _resolve_uv(env),
+        "run",
+        "--project",
+        str(source_root),
+        # The checkout is authoritative and read-only: never sync it.
+        "--no-sync",
+        "python",
+        str(WORKER_MODULE_PATH),
+    ]
+
+
 def build_worker_invocation(
     *,
     source_root: Path,
@@ -112,37 +136,36 @@ def build_worker_invocation(
     turn_timeout: float = DEFAULT_TURN_TIMEOUT_SECONDS,
 ) -> tuple[tuple[str, ...], dict[str, str]]:
     """Build the ``uv`` command and environment that run the worker in *source_root*."""
-    command = [
-        _resolve_uv(env),
-        "run",
-        "--project",
-        str(source_root),
-        # The checkout is authoritative and read-only: never sync it.
-        "--no-sync",
-        "python",
-        str(WORKER_MODULE_PATH),
-        "--request",
-        str(request_path),
-        "--response",
-        str(response_path),
-        "--profile",
-        profile,
-        "--approval-timeout",
-        str(float(approval_timeout)),
-        "--turn-timeout",
-        str(float(turn_timeout)),
-    ]
+    command = _build_worker_command(source_root, env)
+    command.extend(
+        [
+            "--request",
+            str(request_path),
+            "--response",
+            str(response_path),
+            "--profile",
+            profile,
+            "--approval-timeout",
+            str(float(approval_timeout)),
+            "--turn-timeout",
+            str(float(turn_timeout)),
+        ]
+    )
     if scripted:
         command.append("--scripted")
 
-    worker_env = dict(env)
-    existing = worker_env.get("PYTHONPATH", "")
-    # `tests.evals.operation_app` lives in the checkout, outside its installed package.
-    worker_env["PYTHONPATH"] = (
-        f"{source_root}{os.pathsep}{existing}" if existing else str(source_root)
-    )
-    worker_env["PYTHONDONTWRITEBYTECODE"] = "1"
-    return tuple(command), worker_env
+    return tuple(command), _build_worker_environment(source_root, env)
+
+
+def build_worker_import_check(
+    *,
+    source_root: Path,
+    env: Mapping[str, str],
+) -> tuple[tuple[str, ...], dict[str, str]]:
+    """Build the worker preflight that proves Korvid's runtime imports resolve."""
+    command = _build_worker_command(source_root, env)
+    command.append("--check-imports")
+    return tuple(command), _build_worker_environment(source_root, env)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -153,8 +176,13 @@ def build_parser() -> argparse.ArgumentParser:
             f" Korvid source checkout named by {SOURCE_ROOT_ENV}."
         ),
     )
-    parser.add_argument("--request", required=True, type=Path, help="Path to the bridge request JSON.")
-    parser.add_argument("--response", required=True, type=Path, help="Path to write the bridge response JSON.")
+    parser.add_argument(
+        "--check-imports",
+        action="store_true",
+        help="Resolve Korvid's runtime imports inside the checked-out Korvid environment.",
+    )
+    parser.add_argument("--request", type=Path, help="Path to the bridge request JSON.")
+    parser.add_argument("--response", type=Path, help="Path to write the bridge response JSON.")
     parser.add_argument(
         "--scripted",
         action="store_true",
@@ -365,16 +393,28 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         timeout = resolve_timeout_budget(env)
-        command, worker_env = build_worker_invocation(
-            source_root=resolve_source_root(env),
-            request_path=args.request,
-            response_path=args.response,
-            env=env,
-            scripted=args.scripted,
-            profile=args.profile,
-            approval_timeout=args.approval_timeout,
-            turn_timeout=args.turn_timeout,
-        )
+        source_root = resolve_source_root(env)
+        if args.check_imports:
+            if args.request is not None or args.response is not None:
+                raise BridgeConfigurationError(
+                    "--check-imports does not accept --request or --response"
+                )
+            command, worker_env = build_worker_import_check(source_root=source_root, env=env)
+        else:
+            if args.request is None or args.response is None:
+                raise BridgeConfigurationError(
+                    "--request and --response are required unless --check-imports is used"
+                )
+            command, worker_env = build_worker_invocation(
+                source_root=source_root,
+                request_path=args.request,
+                response_path=args.response,
+                env=env,
+                scripted=args.scripted,
+                profile=args.profile,
+                approval_timeout=args.approval_timeout,
+                turn_timeout=args.turn_timeout,
+            )
     except BridgeConfigurationError as exc:
         print(f"korvid-bridge: {sanitize_error(exc, env)}", file=sys.stderr)
         return EXIT_SYSTEMIC_FAILURE

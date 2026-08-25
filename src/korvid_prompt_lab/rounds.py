@@ -338,6 +338,7 @@ def write_safe_evidence(
     prompt_lab_revision: str | None = None,
     korvid_revision: str | None = None,
     workflow_run_url: str | None = None,
+    campaign_action_id: str | None = None,
 ) -> Path:
     artifact_root_path = _resolve_existing_directory(artifact_root, "artifact_root")
     optimize_artifact_root_path = (
@@ -512,6 +513,8 @@ def write_safe_evidence(
         "workflow_run_url": workflow_run_url,
         "reproduction_command": list(report.reproduction_command),
     }
+    if campaign_action_id is not None:
+        summary_payload["campaign_action_id"] = campaign_action_id
     _write_json(_resolve_destination_path(safe_output_path, safe_output_path / "round-summary.json"), summary_payload)
 
     # Build markdown: the comparison/single-evaluation decision headline is the

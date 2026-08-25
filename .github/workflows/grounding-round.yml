@@ -28,13 +28,12 @@ name: Grounding Round
         description: "Korvid commit SHA to check out (exact 40-hex commit SHA, proven authoritative before any credential)"
         required: true
         type: string
-        # The operation-journey harness the bridge imports is not on the Korvid
-        # default branch yet, so this pin is a commit of the open pull request
-        # that introduces it.  `src/korvid_prompt_lab/korvid_pin.py` is the
-        # reviewed declaration of this SHA, its provenance, and the bridge
-        # dependencies it must contain; `scripts/verify-korvid-pin.sh` re-proves
-        # both against the live GitHub API.
-        default: "fc7eece2adb66a5b2a18d378bdfd7503ddbdd2ca"
+        # `src/korvid_prompt_lab/korvid_pin.py` is the reviewed declaration of
+        # this SHA, its authoritative provenance, and the bridge import contract
+        # it must satisfy. `scripts/verify-korvid-pin.sh` re-proves both against
+        # the live GitHub API, and the workflow preflights `korvid-bridge
+        # --check-imports` before Azure/model credentials or any AKS scaling.
+        default: "62bd3cbee2e27369bb81abc0957dae341c2aa434"
       model:
         description: "Ollama model tag to evaluate"
         type: choice
@@ -61,22 +60,42 @@ name: Grounding Round
         description: "Path to campaign YAML (relative to the Prompt Lab checkout)"
         required: true
         type: string
-        default: "examples/campaigns/aks-shared-runners.yaml"
-      train_case_id:
-        description: "Campaign case id forming the train split"
+        default: "examples/campaigns/aks-small-operator-qualification.yaml"
+      train_case_ids:
+        description: "Campaign train case ids, one per line"
         required: true
         type: string
-        default: "aks-scale-deployment-up"
-      validation_case_id:
-        description: "Campaign case id forming the validation split (must differ from train)"
+        default: |-
+          scale-deployment-up
+          restart-denied
+          scale-no-op
+      validation_case_ids:
+        description: "Campaign validation case ids, one per line"
         required: true
         type: string
-        default: "aks-restart-denied"
+        default: |-
+          scale-deployment-down
+          restart-deployment
+          scale-rbac-denied
       milestone_case_ids:
-        description: "Comma-separated campaign case ids forming the milestone pack"
+        description: "Campaign milestone case ids, one per line"
         required: true
         type: string
-        default: "aks-scale-deployment-up,aks-restart-denied"
+        default: |-
+          scale-ambiguous-namespace
+          restart-approval-expired
+          restart-daemonset
+          scale-same-name-replacement
+          scale-statefulset-down
+          edit-unsupported
+      evaluation_case_ids:
+        description: "Exact evaluation scope, one case id per line"
+        required: true
+        type: string
+        default: |-
+          scale-deployment-down
+          restart-deployment
+          scale-rbac-denied
       max_metric_calls:
         description: "GEPA metric-call budget for optimize-evaluate rounds"
         required: true
@@ -133,9 +152,10 @@ jobs:
           CANDIDATE: ${{ inputs.candidate }}
           CAMPAIGN: ${{ inputs.campaign }}
           ROUND_TYPE: ${{ inputs.round_type }}
-          TRAIN_CASE_ID: ${{ inputs.train_case_id }}
-          VALIDATION_CASE_ID: ${{ inputs.validation_case_id }}
+          TRAIN_CASE_IDS: ${{ inputs.train_case_ids }}
+          VALIDATION_CASE_IDS: ${{ inputs.validation_case_ids }}
           MILESTONE_CASE_IDS: ${{ inputs.milestone_case_ids }}
+          EVALUATION_CASE_IDS: ${{ inputs.evaluation_case_ids }}
           MAX_METRIC_CALLS: ${{ inputs.max_metric_calls }}
           SEED: ${{ inputs.seed }}
         run: |
@@ -180,33 +200,50 @@ jobs:
             *) echo "::error::unsupported round type"; exit 1 ;;
           esac
 
-          # Case ids reach the orchestrator as argv, so the vocabulary is closed:
-          # no whitespace, globs, option-looking values, or path traversal.  Each
-          # value is matched literally — never through eval or indirection.
+          # Case ids are one-per-line arrays. Values are matched literally:
+          # never through eval, shell words, comma parsing, or indirection.
           case_id_pattern='^[A-Za-z0-9][A-Za-z0-9._-]*$'
-          if [[ ! "$TRAIN_CASE_ID" =~ $case_id_pattern ]]; then
-            echo "::error::train_case_id must be a single case id matching $case_id_pattern"
-            exit 1
-          fi
+          parse_case_ids() {
+            local raw="$1" label="$2" remaining="$1" case_id
+            parsed=()
+            while [[ "$remaining" == *$'\n'* ]]; do
+              case_id="${remaining%%$'\n'*}"
+              remaining="${remaining#*$'\n'}"
+              [[ "$case_id" =~ $case_id_pattern ]] || {
+                echo "::error::$label contains an invalid or empty case id"; exit 1;
+              }
+              parsed+=("$case_id")
+            done
+            [[ -n "$remaining" && "$remaining" =~ $case_id_pattern ]] || {
+              echo "::error::$label must contain non-empty case ids"; exit 1;
+            }
+            parsed+=("$remaining")
+          }
+          parse_case_ids "$TRAIN_CASE_IDS" train_case_ids
+          train_ids=("${parsed[@]}")
+          parse_case_ids "$VALIDATION_CASE_IDS" validation_case_ids
+          validation_ids=("${parsed[@]}")
+          parse_case_ids "$MILESTONE_CASE_IDS" milestone_case_ids
+          milestone_ids=("${parsed[@]}")
+          parse_case_ids "$EVALUATION_CASE_IDS" evaluation_case_ids
+          evaluation_ids=("${parsed[@]}")
 
-          if [[ ! "$VALIDATION_CASE_ID" =~ $case_id_pattern ]]; then
-            echo "::error::validation_case_id must be a single case id matching $case_id_pattern"
-            exit 1
-          fi
+          for left in "${train_ids[@]}" "${validation_ids[@]}" "${milestone_ids[@]}"; do
+            count=0
+            for right in "${train_ids[@]}" "${validation_ids[@]}" "${milestone_ids[@]}"; do
+              [[ "$left" == "$right" ]] && count=$((count + 1))
+            done
+            if (( count != 1 )); then
+              echo "::error::train, validation, and milestone case ids must be unique and disjoint"
+              exit 1
+            fi
+          done
 
-          if [[ "$TRAIN_CASE_ID" == "$VALIDATION_CASE_ID" ]]; then
-            echo "::error::train and validation case ids must be disjoint"
-            exit 1
-          fi
-
-          if [[ ! "$MILESTONE_CASE_IDS" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(,[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]]; then
-            echo "::error::milestone_case_ids must be a comma-separated list of case ids"
-            exit 1
-          fi
-
-          if [[ ! "$MAX_METRIC_CALLS" =~ ^[1-9][0-9]{0,4}$ ]]; then
-            echo "::error::max_metric_calls must be a positive integer"
-            exit 1
+          if [[ "$ROUND_TYPE" == "optimize-evaluate" ]]; then
+            if [[ ! "$MAX_METRIC_CALLS" =~ ^[1-9][0-9]{0,4}$ ]]; then
+              echo "::error::max_metric_calls must be a positive integer for optimization"
+              exit 1
+            fi
           fi
 
           if [[ ! "$SEED" =~ ^[0-9]{1,9}$ ]]; then
@@ -515,17 +552,7 @@ jobs:
           persist-credentials: false
 
       # -----------------------------------------------------------------------
-      # 6. Azure OIDC login (no client secret)
-      # -----------------------------------------------------------------------
-      - name: Azure login (OIDC)
-        uses: azure/login@a65d910e8af852a8061c627c456678983e180302  # v2.2.0
-        with:
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-
-      # -----------------------------------------------------------------------
-      # 7. Python toolchain
+      # 6. Python toolchain
       # -----------------------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
@@ -538,7 +565,7 @@ jobs:
           version: "latest"
 
       # -----------------------------------------------------------------------
-      # 8. Install Prompt Lab into an environment outside both checkouts
+      # 7. Install Prompt Lab into an environment outside both checkouts
       # -----------------------------------------------------------------------
       - name: Install Prompt Lab
         working-directory: prompt-lab
@@ -554,7 +581,7 @@ jobs:
           printf '%s\n' "$UV_PROJECT_ENVIRONMENT/bin" >> "$GITHUB_PATH"
 
       # -----------------------------------------------------------------------
-      # 9. Provision the Korvid uv environment out of tree
+      # 8. Provision the Korvid uv environment out of tree
       #
       # The bridge launches its worker with `uv run --project <korvid> --no-sync`,
       # which needs a complete environment for that checkout.  The checkout stays
@@ -579,7 +606,35 @@ jobs:
           fi
 
       # -----------------------------------------------------------------------
-      # 10. Verify required CLI tools before node-pool operations
+      # 9. Preflight Korvid runtime imports before Azure/model credentials
+      #
+      # Source-path existence alone is insufficient: the checked-out Korvid
+      # revision must also resolve every bridge runtime symbol in its own uv
+      # environment before Azure OIDC, model credentials, or node-pool work can
+      # begin.
+      # -----------------------------------------------------------------------
+      - name: Preflight Korvid bridge imports
+        working-directory: prompt-lab
+        shell: bash
+        env:
+          KORVID_SOURCE_ROOT: ${{ github.workspace }}/korvid
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/korvid-uv-env
+        run: |
+          set -Eeuo pipefail
+          korvid-bridge --check-imports
+
+      # -----------------------------------------------------------------------
+      # 10. Azure OIDC login (no client secret)
+      # -----------------------------------------------------------------------
+      - name: Azure login (OIDC)
+        uses: azure/login@a65d910e8af852a8061c627c456678983e180302  # v2.2.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # -----------------------------------------------------------------------
+      # 11. Verify required CLI tools before node-pool operations
       # -----------------------------------------------------------------------
       - name: Verify required CLI tools
         shell: bash
@@ -593,7 +648,7 @@ jobs:
           done
 
       # -----------------------------------------------------------------------
-      # 11. Record the original modeleval node count
+      # 12. Record the original modeleval node count
       #
       # Captured as a step output *before* anything can scale the pool, so the
       # always() cleanup step at the end restores the exact original count even
@@ -619,7 +674,7 @@ jobs:
           printf 'original-count=%s\n' "$count" >> "$GITHUB_OUTPUT"
 
       # -----------------------------------------------------------------------
-      # 12. Run the grounding orchestrator
+      # 13. Run the grounding orchestrator
       # -----------------------------------------------------------------------
       - name: Run grounding round
         working-directory: prompt-lab
@@ -630,10 +685,11 @@ jobs:
           GROUNDING_CANDIDATE: ${{ inputs.candidate }}
           GROUNDING_CAMPAIGN: ${{ inputs.campaign }}
           GROUNDING_ROUND_TYPE: ${{ inputs.round_type }}
-          GROUNDING_TRAIN_CASE_ID: ${{ inputs.train_case_id }}
-          GROUNDING_VALIDATION_CASE_ID: ${{ inputs.validation_case_id }}
+          GROUNDING_TRAIN_CASE_IDS: ${{ inputs.train_case_ids }}
+          GROUNDING_VALIDATION_CASE_IDS: ${{ inputs.validation_case_ids }}
           GROUNDING_MILESTONE_CASE_IDS: ${{ inputs.milestone_case_ids }}
-          GROUNDING_MAX_METRIC_CALLS: ${{ inputs.max_metric_calls }}
+          GROUNDING_EVALUATION_CASE_IDS: ${{ inputs.evaluation_case_ids }}
+          GROUNDING_MAX_METRIC_CALLS: ${{ inputs.round_type == 'optimize-evaluate' && inputs.max_metric_calls || '' }}
           GROUNDING_SEED: ${{ inputs.seed }}
           # Reflection credentials exist only for optimize rounds; an
           # evaluate-only round never materialises them.
@@ -658,7 +714,7 @@ jobs:
         run: bash scripts/run-grounding-round.sh
 
       # -----------------------------------------------------------------------
-      # 13. Append the safe round summary to the Job Summary
+      # 14. Append the safe round summary to the Job Summary
       # -----------------------------------------------------------------------
       - name: Append round summary to Job Summary
         if: always() && hashFiles('prompt-lab/artifacts/grounding-round/safe-evidence/round-summary.md') != ''

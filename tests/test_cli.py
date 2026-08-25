@@ -2183,14 +2183,16 @@ def test_evaluate_requires_explicit_disjoint_case_splits(
     assert message in stderr
 
 
-def test_evaluate_rejects_case_sets_that_were_not_evaluated(tmp_path: Path) -> None:
+def test_evaluate_records_planned_splits_outside_the_evaluation_scope(
+    tmp_path: Path,
+) -> None:
     candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
     campaign_path = _write_yaml(
         tmp_path / "campaign.yaml",
         _process_campaign_payload("smoke-happy", extra_case_ids=("smoke-guardrail",)),
     )
 
-    exit_code, stdout, stderr = _run_cli(
+    exit_code, _stdout, stderr = _run_cli(
         _evaluate_args(
             candidate_path,
             campaign_path,
@@ -2201,9 +2203,13 @@ def test_evaluate_rejects_case_sets_that_were_not_evaluated(tmp_path: Path) -> N
         )
     )
 
-    assert exit_code == 2
-    assert stdout == ""
-    assert "evaluated" in stderr
+    assert exit_code == 0, stderr
+    summary = json.loads(
+        (tmp_path / "artifacts" / "evaluation-summary.json").read_text()
+    )
+    assert summary["evaluated_case_ids"] == ["smoke-happy"]
+    assert summary["case_sets"]["train"] == ["smoke-happy"]
+    assert summary["case_sets"]["validation"] == ["smoke-guardrail"]
 
 
 def test_evaluate_rejects_milestone_cases_that_were_not_evaluated(
@@ -2226,7 +2232,7 @@ def test_evaluate_rejects_milestone_cases_that_were_not_evaluated(
 
     assert exit_code == 2
     assert stdout == ""
-    assert "evaluated" in stderr
+    assert "campaign" in stderr
 
 
 @pytest.mark.parametrize(

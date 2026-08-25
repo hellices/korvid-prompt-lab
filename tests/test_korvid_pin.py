@@ -36,9 +36,11 @@ from korvid_prompt_lab.korvid_pin import (
     APPROVED_KORVID_SHA,
     KORVID_DEFAULT_BRANCH,
     KORVID_REPOSITORY,
+    PROVENANCE_DEFAULT_BRANCH,
     PROVENANCE_OPEN_PULL_REQUEST,
     REQUIRED_KORVID_IMPORTS,
     REQUIRED_KORVID_SOURCE_PATHS,
+    KorvidProvenance,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -55,19 +57,16 @@ def vouching_pull_request(
     head_repository: str | None = None,
     base_ref: str | None = None,
 ) -> dict[str, Any]:
-    """The recorded Korvid pull request that vouches for the pin, with overrides."""
-    provenance = APPROVED_KORVID_PROVENANCE
+    """A synthetic same-repository Korvid pull request, with overrides."""
     return {
-        "number": provenance.pull_request if number is None else number,
+        "number": 312 if number is None else number,
         "state": "open",
-        "base": {"ref": provenance.base_branch if base_ref is None else base_ref},
+        "base": {"ref": KORVID_DEFAULT_BRANCH if base_ref is None else base_ref},
         "head": {
-            "sha": provenance.head_sha if head_sha is None else head_sha,
-            "ref": provenance.branch,
+            "sha": ("d" * 40) if head_sha is None else head_sha,
+            "ref": "feat/307-small-operator-foundation",
             "repo": {
-                "full_name": (
-                    provenance.head_repository if head_repository is None else head_repository
-                )
+                "full_name": (KORVID_REPOSITORY if head_repository is None else head_repository)
             },
         },
     }
@@ -82,8 +81,23 @@ def run_gate_for_shipped_default(tmp_path: Path, **overrides: Any) -> dict[str, 
         "korvid_repo": KORVID_REPOSITORY,
         "korvid_default_branch": KORVID_DEFAULT_BRANCH,
         "korvid_compare": {"status": provenance.default_branch_compare_status},
+        "korvid_pulls": [],
+        "korvid_pull_compare": {"status": "ahead"},
+    }
+    kwargs.update(overrides)
+    return run_trust_script(tmp_path, **kwargs)
+
+
+def run_gate_for_pull_request_vouched_ref(tmp_path: Path, **overrides: Any) -> dict[str, Any]:
+    """Replay a Korvid ref that only an open same-repository pull request can vouch for."""
+    kwargs: dict[str, Any] = {
+        "compare": {"status": "ahead"},  # prompt_lab_ref passes; korvid is under test
+        "korvid_ref": workflow_korvid_default(),
+        "korvid_repo": KORVID_REPOSITORY,
+        "korvid_default_branch": KORVID_DEFAULT_BRANCH,
+        "korvid_compare": {"status": "diverged"},
         "korvid_pulls": [vouching_pull_request()],
-        "korvid_pull_compare": {"status": provenance.head_compare_status},
+        "korvid_pull_compare": {"status": "ahead"},
     }
     kwargs.update(overrides)
     return run_trust_script(tmp_path, **kwargs)
@@ -103,33 +117,51 @@ def test_approved_pin_is_an_exact_commit_sha() -> None:
     assert SHA_PATTERN.match(APPROVED_KORVID_SHA), (
         "the approved Korvid pin must be an exact 40-hex commit SHA, never a branch or tag"
     )
-    assert SHA_PATTERN.match(APPROVED_KORVID_PROVENANCE.head_sha)
+    if APPROVED_KORVID_PROVENANCE.kind == PROVENANCE_OPEN_PULL_REQUEST:
+        assert APPROVED_KORVID_PROVENANCE.head_sha is not None
+        assert SHA_PATTERN.match(APPROVED_KORVID_PROVENANCE.head_sha)
 
 
 def test_pin_records_the_repository_it_was_proven_against() -> None:
     assert KORVID_REPOSITORY == "hellices/korvid"
-    assert APPROVED_KORVID_PROVENANCE.head_repository == KORVID_REPOSITORY, (
-        "a pull request whose head repository is a fork can never vouch for the pin"
-    )
-    assert APPROVED_KORVID_PROVENANCE.base_branch == KORVID_DEFAULT_BRANCH
-
-
-def test_pin_records_why_the_default_branch_route_is_insufficient() -> None:
-    """The declaration must keep the failing default-branch status, not hide it.
-
-    The recorded ``diverged`` status is the whole reason the gate needs a second
-    acceptance route.  If someone repins to a default-branch commit they must
-    update this fact deliberately, which is exactly the review moment that was
-    missing when the gate and the default drifted apart.
-    """
-    provenance = APPROVED_KORVID_PROVENANCE
-    if provenance.kind == PROVENANCE_OPEN_PULL_REQUEST:
-        assert provenance.default_branch_compare_status not in ("identical", "ahead"), (
-            "a pin routed through a pull request must not also be reachable from the "
-            "default branch — if it is, pin the default-branch route instead"
+    if APPROVED_KORVID_PROVENANCE.kind == PROVENANCE_OPEN_PULL_REQUEST:
+        assert APPROVED_KORVID_PROVENANCE.head_repository == KORVID_REPOSITORY, (
+            "a pull request whose head repository is a fork can never vouch for the pin"
         )
-        assert provenance.head_compare_status in ("identical", "ahead"), (
-            "the vouching pull request head must contain the pinned commit"
+        assert APPROVED_KORVID_PROVENANCE.base_branch == KORVID_DEFAULT_BRANCH
+
+
+def test_approved_pin_is_reviewed_squash_merge_on_default_branch() -> None:
+    assert APPROVED_KORVID_SHA == "62bd3cbee2e27369bb81abc0957dae341c2aa434"
+    assert APPROVED_KORVID_PROVENANCE.kind == PROVENANCE_DEFAULT_BRANCH
+    assert APPROVED_KORVID_PROVENANCE.default_branch_compare_status in {"identical", "ahead"}
+
+
+def test_default_branch_provenance_does_not_carry_pull_request_only_fields() -> None:
+    provenance = APPROVED_KORVID_PROVENANCE
+
+    assert provenance.kind == PROVENANCE_DEFAULT_BRANCH
+    assert provenance.pull_request is None
+    assert provenance.branch is None
+    assert provenance.base_branch is None
+    assert provenance.head_repository is None
+    assert provenance.head_sha is None
+    assert provenance.head_compare_status is None
+    assert provenance.default_branch_compare_status in {"identical", "ahead"}
+
+
+def test_open_pull_request_provenance_requires_pull_request_fields() -> None:
+    with pytest.raises(ValueError, match="pull-request provenance requires"):
+        KorvidProvenance(
+            kind=PROVENANCE_OPEN_PULL_REQUEST,
+            pull_request=None,
+            branch=None,
+            base_branch=None,
+            head_repository=None,
+            head_sha=None,
+            head_compare_status=None,
+            default_branch_compare_status="diverged",
+            verified_on="2026-08-26",
         )
 
 
@@ -225,10 +257,9 @@ def test_workflow_korvid_ref_default_is_an_exact_sha() -> None:
 def test_shipped_korvid_default_passes_the_shipped_trust_gate(tmp_path: Path) -> None:
     """The default dispatch must survive its own pre-credential provenance gate.
 
-    Replays the recorded facts: the pin is ``diverged`` from the Korvid default
-    branch, and it is contained in the head of open, same-repository pull request
-    #312 targeting that default branch.  A gate that only accepts default-branch
-    containment rejects the shipped default, which is the round-two finding.
+    Replays the recorded facts for the reviewed squash merge: the Korvid default
+    branch contains the shipped SHA directly, so the pre-credential gate must
+    accept it without consulting pull requests.
     """
     outcome = run_gate_for_shipped_default(tmp_path / "shipped-default")
 
@@ -242,7 +273,7 @@ def test_trust_gate_consults_open_pull_requests_of_the_authoritative_repo(
     tmp_path: Path,
 ) -> None:
     """The fallback route must ask the authoritative repo for its *open* pull requests."""
-    outcome = run_gate_for_shipped_default(tmp_path / "pull-request-route")
+    outcome = run_gate_for_pull_request_vouched_ref(tmp_path / "pull-request-route")
 
     list_calls = [call for call in outcome["calls"] if call["name"] == "pulls.list"]
     assert list_calls, (
@@ -261,7 +292,7 @@ def test_trust_gate_consults_open_pull_requests_of_the_authoritative_repo(
 
 
 def test_trust_gate_rejects_a_ref_no_open_pull_request_contains(tmp_path: Path) -> None:
-    outcome = run_gate_for_shipped_default(
+    outcome = run_gate_for_pull_request_vouched_ref(
         tmp_path / "no-vouching-pr",
         korvid_pull_compare={"status": "diverged"},
     )
@@ -274,7 +305,7 @@ def test_trust_gate_rejects_a_ref_no_open_pull_request_contains(tmp_path: Path) 
 
 def test_trust_gate_rejects_a_fork_pull_request_that_contains_the_ref(tmp_path: Path) -> None:
     """A fork head must never vouch for a Korvid ref, however it compares."""
-    outcome = run_gate_for_shipped_default(
+    outcome = run_gate_for_pull_request_vouched_ref(
         tmp_path / "fork-pr",
         korvid_pulls=[vouching_pull_request(head_repository="attacker/korvid")],
         korvid_pull_compare={"status": "ahead"},
@@ -287,7 +318,7 @@ def test_trust_gate_rejects_a_fork_pull_request_that_contains_the_ref(tmp_path: 
 
 
 def test_trust_gate_rejects_a_pull_request_targeting_another_base(tmp_path: Path) -> None:
-    outcome = run_gate_for_shipped_default(
+    outcome = run_gate_for_pull_request_vouched_ref(
         tmp_path / "wrong-base-pr",
         korvid_pulls=[vouching_pull_request(base_ref="some-release-branch")],
         korvid_pull_compare={"status": "ahead"},
@@ -300,7 +331,7 @@ def test_trust_gate_rejects_a_pull_request_targeting_another_base(tmp_path: Path
 
 def test_trust_gate_rejects_when_the_pull_request_api_fails(tmp_path: Path) -> None:
     """An API outage must close the round, not open it."""
-    outcome = run_gate_for_shipped_default(
+    outcome = run_gate_for_pull_request_vouched_ref(
         tmp_path / "pr-api-failure",
         korvid_pulls_error="HttpError: 503",
     )
@@ -346,7 +377,7 @@ def test_readme_names_the_approved_korvid_pin() -> None:
 
 def test_readme_documents_the_pull_request_provenance_route() -> None:
     text = readme_text().lower()
-    assert f"#{APPROVED_KORVID_PROVENANCE.pull_request}" in readme_text(), (
+    assert "#312" in readme_text(), (
         "the README must name the open pull request that vouches for the pin"
     )
     assert "pull request" in text and "fork" in text
@@ -422,7 +453,7 @@ def test_verify_script_pin_field_does_not_execute_the_declaration(tmp_path: Path
     # Extract the Python snippet from pin_field(), which receives the declaration
     # path and requested field as positional arguments.
     m = re.search(
-        r"pin_field\(\) \{[^}]*?\"?\$PYTHON\"? -c '(.*?)'\s+\"\$REPO_ROOT[^\"]+\"\s+\"\$1\"\s*\n\}",
+        r"pin_field\(\) \{[^}]*?\"?\$PYTHON\"? -c '(.*?)'\s+\"\$PIN_PATH\"\s+\"\$1\"\s+\"\$BRIDGE_WORKER_PATH\"\s*\n\}",
         body,
         re.DOTALL,
     )
@@ -441,7 +472,15 @@ def test_verify_script_pin_field_does_not_execute_the_declaration(tmp_path: Path
         encoding="utf-8",
     )
     result = subprocess.run(
-        [sys.executable, "-S", "-c", snippet, str(pin_path), "sha"],
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            snippet,
+            str(pin_path),
+            "sha",
+            str(_REPO_ROOT / "src" / "korvid_prompt_lab" / "bridge_worker.py"),
+        ],
         capture_output=True,
         text=True,
         env={},

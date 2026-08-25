@@ -84,6 +84,10 @@ _CREDENTIAL_PHRASE = re.compile(
     r"(?:[\s:=]*\b(?:authorization|bearer|api[-_]?key|apikey|token|secret|password)\b)*"
     r"[\s:=]*\S+"
 )
+_CANNOT_IMPORT_NAME = re.compile(r"cannot import name ['\"]([^'\"]+)['\"] from ['\"]([^'\"]+)['\"]")
+_MISSING_MODULE_ATTRIBUTE = re.compile(
+    r"module ['\"]([^'\"]+)['\"] has no attribute ['\"]([^'\"]+)['\"]"
+)
 
 
 class WorkerConfigurationError(Exception):
@@ -523,6 +527,38 @@ def sanitize_error(error: BaseException | str, env: Mapping[str, str] | None = N
     return text or "unspecified bridge failure"
 
 
+def _sanitize_text_fragment(text: str, env: Mapping[str, str] | None = None) -> str:
+    environment = os.environ if env is None else env
+    sanitized = _CREDENTIAL_PHRASE.sub("[redacted-credential]", text)
+    for name in SENSITIVE_ENV_NAMES:
+        secret = environment.get(name, "")
+        if secret and secret.strip():
+            sanitized = sanitized.replace(secret, "***")
+    sanitized = " ".join(sanitized.split())
+    if len(sanitized) > MAX_ERROR_CHARS:
+        sanitized = f"{sanitized[:MAX_ERROR_CHARS]} [truncated]"
+    return sanitized or "[redacted-credential]"
+
+
+def sanitize_import_error(error: BaseException, env: Mapping[str, str] | None = None) -> str:
+    """Return a bounded import/symbol-resolution error without paths or secrets."""
+    text = sanitize_error(error, env)
+
+    if match := _CANNOT_IMPORT_NAME.search(str(error)):
+        module = _sanitize_text_fragment(match.group(2), env)
+        name = _sanitize_text_fragment(match.group(1), env)
+        return f"{module}: {name}"
+    if match := _MISSING_MODULE_ATTRIBUTE.search(str(error)):
+        module = _sanitize_text_fragment(match.group(1), env)
+        name = _sanitize_text_fragment(match.group(2), env)
+        return f"{module}: {name}"
+    if isinstance(error, ModuleNotFoundError) and error.name:
+        return _sanitize_text_fragment(error.name, env)
+    if isinstance(error, ImportError) and error.name:
+        return _sanitize_text_fragment(error.name, env)
+    return text
+
+
 # --- atomic response write --------------------------------------------------------
 
 
@@ -649,26 +685,20 @@ class _Korvid:
 def _import_korvid() -> _Korvid:
     # Every symbol below lives in the checkout named by KORVID_SOURCE_ROOT, so it
     # is resolvable only in the worker's uv environment, never in this one.
-    try:
-        import httpx
-        from korvid.agent.profiles import PromptOverrides
-        from korvid.evals.operation import (
-            LIFECYCLE_CHECKPOINTS,
-            bundled_operations_dir,
-            load_operation_journeys,
-        )
-        from korvid.evals.scripted import ScriptedProvider
-        from korvid.providers.openai_compat import OpenAICompatProvider, ProviderError
-        from korvid.providers.static_creds import StaticHeaderSource
-        from tests.evals import operation_app
-        from tests.evals.operation_campaign import approval_timeout_for
-        from tests.evals.operation_scripts import OPERATION_SCRIPTS
-        from tests.ui.waits import WaitTimeout
-    except ImportError as exc:
-        raise WorkerConfigurationError(
-            "korvid operation harness is not importable; KORVID_SOURCE_ROOT must point at a"
-            " Korvid source checkout whose uv environment is installed"
-        ) from exc
+    import httpx
+    from korvid.agent.profiles import PromptOverrides
+    from korvid.evals.operation import (
+        LIFECYCLE_CHECKPOINTS,
+        bundled_operations_dir,
+        load_operation_journeys,
+    )
+    from korvid.evals.scripted import ScriptedProvider
+    from korvid.providers.openai_compat import OpenAICompatProvider, ProviderError
+    from korvid.providers.static_creds import StaticHeaderSource
+    from tests.evals import operation_app
+    from tests.evals.operation_campaign import approval_timeout_for
+    from tests.evals.operation_scripts import OPERATION_SCRIPTS
+    from tests.ui.waits import WaitTimeout
 
     return _Korvid(
         operation_app=operation_app,
@@ -789,6 +819,18 @@ def run_bridge(
     )
 
 
+def check_korvid_imports(*, env: Mapping[str, str] | None = None) -> int:
+    """Exit zero only when every runtime symbol resolves inside the Korvid checkout."""
+    environment = os.environ if env is None else env
+    try:
+        _import_korvid()
+    except (ImportError, AttributeError) as exc:
+        print(f"korvid import failed: {sanitize_import_error(exc, environment)}", file=sys.stderr)
+        return EXIT_SYSTEMIC_FAILURE
+    print("korvid runtime imports: OK")
+    return 0
+
+
 # --- entry point --------------------------------------------------------------------
 
 
@@ -797,8 +839,13 @@ def build_parser() -> argparse.ArgumentParser:
         prog="korvid-bridge-worker",
         description="Run one graded Korvid operation journey for a prompt candidate.",
     )
-    parser.add_argument("--request", required=True, type=Path, help="Path to the bridge request JSON.")
-    parser.add_argument("--response", required=True, type=Path, help="Path to write the bridge response JSON.")
+    parser.add_argument(
+        "--check-imports",
+        action="store_true",
+        help="Resolve the pinned Korvid runtime imports and exit without reading bridge artifacts.",
+    )
+    parser.add_argument("--request", type=Path, help="Path to the bridge request JSON.")
+    parser.add_argument("--response", type=Path, help="Path to write the bridge response JSON.")
     parser.add_argument(
         "--scripted",
         action="store_true",
@@ -821,7 +868,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    environment = dict(os.environ)
     args = build_parser().parse_args(argv)
+    if args.check_imports:
+        if args.request is not None or args.response is not None:
+            print(
+                "korvid-bridge-worker: --check-imports does not accept --request or --response",
+                file=sys.stderr,
+            )
+            return EXIT_SYSTEMIC_FAILURE
+        return check_korvid_imports(env=environment)
+    if args.request is None or args.response is None:
+        print(
+            "korvid-bridge-worker: --request and --response are required unless --check-imports is used",
+            file=sys.stderr,
+        )
+        return EXIT_SYSTEMIC_FAILURE
 
     request: BridgeRequest | None = None
     execution_mode: str | None = None
@@ -839,20 +901,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except WorkerModelFailure as exc:
         if request is None or execution_mode is None:  # pragma: no cover - defensive; the model cannot fail before parsing
-            print(f"korvid-bridge-worker: {sanitize_error(exc)}", file=sys.stderr)
+            print(f"korvid-bridge-worker: {sanitize_error(exc, environment)}", file=sys.stderr)
             return EXIT_SYSTEMIC_FAILURE
         payload = build_model_failure_response(request, exc, execution_mode=execution_mode)
+    except (ImportError, AttributeError) as exc:
+        print(
+            f"korvid-bridge-worker: korvid import failed: {sanitize_import_error(exc, environment)}",
+            file=sys.stderr,
+        )
+        return EXIT_SYSTEMIC_FAILURE
     except WorkerConfigurationError as exc:
-        print(f"korvid-bridge-worker: {sanitize_error(exc)}", file=sys.stderr)
+        print(f"korvid-bridge-worker: {sanitize_error(exc, environment)}", file=sys.stderr)
         return EXIT_SYSTEMIC_FAILURE
     except Exception as exc:  # noqa: BLE001 - a systemic failure must never be graded
-        print(f"korvid-bridge-worker: {sanitize_error(exc)}", file=sys.stderr)
+        print(f"korvid-bridge-worker: {sanitize_error(exc, environment)}", file=sys.stderr)
         return EXIT_SYSTEMIC_FAILURE
 
     try:
         write_response(args.response, payload)
     except WorkerConfigurationError as exc:
-        print(f"korvid-bridge-worker: {sanitize_error(exc)}", file=sys.stderr)
+        print(f"korvid-bridge-worker: {sanitize_error(exc, environment)}", file=sys.stderr)
         return EXIT_SYSTEMIC_FAILURE
     return 0
 

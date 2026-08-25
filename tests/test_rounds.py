@@ -183,6 +183,37 @@ def test_round_cli_writes_safe_package_and_prints_markdown_path_only(tmp_path: P
     assert "raw answer" not in (safe_output / "round-summary.md").read_text(encoding="utf-8")
 
 
+def test_round_cli_writes_campaign_action_id_to_round_summary(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    artifact_root = write_live_fixture(tmp_path, include_optimization=True, include_best_candidate=True)
+    safe_output = tmp_path / "safe-evidence"
+
+    exit_code = main(
+        [
+            "--artifact-root",
+            str(artifact_root),
+            "--safe-output",
+            str(safe_output),
+            "--prompt-lab-revision",
+            "1234567",
+            "--korvid-revision",
+            "89abcde",
+            "--workflow-run-url",
+            "https://github.example/actions/runs/42",
+            "--campaign-action-id",
+            "my-action-1",
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert captured.err == ""
+    payload = json.loads((safe_output / "round-summary.json").read_text(encoding="utf-8"))
+    assert payload["campaign_action_id"] == "my-action-1"
+
+
 def test_round_cli_accepts_a_separate_optimize_artifact_root(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -443,6 +474,45 @@ def test_safe_round_summary_json_publishes_the_full_result_contract(
     )
     for forbidden in ("raw answer", "SECRET REQUEST PROMPT", "request.json"):
         assert forbidden not in written
+
+
+def test_safe_round_summary_json_includes_campaign_action_id_when_supplied(
+    tmp_path: Path,
+) -> None:
+    artifact_root = write_realistic_live_fixture(tmp_path)
+    safe_output = tmp_path / "safe-with-action"
+
+    write_safe_evidence(
+        artifact_root,
+        safe_output,
+        prompt_lab_revision="0" * 40,
+        korvid_revision="1" * 40,
+        workflow_run_url="https://github.example/actions/runs/42",
+        campaign_action_id="my-action-1",
+    )
+
+    payload = json.loads((safe_output / "round-summary.json").read_text(encoding="utf-8"))
+
+    assert payload["campaign_action_id"] == "my-action-1"
+
+
+def test_safe_round_summary_json_omits_campaign_action_id_by_default(
+    tmp_path: Path,
+) -> None:
+    artifact_root = write_realistic_live_fixture(tmp_path)
+    safe_output = tmp_path / "safe-without-action"
+
+    write_safe_evidence(
+        artifact_root,
+        safe_output,
+        prompt_lab_revision="0" * 40,
+        korvid_revision="1" * 40,
+        workflow_run_url="https://github.example/actions/runs/42",
+    )
+
+    payload = json.loads((safe_output / "round-summary.json").read_text(encoding="utf-8"))
+
+    assert "campaign_action_id" not in payload
 
 
 def response(

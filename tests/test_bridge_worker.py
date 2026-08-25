@@ -12,6 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from korvid_prompt_lab import bridge_worker
 from korvid_prompt_lab.bridge_worker import (
     EXECUTION_MODE_LIVE,
     EXECUTION_MODE_SCRIPTED,
@@ -35,6 +36,7 @@ from korvid_prompt_lab.bridge_worker import (
     resolve_execution_mode,
     run_bridge,
     sanitize_error,
+    sanitize_import_error,
     select_journey,
     write_response,
 )
@@ -580,6 +582,39 @@ def test_sanitize_error_is_bounded() -> None:
     assert len(text) <= 320
 
 
+def test_sanitize_import_error_preserves_safe_module_missing_name_shape() -> None:
+    text = sanitize_import_error(
+        ImportError("cannot import name 'LIFECYCLE_CHECKPOINTS' from 'korvid.evals.operation'"),
+        env={},
+    )
+
+    assert text == "korvid.evals.operation: LIFECYCLE_CHECKPOINTS"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ImportError("cannot import name 'hunter2-secret' from 'korvid.evals.operation'"),
+        AttributeError("module 'korvid.evals.operation' has no attribute 'hunter2-secret'"),
+    ],
+)
+def test_sanitize_import_error_redacts_structured_captures(error: BaseException) -> None:
+    text = sanitize_import_error(error, env={"KORVID_EVAL_API_KEY": "hunter2-secret"})
+
+    assert "hunter2-secret" not in text
+    assert "korvid.evals.operation" in text
+    assert "***" in text
+
+
+def test_sanitize_import_error_redacts_fallback_name_path() -> None:
+    error = ImportError("import failed", name="hunter2-secret")
+
+    text = sanitize_import_error(error, env={"KORVID_EVAL_API_KEY": "hunter2-secret"})
+
+    assert "hunter2-secret" not in text
+    assert "***" in text
+
+
 # --- atomic response write ------------------------------------------------------
 
 
@@ -958,3 +993,40 @@ def test_worker_writes_a_model_failure_response_when_a_started_turn_times_out(
     assert response["status"] == "model_failure"
     assert response["execution_mode"] == "live"
     assert response["grade"] is None
+
+
+def test_worker_check_imports_reports_missing_name_without_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        bridge_worker,
+        "_import_korvid",
+        lambda: (_ for _ in ()).throw(
+            ImportError("cannot import name 'LIFECYCLE_CHECKPOINTS' from 'korvid.evals.operation'")
+        ),
+    )
+
+    assert bridge_worker.main(["--check-imports"]) == bridge_worker.EXIT_SYSTEMIC_FAILURE
+    captured = capsys.readouterr()
+    assert "korvid.evals.operation" in captured.err
+    assert "LIFECYCLE_CHECKPOINTS" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_worker_check_imports_redacts_configured_secret_values(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        bridge_worker,
+        "_import_korvid",
+        lambda: (_ for _ in ()).throw(
+            ImportError("cannot import name 'hunter2-secret' from 'korvid.evals.operation'")
+        ),
+    )
+    monkeypatch.setenv("KORVID_EVAL_API_KEY", "hunter2-secret")
+
+    assert bridge_worker.main(["--check-imports"]) == bridge_worker.EXIT_SYSTEMIC_FAILURE
+    captured = capsys.readouterr()
+    assert "hunter2-secret" not in captured.err
+    assert "korvid.evals.operation" in captured.err
+    assert "***" in captured.err

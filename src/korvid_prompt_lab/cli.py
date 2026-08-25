@@ -226,7 +226,11 @@ def command_evaluate(args: argparse.Namespace) -> int:
     try:
         candidate, campaign = _load_candidate_campaign(args.candidate, args.campaign)
         selected_cases = _select_cases(campaign.cases, args.case_ids)
-        case_sets = _resolve_case_sets(args, [case.case_id for case in selected_cases])
+        case_sets = _resolve_case_sets(
+            args,
+            [case.case_id for case in selected_cases],
+            [case.case_id for case in campaign.cases],
+        )
     except (OSError, ValueError) as exc:
         print(f"evaluation failed: {exc}", file=_stderr())
         return 2
@@ -491,7 +495,9 @@ def _require_non_negative_seed(seed: int) -> int:
 
 
 def _resolve_case_sets(
-    args: argparse.Namespace, evaluated_case_ids: Sequence[str]
+    args: argparse.Namespace,
+    evaluated_case_ids: Sequence[str],
+    campaign_case_ids: Sequence[str],
 ) -> dict[str, list[str]]:
     train_case_ids = _require_case_selection("--train-case-id", args.train_case_ids)
     validation_case_ids = _require_case_selection(
@@ -500,16 +506,17 @@ def _resolve_case_sets(
     _require_disjoint_case_selections(train_case_ids, validation_case_ids)
     milestone_case_ids = list(dict.fromkeys(args.milestone_case_ids))
 
-    evaluated = set(evaluated_case_ids)
+    del evaluated_case_ids
+    campaign = set(campaign_case_ids)
     for label, case_ids in (
         ("train", train_case_ids),
         ("validation", validation_case_ids),
         ("milestone", milestone_case_ids),
     ):
-        missing = [case_id for case_id in case_ids if case_id not in evaluated]
+        missing = [case_id for case_id in case_ids if case_id not in campaign]
         if missing:
             raise ValueError(
-                f"{label} case set must be drawn from the evaluated cases: {', '.join(missing)}"
+                f"{label} case set must be drawn from the campaign cases: {', '.join(missing)}"
             )
 
     return {

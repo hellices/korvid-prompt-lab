@@ -1,61 +1,136 @@
 # Task 6 Report
 
 ## Status
-DONE
+
+DONE — implemented, review-fixed, and locally verified. Live dispatch remains Task 7.
 
 ## Files
+
+- `.github/workflows/optimization-campaign.yml`
+- `tests/test_optimization_campaign_workflow.py`
 - `README.md`
-- `.gitignore`
-- `src/korvid_prompt_lab/cli.py`
-- `src/korvid_prompt_lab/config.py`
-- `src/korvid_prompt_lab/publish.py`
-- `src/korvid_prompt_lab/runner.py`
-- `src/korvid_prompt_lab/aks.py`
-- `src/korvid_prompt_lab/contracts.py`
-- `src/korvid_prompt_lab/optimize.py`
-- `src/korvid_prompt_lab/reflection.py`
-- `tests/test_cli.py`
-- `tests/test_publish.py`
-- `tests/test_aks.py`
-- `tests/test_contracts.py`
-- `tests/test_optimize.py`
-- `tests/test_reflection.py`
-- `tests/test_runner.py`
 - `.superpowers/sdd/task-6-report.md`
 
-## RED-GREEN
-- RED: `uv run --python 3.12 pytest tests/test_cli.py -q`
-  - Failed with `ModuleNotFoundError: No module named 'korvid_prompt_lab.cli'`.
-- GREEN: `uv run --python 3.12 pytest tests/test_cli.py -q`
-  - Passed after introducing the CLI commands and initial operator docs.
-- REVIEW RED: `uv run --python 3.12 pytest tests/test_cli.py -q`
-  - Failed on partial model-specific milestone gating and summary/candidate mismatch publication regressions.
-- REVIEW GREEN: `uv run --python 3.12 pytest tests/test_cli.py tests/test_publish.py -q`
-  - Passed after adding summary provenance, case-model coverage, target-model score handling, campaign-scoped strongest-baseline selection, and stricter common/model-specific publish validation.
+## RED / GREEN
 
-## Tests
-- `uv run --python 3.12 pytest tests/test_cli.py -q`
-- `uv run --python 3.12 pytest -q`
-- `uv run --python 3.12 ruff check .`
-- `uv run --python 3.12 mypy src tests`
-- `uv run --python 3.12 korvid-prompt-lab validate --candidate examples/candidates/shipped-small.yaml --campaign examples/campaigns/local-smoke.yaml`
+- RED: `uv run --python 3.12 pytest tests/test_optimization_campaign_workflow.py -q`
+  - `10 failed`: the workflow did not exist.
+- GREEN: the same command passed after adding exact trigger, permissions, trust,
+  artifact, cleanup, and dispatch structure.
+- Regression RED: the continuation preflight test exposed that downloading into
+  `CAMPAIGN_ROOT/prior` creates the parent before state preparation.
+- Regression GREEN: preparation now permits that fixed parent and rejects
+  pre-existing state/candidate files.
+- Regression RED: upstream `upload-artifact@v4.6.2` validation proved that the
+  canonical `sha256:<hex>` state hash contains an invalid artifact-name colon.
+- Regression GREEN: artifact names use the reversible `sha256-<hex>` form while
+  state content and continuation inputs retain exact canonical hashes.
+- RED: the README contract failed because bounded campaign semantics were absent.
+- GREEN: the documented canary, statuses, budgets, stops, tier isolation, and
+  approval gate all pass.
+- Regression RED: review found a successor could inspect its predecessor before
+  the predecessor had reached a successful conclusion.
+- Regression GREEN: repository-wide dispatch serialization now holds the
+  successor until the predecessor finishes; the expensive job also retains the
+  immutable validated campaign-ID concurrency group.
 
-## Results
-- Focused CLI suite: `19 passed`
-- Full test suite: `109 passed`
-- Ruff: `All checks passed!`
-- Mypy: `Success: no issues found in 22 source files`
-- CLI validate smoke: passed for `examples/candidates/shipped-small.yaml` + `examples/campaigns/local-smoke.yaml`
+## Invariants
+
+### Permissions and trust
+
+- Workflow permissions are exactly `actions: write`, `contents: read`, and
+  `id-token: write`.
+- Input shapes and continuation half-pairs are rejected before checkout.
+- Prompt Lab and Korvid SHAs are proven against authoritative history before
+  privileged credentials; exact-SHA checkouts disable persisted credentials.
+- Prior runs must be positive safe integers, successful `workflow_dispatch` runs
+  of this workflow, on this repository's default branch.
+- The protected `aks-grounding` environment remains on the expensive job, and
+  Korvid import preflight precedes Azure OIDC and reflection credentials.
+
+### Idempotency and artifacts
+
+- Validated manifest content produces the campaign ID and SHA-256 identity used
+  by concurrency and continuation verification.
+- Continuations download one exact artifact by repository, run ID, campaign ID,
+  and state-hash name.
+- State hash, embedded hash, campaign ID, revisions, manifest identity, package
+  allowlist, symlinks, and champion candidate fingerprint are checked before the
+  wrapper plans.
+- One wrapper invocation performs one action and one CAS advance.
+- Upload contains only `safe-campaign/` and `safe-round/`; raw evidence paths are
+  rejected. The exact generated `campaign-summary.md` is appended.
+
+### Dispatch and publication
+
+- Dispatch uses `GH_TOKEN` from `github.token`; no token appears in argv or the
+  shell body and no GitHub App private key is used for dispatch.
+- Dispatch occurs only for lowercase controller status `running`, after upload
+  and cleanup success, and passes the same manifest/revisions plus current run
+  ID and exact new state hash.
+- `qualified`, `not_converged`, and `system_error` cannot dispatch.
+- There is no publication step or write permission.
+
+### Cleanup
+
+- `if: always()` restores `modeleval` only when this run observed an original
+  count of zero; pre-owned capacity is untouched.
+- ARC verification reads only the dedicated scale set, allows the active runner,
+  fails on stale terminal/deleting runner pods, and performs no delete/kill.
+
+## Exact verification commands
+
+```text
+uv run --python 3.12 pytest tests/test_optimization_campaign_workflow.py tests/test_grounding_workflow.py tests/test_optimization_campaign_script.py -q
+# 94 passed
+
+uv run --python 3.12 python - <<'PY'
+# Parsed workflow, bash -n checked every run block, compiled four embedded Python blocks.
+PY
+# workflow syntax valid: shell blocks and 4 embedded Python blocks
+
+git diff --check
+# clean
+```
 
 ## Self-review
-- Verified `validate`, `evaluate`, `optimize`, `aks-check`, and `publish` all route through the reviewed loaders, runner, optimizer, AKS preflight, and publication code.
-- Verified `evaluate` now emits candidate/campaign provenance, model coverage, case-model coverage, and per-model scores needed for safe publication decisions.
-- Verified `publish` preserves the common-first, safety-gated override policy, scopes common baselines to the matching campaign, and compares model-specific promotion against the strongest matching common baseline for the same target model.
-- Verified published evaluation artifacts retain the provenance fields needed to re-check registry inputs later.
-- Verified operator documentation now covers `uv` installation, bridge schema, fake smoke runs, AKS setup, safety semantics, promotion rules, model matrix, artifacts, and non-goals.
 
-## Hash
-- Final commit hash is recorded after commit in the CLI response because embedding the final self-referential commit hash in this tracked report would change `HEAD`.
+- Traced initial and continuation data flow from immutable input through trusted
+  checkout, manifest resolution, state preparation, one wrapper call, safe
+  packaging, upload, cleanup, and dispatch.
+- Checked terminal exit behavior: qualification succeeds without continuation;
+  non-convergence returns 1; system/persistence failures return 70.
+- Checked queued continuation timing and added whole-run serialization so the
+  trusted prior-run success check cannot race its predecessor.
+- Confirmed all third-party actions are exact 40-hex pins and tests parse YAML
+  jobs, steps, `with`, `env`, ordering, conditions, permissions, and paths
+  structurally rather than accepting a decoy substring.
 
 ## Concerns
-- Pre-existing untracked `uv.lock` remains outside the task scope and was not modified.
+
+- GitHub forbids `:` in artifact names, so the name uses `sha256-<hex>` while
+  state JSON and workflow inputs keep canonical `sha256:<hex>`.
+- Whole-run dispatch serialization is intentionally repository-wide to close
+  predecessor-completion races; the expensive job is additionally serialized by
+  validated campaign ID.
+- No live workflow was dispatched in Task 6. Task 7 must validate environment
+  approval, external APIs, artifact transfer, ARC observation, and self-dispatch.
+
+## Review fix: prepare-state runtime import
+
+- Verified the finding directly: the `prepare` embedded Python referenced
+  `sys.argv[1]` without importing `sys`. Compilation passed because name
+  resolution occurs only when the block executes.
+- RED:
+  `uv run --python 3.12 pytest tests/test_optimization_campaign_workflow.py::test_prepare_initialization_executes_and_writes_github_output -q`
+  failed with `NameError: name 'sys' is not defined`.
+- GREEN: added `import sys`; the same focused command passed.
+- The regression structurally extracts the exact `campaign.prepare` heredoc from
+  parsed workflow YAML, executes its no-prior-state initialization path with the
+  real campaign loaders and controlled project-local inputs, and verifies all
+  four `GITHUB_OUTPUT` entries plus the created state and candidate files.
+- Review-fix verification:
+  `uv run --python 3.12 pytest tests/test_optimization_campaign_workflow.py tests/test_grounding_workflow.py tests/test_optimization_campaign_script.py -q`
+  passed with `95 passed`.
+- Every workflow shell block passed `bash -n`; all four embedded Python blocks
+  compiled; `git diff --check` was clean.

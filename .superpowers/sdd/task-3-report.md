@@ -1,59 +1,159 @@
-# Task 3 Report
+# Task 3 Report: Deterministic Campaign State Transitions
 
-## Status
-DONE
+## Status: COMPLETE ✅
 
-## Files
-- `src/korvid_prompt_lab/adapter.py`
-- `src/korvid_prompt_lab/reflection.py`
-- `src/korvid_prompt_lab/optimize.py`
-- `tests/test_adapter.py`
-- `tests/test_reflection.py`
-- `tests/test_optimize.py`
-- `.superpowers/sdd/task-3-report.md`
+## Commits
+- `ee923fc` — feat(campaigns): add bounded campaign state machine
 
-## Confirmed external APIs
-- `uv run --python 3.12 python` confirmed `gepa.optimize(...)` is installed and accepts `adapter`, `seed_candidate`, `trainset`, `valset`, `custom_candidate_proposer`, `max_metric_calls`, and `run_dir`.
-- `uv run --python 3.12 python` confirmed `dspy` 3.3.0 exposes `Signature`, `Predict`, `InputField`, and `OutputField`.
-- Implementation uses `KorvidProcessRunner.run(...)` for runtime execution and reserves DSPy for proposal generation only.
+## Files Modified
+- `src/korvid_prompt_lab/campaigns.py` — Added state machine types and functions
+- `tests/test_campaign_state.py` — 17 focused tests (new file)
 
-## Commands and results
-- `uv run --python 3.12 pytest tests/test_adapter.py tests/test_reflection.py tests/test_optimize.py -q`
-  - RED: failed with `ModuleNotFoundError` for `korvid_prompt_lab.adapter`, `korvid_prompt_lab.reflection`, and `korvid_prompt_lab.optimize`.
-- `uv run --python 3.12 pytest tests/test_adapter.py tests/test_reflection.py tests/test_optimize.py -q`
-  - GREEN: `8 passed in 2.63s`
-- `uv run --python 3.12 pytest -q`
-  - GREEN: `65 passed in 4.57s`
+## RED/GREEN Evidence
 
-## Implementation summary
-- Added `KorvidGEPAAdapter.evaluate(...)` to materialize strict candidates from component maps, invoke the real process runner once per case, derive GEPA scores through existing scoring rules, and emit safe typed traces only when requested.
-- Added `KorvidGEPAAdapter.make_reflective_dataset(...)` to serialize compact JSON-safe reflection records containing case identity, answer, checkpoints, tool-call counts, outcome, missing checkpoints, hard failures, and score while excluding raw journal payloads and sensitive tool results.
-- Added a lazy DSPy proposer that builds a `dspy.Predict` instance only on first reflection use, serializes per-component reflection datasets to JSON, and rejects unknown component requests and blank rewritten text.
-- Added `optimize_campaign(...)` orchestration that wires the adapter into `gepa.optimize`, optionally attaches the DSPy proposer, persists the best strict candidate YAML, and writes an optimization summary JSON.
+**RED phase:** Tests initially failed with `ImportError` for missing `CampaignStatus`, `ActionKind`, etc.
 
-## Self-review
-- Verified unsafe bridge results score `0.0`, retain hard-failure feedback for reflection, and never leak raw tool outputs or audit payloads into reflection datasets.
-- Verified systemic runner failures still raise their typed exceptions instead of being flattened into bad-example scores.
-- Verified candidate component maps are copied before validation/evaluation so GEPA-owned dictionaries are not mutated in place.
-- Verified optimization persistence revalidates the best candidate through the strict `Candidate` contract before writing YAML.
+**GREEN phase:**
+```
+$ uv run --python 3.12 pytest tests/test_campaign_state.py tests/test_campaigns.py -q
+54 passed in 0.26s
 
-## Commit
-- `7b65272` — `feat: add GEPA optimization adapter` (with required Co-authored-by trailer).
+$ uv run --python 3.12 ruff check src/korvid_prompt_lab/campaigns.py tests/test_campaign_state.py
+All checks passed!
+
+$ uv run --python 3.12 mypy src/korvid_prompt_lab/campaigns.py
+Success: no issues found in 1 source file
+```
+
+## State Invariants
+1. `state_hash(state)` is deterministic SHA-256 over sorted-key compact JSON
+2. `advance_state` rejects any action whose `expected_state_hash` doesn't match current state
+3. SYSTEM_ERROR increments `retries_used` and `elapsed_seconds` only; never `metric_calls_used`
+4. Promotion requires: different fingerprint, no hard-safety regression, no core regression, strictly better rank
+5. Tie-break is full lexicographic fingerprint comparison (embedded in rank key tuple)
+6. Milestone/confirmation evidence does not affect GEPA candidate ranking
+7. Confirmation failure → NOT_CONVERGED (never publishes)
+8. Terminal states: QUALIFIED, NOT_CONVERGED, SYSTEM_ERROR — `next_action` returns None
+
+## Self-Review
+- All brief requirements implemented
+- Immutable frozen+slotted dataclasses throughout
+- No network/filesystem/GitHub side effects in state machine
 
 ## Concerns
-- None.
+- Multi-tier re-entry (creating fresh state for tier 1+) left to orchestrator layer
+- `confirmation_runs > 1` not explicitly iterated in tests
 
-## Task 3 regression fix
-- Fixed `KorvidGEPAAdapter.evaluate(...)` so any unsafe case zeros the entire returned `scores` vector, while preserving one output and one trajectory per input case.
-- Regression test added: `test_adapter_zeroes_all_scores_when_any_case_is_unsafe`.
+---
 
-## Verification
-- `uv run --python 3.12 pytest tests/test_adapter.py -q -k 'zeroes_all_scores_when_any_case_is_unsafe'`
-  - PASS: `1 passed, 3 deselected in 0.38s`
-- `uv run --python 3.12 pytest tests/test_adapter.py tests/test_reflection.py tests/test_optimize.py -q`
-  - PASS: `9 passed in 3.42s`
-- `uv run --python 3.12 pytest -q`
-  - PASS: `66 passed in 3.00s`
+## Review Fix (2026-08-26)
 
-## Fix commit
-- `648705bb6b9417a54bc0d035ba629981da7afe24` — `fix: zero unsafe batch scores`
+### Status: DONE
+
+### Commit
+- `65d204c` — fix(campaigns): address review findings for state machine
+
+### Findings Addressed
+1. **Action validation**: `_validate_action()` verifies action_id, kind, tier/stage/seed cursors, metric_calls against `next_action()` output. Forged/replayed actions raise ValueError.
+2. **confirmation_runs>1**: Loop until `confirmations_passed >= control.confirmation_runs`. Tested with confirmation_runs=2.
+3. **Tier rollover**: Non-final tier qualification resets champion, stage/seed, stagnation, retries, milestone/confirmation to initial. Preserves metric_calls_used, elapsed. Records TierResult.
+4. **CONFIG_ERROR**: Terminates as SYSTEM_ERROR with `stop_reason="config_error: ..."`.
+5. **Equal-score no-promote**: `_is_strictly_better()` uses core dimensions only (no fingerprint). Equal scores → stagnation.
+6. **metric_calls accounting**: Uses `action.metric_calls` (from stage definition), not +1. Tested exact increments.
+7. **Wall-clock crossing on SYSTEM_ERROR**: Checked in system_error branch → terminal SYSTEM_ERROR.
+8. **Tests replaced**: Removed equal-score promotion test, added forged-kind/id/cursor, stale replay, confirmation_runs=2, tier rollover, config_error, exact metric increments, wall-clock-crossing system error.
+
+### RED/GREEN Evidence
+```
+$ uv run --python 3.12 pytest tests/test_campaign_state.py tests/test_campaigns.py -q
+62 passed in 0.21s
+
+$ uv run --python 3.12 ruff check src/korvid_prompt_lab/campaigns.py tests/test_campaign_state.py
+All checks passed!
+
+$ uv run --python 3.12 mypy src/korvid_prompt_lab/campaigns.py
+Success: no issues found in 1 source file
+```
+
+### Self-Review
+- All 8 findings resolved with test coverage
+- Pure function boundary maintained (no global state, no side effects)
+- Task 2 manifest APIs preserved (OptimizationCampaign, SearchStage, ModelTier, load_optimization_campaign unchanged)
+- Immutable frozen+slotted dataclasses throughout
+
+### Concerns
+- None blocking. Milestone/confirm metric_calls set to 0 (free operations per the action's declared accounting contract). If the orchestrator needs non-zero cost for these, the action.metric_calls field is ready.
+
+---
+
+## Review Fix Wave 2 (2026-08-26)
+
+### Status: DONE
+
+### Commit
+- `f416c32` — fix(campaigns): correct qualification gate, tier rollover, and budget semantics
+
+### Corrected Semantics
+1. **Qualification/tier**: Success on ANY tier → campaign QUALIFIED. Never rolls to larger model after success.
+2. **Qualification gate**: `_passes_qualification_gate()` requires `hard_safety_failures=0`, `core_regression=False`, `pass_at_3=1.0`, `pass_at_5=1.0`. Milestone only sets `milestone_passed=True` when gate passes.
+3. **Tier exhaustion**: Milestone fail or confirmation fail → `_handle_tier_failure()` records `TierResult(NOT_CONVERGED)`, rolls to next tier (fresh champion/stage/seed/stagnation/retry/milestone/confirm), preserves campaign-wide metric_calls/elapsed. Final tier → campaign NOT_CONVERGED.
+4. **Budget accounting**: Uniform `new_metric_calls = state.metric_calls_used + action.metric_calls` before status check for ALL evidence kinds. Milestone/confirm with `metric_calls=0` add zero. Budget exceeded during milestone/confirm → NOT_CONVERGED.
+5. **Replay semantics**: Pure deterministic `_validate_action` with CAS on `expected_state_hash`. No global mutable state. Test named `test_stale_action_replay_against_advanced_state` — two workers compute same transition, only one persisted state hash matches.
+6. **New tests**: `test_milestone_gate_pass_at_3_failure_rejects`, `test_milestone_gate_hard_safety_rejects`, `test_qualification_tier0_success_qualifies_campaign`, `test_confirmation_failure_rolls_to_next_tier`, `test_milestone_failure_rolls_to_next_tier`, `test_final_tier_failure_not_converged`, `test_milestone_confirm_metric_accounting_uniform`, `test_wall_clock_crossing_during_milestone_terminates`, `test_wall_clock_crossing_during_confirm_terminates`.
+
+### RED/GREEN Evidence
+```
+$ uv run --python 3.12 pytest tests/test_campaign_state.py tests/test_campaigns.py -q
+67 passed in 0.19s
+
+$ uv run --python 3.12 ruff check src/korvid_prompt_lab/campaigns.py tests/test_campaign_state.py
+All checks passed!
+
+$ uv run --python 3.12 mypy src/korvid_prompt_lab/campaigns.py
+Success: no issues found in 1 source file
+```
+
+### Self-Review
+- All 6 review findings addressed with exact test coverage
+- Pure function boundary preserved — no global state, no side effects
+- Task 2 manifest APIs unchanged (OptimizationCampaign/SearchStage/ModelTier/load_optimization_campaign)
+- Tier rollover resets all tier-local state while preserving campaign-wide budget/time
+
+### Concerns
+- None blocking.
+
+---
+
+## Review Fix Wave 3 (2026-08-26)
+
+### Status: DONE
+
+### Commit
+- `62d92d6` — fix(campaigns): add systemic_failures, evidence binding, stagnation rollover, model identity
+
+### Changes
+1. **systemic_failures**: New validated non-negative int field on CampaignScore. `__post_init__` rejects bool/negative. `_is_strictly_better()` blocks promotion when systemic>0. `_passes_qualification_gate()` requires systemic==0.
+2. **Evidence fingerprint binding**: MILESTONE/CONFIRM `advance_state` raises ValueError if `outcome.score.fingerprint != state.champion_fingerprint`. Fail-closed, can never set milestone_passed/QUALIFIED.
+3. **Stagnation rollover**: Stagnation at limit uses `_handle_tier_exhaustion()` (same helper as milestone/confirm failure). Non-final tier records TierResult(NOT_CONVERGED) and rolls; final tier ends campaign NOT_CONVERGED.
+4. **ModelIdentity**: New frozen dataclass (name/model/digest). `initial_state` derives from `control.model_tiers[0]`. Rollover replaces from next tier. Included in state_hash. `_validate_model_identity` called in `next_action`/`_validate_action` — tampered identity raises ValueError.
+5. **Tests**: 34 state-machine tests covering all new behaviors.
+
+### RED/GREEN Evidence
+```
+$ uv run --python 3.12 pytest tests/test_campaign_state.py tests/test_campaigns.py -q
+71 passed in 0.50s
+
+$ uv run --python 3.12 ruff check src/korvid_prompt_lab/campaigns.py tests/test_campaign_state.py
+All checks passed!
+
+$ uv run --python 3.12 mypy src/korvid_prompt_lab/campaigns.py
+Success: no issues found in 1 source file
+```
+
+### Self-Review
+- All 5 findings resolved with exact test coverage
+- Pure function boundary preserved
+- Task 2 manifest APIs unchanged
+
+### Concerns
+- None blocking.
