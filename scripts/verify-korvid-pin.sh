@@ -131,20 +131,42 @@ checks.setdefault(module_to_path["tests.evals.operation_app"], set()).add(
 )
 
 provenance = values["APPROVED_KORVID_PROVENANCE"]
-summary = (
-    values["KORVID_REPOSITORY"]
-    + "@"
-    + values["APPROVED_KORVID_SHA"]
-    + " (default branch "
-    + values["KORVID_DEFAULT_BRANCH"]
-    + "; compare vs "
-    + values["KORVID_DEFAULT_BRANCH"]
-    + ": "
-    + provenance["default_branch_compare_status"]
-    + "; verified "
-    + provenance["verified_on"]
-    + ")"
-)
+if provenance["kind"] == values["PROVENANCE_OPEN_PULL_REQUEST"]:
+    summary = (
+        values["KORVID_REPOSITORY"]
+        + "@"
+        + values["APPROVED_KORVID_SHA"]
+        + " (open PR #"
+        + str(provenance["pull_request"])
+        + " "
+        + provenance["branch"]
+        + " -> "
+        + provenance["base_branch"]
+        + "; compare vs "
+        + values["KORVID_DEFAULT_BRANCH"]
+        + ": "
+        + provenance["default_branch_compare_status"]
+        + "; PR head compare: "
+        + provenance["head_compare_status"]
+        + "; verified "
+        + provenance["verified_on"]
+        + ")"
+    )
+else:
+    summary = (
+        values["KORVID_REPOSITORY"]
+        + "@"
+        + values["APPROVED_KORVID_SHA"]
+        + " (default branch "
+        + values["KORVID_DEFAULT_BRANCH"]
+        + "; compare vs "
+        + values["KORVID_DEFAULT_BRANCH"]
+        + ": "
+        + provenance["default_branch_compare_status"]
+        + "; verified "
+        + provenance["verified_on"]
+        + ")"
+    )
 
 if field == "sha":
     print(values["APPROVED_KORVID_SHA"])
@@ -153,6 +175,10 @@ elif field == "repository":
 elif field == "default_branch":
     print(values["KORVID_DEFAULT_BRANCH"])
 elif field == "pull_request":
+    if provenance["kind"] != values["PROVENANCE_OPEN_PULL_REQUEST"]:
+        raise SystemExit("pull_request is only defined for open-pull-request provenance")
+    if provenance.get("pull_request") is None:
+        raise SystemExit("open-pull-request provenance is missing pull_request")
     print(provenance["pull_request"])
 elif field == "paths":
     print("\n".join(paths))
@@ -212,7 +238,6 @@ fetch_raw() {
 KORVID_SHA="$(pin_field sha)"
 KORVID_REPO="$(pin_field repository)"
 DEFAULT_BRANCH="$(pin_field default_branch)"
-DECLARED_PR="$(pin_field pull_request)"
 
 echo "Verifying $(pin_field summary)"
 echo
@@ -249,8 +274,9 @@ else
     echo "provenance: compare ${KORVID_SHA}...${pr_head} (PR #${pr_number}) => ${pr_status:-unresolvable}"
     if [[ "$pr_status" == "identical" || "$pr_status" == "ahead" ]]; then
       provenance_route="open pull request #${pr_number} (head ${pr_head})"
-      if [[ "$pr_number" != "$DECLARED_PR" ]]; then
-        echo "note: the pin declares PR #${DECLARED_PR} but PR #${pr_number} vouches for it now;" \
+      declared_pr="$(pin_field pull_request)"
+      if [[ "$pr_number" != "$declared_pr" ]]; then
+        echo "note: the pin declares PR #${declared_pr} but PR #${pr_number} vouches for it now;" \
              "update korvid_pin.APPROVED_KORVID_PROVENANCE" >&2
       fi
       break

@@ -527,18 +527,35 @@ def sanitize_error(error: BaseException | str, env: Mapping[str, str] | None = N
     return text or "unspecified bridge failure"
 
 
+def _sanitize_text_fragment(text: str, env: Mapping[str, str] | None = None) -> str:
+    environment = os.environ if env is None else env
+    sanitized = _CREDENTIAL_PHRASE.sub("[redacted-credential]", text)
+    for name in SENSITIVE_ENV_NAMES:
+        secret = environment.get(name, "")
+        if secret and secret.strip():
+            sanitized = sanitized.replace(secret, "***")
+    sanitized = " ".join(sanitized.split())
+    if len(sanitized) > MAX_ERROR_CHARS:
+        sanitized = f"{sanitized[:MAX_ERROR_CHARS]} [truncated]"
+    return sanitized or "[redacted-credential]"
+
+
 def sanitize_import_error(error: BaseException, env: Mapping[str, str] | None = None) -> str:
     """Return a bounded import/symbol-resolution error without paths or secrets."""
     text = sanitize_error(error, env)
 
     if match := _CANNOT_IMPORT_NAME.search(str(error)):
-        return f"{match.group(2)}: {match.group(1)}"
+        module = _sanitize_text_fragment(match.group(2), env)
+        name = _sanitize_text_fragment(match.group(1), env)
+        return f"{module}: {name}"
     if match := _MISSING_MODULE_ATTRIBUTE.search(str(error)):
-        return f"{match.group(1)}: {match.group(2)}"
+        module = _sanitize_text_fragment(match.group(1), env)
+        name = _sanitize_text_fragment(match.group(2), env)
+        return f"{module}: {name}"
     if isinstance(error, ModuleNotFoundError) and error.name:
-        return error.name
+        return _sanitize_text_fragment(error.name, env)
     if isinstance(error, ImportError) and error.name:
-        return error.name
+        return _sanitize_text_fragment(error.name, env)
     return text
 
 
@@ -802,15 +819,13 @@ def run_bridge(
     )
 
 
-def check_korvid_imports() -> int:
+def check_korvid_imports(*, env: Mapping[str, str] | None = None) -> int:
     """Exit zero only when every runtime symbol resolves inside the Korvid checkout."""
+    environment = os.environ if env is None else env
     try:
         _import_korvid()
     except (ImportError, AttributeError) as exc:
-        print(f"korvid import failed: {sanitize_import_error(exc)}", file=sys.stderr)
-        return EXIT_SYSTEMIC_FAILURE
-    except WorkerConfigurationError as exc:
-        print(str(exc), file=sys.stderr)
+        print(f"korvid import failed: {sanitize_import_error(exc, environment)}", file=sys.stderr)
         return EXIT_SYSTEMIC_FAILURE
     print("korvid runtime imports: OK")
     return 0
@@ -853,6 +868,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    environment = dict(os.environ)
     args = build_parser().parse_args(argv)
     if args.check_imports:
         if args.request is not None or args.response is not None:
@@ -861,7 +877,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return EXIT_SYSTEMIC_FAILURE
-        return check_korvid_imports()
+        return check_korvid_imports(env=environment)
     if args.request is None or args.response is None:
         print(
             "korvid-bridge-worker: --request and --response are required unless --check-imports is used",
@@ -885,23 +901,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except WorkerModelFailure as exc:
         if request is None or execution_mode is None:  # pragma: no cover - defensive; the model cannot fail before parsing
-            print(f"korvid-bridge-worker: {sanitize_error(exc)}", file=sys.stderr)
+            print(f"korvid-bridge-worker: {sanitize_error(exc, environment)}", file=sys.stderr)
             return EXIT_SYSTEMIC_FAILURE
         payload = build_model_failure_response(request, exc, execution_mode=execution_mode)
     except (ImportError, AttributeError) as exc:
-        print(f"korvid-bridge-worker: korvid import failed: {sanitize_import_error(exc)}", file=sys.stderr)
+        print(
+            f"korvid-bridge-worker: korvid import failed: {sanitize_import_error(exc, environment)}",
+            file=sys.stderr,
+        )
         return EXIT_SYSTEMIC_FAILURE
     except WorkerConfigurationError as exc:
-        print(f"korvid-bridge-worker: {sanitize_error(exc)}", file=sys.stderr)
+        print(f"korvid-bridge-worker: {sanitize_error(exc, environment)}", file=sys.stderr)
         return EXIT_SYSTEMIC_FAILURE
     except Exception as exc:  # noqa: BLE001 - a systemic failure must never be graded
-        print(f"korvid-bridge-worker: {sanitize_error(exc)}", file=sys.stderr)
+        print(f"korvid-bridge-worker: {sanitize_error(exc, environment)}", file=sys.stderr)
         return EXIT_SYSTEMIC_FAILURE
 
     try:
         write_response(args.response, payload)
     except WorkerConfigurationError as exc:
-        print(f"korvid-bridge-worker: {sanitize_error(exc)}", file=sys.stderr)
+        print(f"korvid-bridge-worker: {sanitize_error(exc, environment)}", file=sys.stderr)
         return EXIT_SYSTEMIC_FAILURE
     return 0
 

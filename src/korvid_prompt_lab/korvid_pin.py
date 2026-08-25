@@ -59,26 +59,68 @@ class KorvidProvenance:
     ``compare/<sha>...<default_branch>`` status when the snapshot was taken.
     """
 
-    #: Acceptance route: containment in an open same-repository pull request head.
+    #: Acceptance route the trust gate applies.
     kind: str
-    #: Pull request in :data:`KORVID_REPOSITORY` that vouches for the pin.
-    pull_request: int
+    #: Pull request in :data:`KORVID_REPOSITORY` that vouches for the pin when the
+    #: provenance route is :data:`PROVENANCE_OPEN_PULL_REQUEST`.
+    pull_request: int | None
     #: Head branch of that pull request.
-    branch: str
+    branch: str | None
     #: Base branch of that pull request — must be the default branch.
-    base_branch: str
+    base_branch: str | None
     #: Head repository of that pull request — must be the authoritative repo, not a fork.
-    head_repository: str
-    #: Head commit of that pull request when the snapshot was taken.  It advances
+    head_repository: str | None
+    #: Head commit of that pull request when the snapshot was taken. It advances
     #: as the pull request does — the tests only replay it, and
     #: ``scripts/verify-korvid-pin.sh`` re-derives the live head.
-    head_sha: str
+    head_sha: str | None
     #: ``compare/<APPROVED_KORVID_SHA>...<head_sha>`` status when the snapshot was taken.
-    head_compare_status: str
+    head_compare_status: str | None
     #: ``compare/<APPROVED_KORVID_SHA>...<default_branch>`` status when the snapshot was taken.
     default_branch_compare_status: str
     #: UTC date the facts above were read from the GitHub API.
     verified_on: str
+
+    def __post_init__(self) -> None:
+        if self.kind == PROVENANCE_DEFAULT_BRANCH:
+            if self.default_branch_compare_status not in {"identical", "ahead"}:
+                raise ValueError(
+                    "default-branch provenance requires default_branch_compare_status "
+                    "to be identical or ahead"
+                )
+            extras = {
+                "pull_request": self.pull_request,
+                "branch": self.branch,
+                "base_branch": self.base_branch,
+                "head_repository": self.head_repository,
+                "head_sha": self.head_sha,
+                "head_compare_status": self.head_compare_status,
+            }
+            present = [name for name, value in extras.items() if value is not None]
+            if present:
+                raise ValueError(
+                    "default-branch provenance must not carry pull-request fields: "
+                    + ", ".join(present)
+                )
+            return
+
+        if self.kind == PROVENANCE_OPEN_PULL_REQUEST:
+            required = {
+                "pull_request": self.pull_request,
+                "branch": self.branch,
+                "base_branch": self.base_branch,
+                "head_repository": self.head_repository,
+                "head_sha": self.head_sha,
+                "head_compare_status": self.head_compare_status,
+            }
+            missing = [name for name, value in required.items() if value is None]
+            if missing:
+                raise ValueError(
+                    "pull-request provenance requires: " + ", ".join(missing)
+                )
+            return
+
+        raise ValueError(f"unknown Korvid provenance kind: {self.kind}")
 
 
 #: Acceptance route names the trust gate implements.
@@ -88,12 +130,12 @@ PROVENANCE_OPEN_PULL_REQUEST = "open_pull_request_containment"
 #: Recorded provenance of :data:`APPROVED_KORVID_SHA`.
 APPROVED_KORVID_PROVENANCE = KorvidProvenance(
     kind=PROVENANCE_DEFAULT_BRANCH,
-    pull_request=312,
-    branch=KORVID_DEFAULT_BRANCH,
-    base_branch=KORVID_DEFAULT_BRANCH,
-    head_repository=KORVID_REPOSITORY,
-    head_sha=APPROVED_KORVID_SHA,
-    head_compare_status="identical",
+    pull_request=None,
+    branch=None,
+    base_branch=None,
+    head_repository=None,
+    head_sha=None,
+    head_compare_status=None,
     default_branch_compare_status="identical",
     verified_on="2026-08-26",
 )
@@ -147,6 +189,13 @@ REQUIRED_PATCHABLE_ATTRIBUTE = "build_profile"
 def approved_pin_summary() -> str:
     """One-line human summary of the pin, used by reports and the verify script."""
     provenance = APPROVED_KORVID_PROVENANCE
+    if provenance.kind == PROVENANCE_OPEN_PULL_REQUEST:
+        return (
+            f"{KORVID_REPOSITORY}@{APPROVED_KORVID_SHA} "
+            f"(open PR #{provenance.pull_request} {provenance.branch} -> {provenance.base_branch}; "
+            f"compare vs {KORVID_DEFAULT_BRANCH}: {provenance.default_branch_compare_status}; "
+            f"PR head compare: {provenance.head_compare_status}; verified {provenance.verified_on})"
+        )
     return (
         f"{KORVID_REPOSITORY}@{APPROVED_KORVID_SHA} "
         f"(default branch {KORVID_DEFAULT_BRANCH}; "
