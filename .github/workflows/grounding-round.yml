@@ -239,9 +239,11 @@ jobs:
             fi
           done
 
-          if [[ ! "$MAX_METRIC_CALLS" =~ ^[1-9][0-9]{0,4}$ ]]; then
-            echo "::error::max_metric_calls must be a positive integer"
-            exit 1
+          if [[ "$ROUND_TYPE" == "optimize-evaluate" ]]; then
+            if [[ ! "$MAX_METRIC_CALLS" =~ ^[1-9][0-9]{0,4}$ ]]; then
+              echo "::error::max_metric_calls must be a positive integer for optimization"
+              exit 1
+            fi
           fi
 
           if [[ ! "$SEED" =~ ^[0-9]{1,9}$ ]]; then

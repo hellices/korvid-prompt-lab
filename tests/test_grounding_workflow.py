@@ -1229,6 +1229,7 @@ def test_grounding_workflow_validates_campaign_case_and_budget_inputs_first() ->
     assert "disjoint" in body.lower(), (
         "the train and validation splits must be proven disjoint before cluster time"
     )
+    assert 'if [[ "$ROUND_TYPE" == "optimize-evaluate" ]]' in body
 
 
 def test_grounding_workflow_wires_campaign_cases_and_budget_to_the_orchestrator() -> (
