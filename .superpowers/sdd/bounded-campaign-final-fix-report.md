@@ -333,7 +333,7 @@ proven by a failing-first test.
 
 | Commit | Scope |
 | --- | --- |
-| `WAVE2_SHA` | All four wave 2 findings, tests, README recovery docs, this report |
+| `7339106` | All four wave 2 findings, tests, README recovery docs, this report |
 
 ## Finding 1 (Critical) — `KORVID_AKS_MODEL` was never exported to `attempt`
 
