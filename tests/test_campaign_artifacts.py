@@ -130,7 +130,7 @@ def _candidate_mapping(candidate_id: str = "cand-1") -> dict[str, object]:
 def _write_search_evidence(
     root: Path,
     *,
-    action_id: str = "action-1",
+    campaign_action_id: str = "action-1",
     candidate_id: str = "cand-1",
     candidate_fingerprint: str | None = None,
     best_candidate_mapping: dict[str, object] | None = None,
@@ -224,7 +224,7 @@ def _write_search_evidence(
         "korvid_revision": korvid_revision,
         "workflow_run_url": "https://github.com/example/actions/runs/1",
         "reproduction_command": ["echo", "test"],
-        "action_id": action_id,
+        "campaign_action_id": campaign_action_id,
     }
     (root / "round-summary.json").write_text(json.dumps(round_summary))
 
@@ -237,7 +237,7 @@ def _write_search_evidence(
         "contract": {
             "campaign_id": "test-campaign",
             "models": list(models),
-            "case_repetitions": [[case_id, 5] for case_id in evaluated_case_ids],
+            "case_repetitions": [[case_id, models[0], 5] for case_id in evaluated_case_ids],
             "execution_modes": ["live"],
         },
         "metrics": [
@@ -312,10 +312,50 @@ class TestLoadRoundOutcome:
 
     def test_rejects_wrong_action_id(self, tmp_path: Path) -> None:
         root = tmp_path / "evidence"
-        _write_search_evidence(root, action_id="action-1")
+        _write_search_evidence(root, campaign_action_id="action-1")
         action = _search_action(action_id="action-WRONG")
-        with pytest.raises(ValueError, match="action_id mismatch"):
+        with pytest.raises(ValueError, match="campaign_action_id mismatch"):
             load_round_outcome(root, action, control=_control(), state=_state())
+
+    def test_accepts_three_element_case_repetitions_entries(self, tmp_path: Path) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+
+        outcome = load_round_outcome(root, _search_action(), control=_control(), state=_state())
+
+        assert outcome.aggregate_score == 0.6
+
+    def test_rejects_two_element_case_repetitions_entries(self, tmp_path: Path) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        comparison_summary = json.loads((root / "comparison-summary.json").read_text())
+        comparison_summary["contract"]["case_repetitions"] = [["case-c", 5]]
+        (root / "comparison-summary.json").write_text(json.dumps(comparison_summary))
+
+        with pytest.raises(ValueError, match=r"case_repetitions\[0\] must be \[case_id, model, repetition\]"):
+            load_round_outcome(root, _search_action(), control=_control(), state=_state())
+
+    def test_rejects_run_identity_max_metric_calls_lower_than_action_budget(self, tmp_path: Path) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root, max_metric_calls=11)
+
+        with pytest.raises(ValueError, match=r"run_identity\.max_metric_calls \(11\) != action\.metric_calls \(12\)"):
+            load_round_outcome(root, _search_action(), control=_control(), state=_state())
+
+    def test_rejects_run_identity_max_metric_calls_higher_than_action_budget(self, tmp_path: Path) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root, max_metric_calls=13)
+
+        with pytest.raises(ValueError, match=r"run_identity\.max_metric_calls \(13\) != action\.metric_calls \(12\)"):
+            load_round_outcome(root, _search_action(), control=_control(), state=_state())
+
+    def test_accepts_run_identity_max_metric_calls_equal_to_action_budget(self, tmp_path: Path) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root, max_metric_calls=12)
+
+        outcome = load_round_outcome(root, _search_action(), control=_control(), state=_state())
+
+        assert outcome.aggregate_score == 0.6
 
     def test_rejects_wrong_case_set(self, tmp_path: Path) -> None:
         root = tmp_path / "evidence"
@@ -548,7 +588,7 @@ class TestLoadRoundOutcome:
             "korvid_revision": "def456",
             "workflow_run_url": "",
             "reproduction_command": [],
-            "action_id": "ms-1",
+            "campaign_action_id": "ms-1",
         }
         (root / "round-summary.json").write_text(json.dumps(rs))
         # Add forbidden optimization file
@@ -615,7 +655,7 @@ class TestLoadRoundOutcome:
             "korvid_revision": "def456",
             "workflow_run_url": "",
             "reproduction_command": [],
-            "action_id": "ms-1",
+            "campaign_action_id": "ms-1",
         }
         (root / "round-summary.json").write_text(json.dumps(round_summary))
         comparison_summary = {
@@ -627,7 +667,7 @@ class TestLoadRoundOutcome:
             "contract": {
                 "campaign_id": "test-campaign",
                 "models": ["qwen3:0.6b"],
-                "case_repetitions": [["case-d", 5]],
+                "case_repetitions": [["case-d", "qwen3:0.6b", 5]],
                 "execution_modes": ["live"],
             },
             "metrics": [],

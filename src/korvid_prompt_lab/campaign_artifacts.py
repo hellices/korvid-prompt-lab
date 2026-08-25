@@ -92,7 +92,7 @@ _ROUND_SUMMARY_REQUIRED_KEYS = frozenset({
     "korvid_revision",
     "workflow_run_url",
     "reproduction_command",
-    "action_id",
+    "campaign_action_id",
 })
 
 _EVAL_SUMMARY_REQUIRED_KEYS = frozenset({
@@ -385,18 +385,25 @@ def _validate_comparison_summary(
         "evaluation-summary.repetitions_per_case",
     )
     for index, entry in enumerate(case_repetitions):
-        if not isinstance(entry, list) or len(entry) != 2:
+        if not isinstance(entry, list) or len(entry) != 3:
             raise ValueError(
-                f"comparison-summary.contract.case_repetitions[{index}] must be [case_id, repetitions]"
+                f"comparison-summary.contract.case_repetitions[{index}] must be [case_id, model, repetition]"
             )
         case_id = _require_str(
             entry[0], f"comparison-summary.contract.case_repetitions[{index}][0]",
         )
-        repetitions = _require_positive_int(
+        model = _require_str(
             entry[1], f"comparison-summary.contract.case_repetitions[{index}][1]",
         )
-        if repetitions != expected_repetitions:
-            raise ValueError("comparison-summary.contract.case_repetitions mismatch")
+        if model != state.model_identity.model:
+            raise ValueError(
+                f"comparison-summary.contract.case_repetitions[{index}][1] model mismatch"
+            )
+        repetition = _require_positive_int(
+            entry[2], f"comparison-summary.contract.case_repetitions[{index}][2]",
+        )
+        if repetition != expected_repetitions:
+            raise ValueError("comparison-summary.contract.case_repetitions repetition mismatch")
         comparison_case_ids.append(case_id)
     if tuple(sorted(comparison_case_ids)) != tuple(sorted(expected_case_ids)):
         raise ValueError("comparison-summary.contract.case_repetitions case set mismatch")
@@ -588,12 +595,12 @@ def load_round_outcome(
         )
 
     evidence_action_id = _require_str(
-        round_summary.get("action_id"),
-        "round-summary.action_id",
+        round_summary.get("campaign_action_id"),
+        "round-summary.campaign_action_id",
     )
     if evidence_action_id != action.action_id:
         raise ValueError(
-            f"action_id mismatch: evidence has {evidence_action_id!r}, "
+            f"campaign_action_id mismatch: evidence has {evidence_action_id!r}, "
             f"expected {action.action_id!r}"
         )
 
@@ -880,8 +887,10 @@ def _validate_search_optimization_evidence(
         run_identity.get("max_metric_calls"),
         "run_identity.max_metric_calls",
     )
-    if ri_max > action.metric_calls:
-        raise ValueError("run_identity.max_metric_calls exceeds action budget")
+    if ri_max != action.metric_calls:
+        raise ValueError(
+            f"run_identity.max_metric_calls ({ri_max}) != action.metric_calls ({action.metric_calls})"
+        )
     if _require_str(run_identity.get("campaign_id"), "run_identity.campaign_id") != control.campaign_id:
         raise ValueError("run_identity.campaign_id mismatch")
     run_identity_candidate_id = _require_str(

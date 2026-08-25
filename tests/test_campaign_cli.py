@@ -170,7 +170,7 @@ def _write_evidence(
         "korvid_revision": "def456",
         "workflow_run_url": "https://github.com/example/actions/runs/1",
         "reproduction_command": ["echo", "test"],
-        "action_id": action.get("action_id", "unknown"),
+        "campaign_action_id": action.get("action_id", "unknown"),
     }
     (evidence_path / "round-summary.json").write_text(json.dumps(round_summary))
 
@@ -183,7 +183,7 @@ def _write_evidence(
         "contract": {
             "campaign_id": "test-campaign",
             "models": ["qwen3:0.6b"],
-            "case_repetitions": [["case-c", 5]],
+            "case_repetitions": [["case-c", "qwen3:0.6b", 5]],
             "execution_modes": ["live"],
         },
         "metrics": [

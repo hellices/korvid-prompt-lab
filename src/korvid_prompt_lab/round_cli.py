@@ -24,6 +24,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-lab-revision", required=True, help="Prompt Lab git revision for the round.")
     parser.add_argument("--korvid-revision", required=True, help="Korvid git revision for the round.")
     parser.add_argument("--workflow-run-url", required=True, help="GitHub Actions workflow run URL.")
+    parser.add_argument(
+        "--campaign-action-id",
+        type=str,
+        default=None,
+        help="Campaign action identifier for campaign-controlled rounds.",
+    )
     return parser
 
 
@@ -38,6 +44,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         prompt_lab_revision=args.prompt_lab_revision,
         korvid_revision=args.korvid_revision,
         workflow_run_url=args.workflow_run_url,
+        campaign_action_id=args.campaign_action_id,
     )
     print(output_root / "round-summary.md")
     return 0
