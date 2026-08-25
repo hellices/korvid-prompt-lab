@@ -248,6 +248,25 @@ def test_retry_exhaustion_terminates() -> None:
     assert s2.stop_reason == "infrastructure_retry_limit_exhausted"
 
 
+def test_zero_retry_limit_terminates_after_first_system_error() -> None:
+    ctrl = _control(infrastructure_retry_limit=0)
+    state = _init(ctrl)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+
+    advanced = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(kind="system_error", error_message="x"),
+        LATER,
+    )
+
+    assert advanced.status is CampaignStatus.SYSTEM_ERROR
+    assert advanced.stop_reason == "infrastructure_retry_limit_exhausted"
+    assert next_action(ctrl, advanced, LATER) is None
+
+
 def test_retry_counter_resets_after_valid_evidence() -> None:
     """The bound is per attempt: evidence progress clears the retry counter."""
     ctrl = _control(infrastructure_retry_limit=1)

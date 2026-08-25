@@ -165,7 +165,7 @@ class OptimizationCampaign:
             wall_clock_limit_seconds=_require_positive_int(
                 mapping.get("wall_clock_limit_seconds"), "wall_clock_limit_seconds"
             ),
-            infrastructure_retry_limit=_require_positive_int(
+            infrastructure_retry_limit=_require_non_negative_int(
                 mapping.get("infrastructure_retry_limit"), "infrastructure_retry_limit"
             ),
             stagnation_attempt_limit=_require_positive_int(
@@ -358,8 +358,7 @@ class ActionKind(StrEnum):
     CONFIRM = "confirm"
 
 
-def _require_non_negative_score_int(value: Any, context: str) -> int:
-    """Validate a non-negative integer field for CampaignScore."""
+def _require_non_negative_int(value: Any, context: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{context} must be a non-negative integer")
     return value

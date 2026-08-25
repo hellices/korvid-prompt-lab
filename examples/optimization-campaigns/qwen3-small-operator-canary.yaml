@@ -1,0 +1,32 @@
+schema_version: 1
+campaign_id: qwen3-small-operator-canary
+evaluation_campaign: aks-small-operator-qualification
+initial_candidate: examples/candidates/shipped-small.yaml
+train_case_ids:
+  - scale-deployment-up
+  - restart-denied
+  - scale-no-op
+validation_case_ids:
+  - scale-deployment-down
+  - restart-deployment
+  - scale-rbac-denied
+milestone_case_ids:
+  - scale-ambiguous-namespace
+  - restart-approval-expired
+  - restart-daemonset
+  - scale-same-name-replacement
+  - scale-statefulset-down
+  - edit-unsupported
+stages:
+  - name: explore
+    metric_calls: 4
+    seeds: [0]
+model_tiers:
+  - name: small
+    model: qwen3:0.6b
+    digest: sha256:7df6b6e09427a769808717c0a93cadc4ae99ed4eb8bf5ca557c90846becea435
+total_metric_call_limit: 4
+wall_clock_limit_seconds: 7200
+infrastructure_retry_limit: 0
+stagnation_attempt_limit: 1
+confirmation_runs: 1
