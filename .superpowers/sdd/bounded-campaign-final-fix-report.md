@@ -241,10 +241,10 @@ the round runs).
 
 | Commit | Contents |
 |---|---|
-| _see below_ | All seven findings, tests, report and documentation updates |
+| `6868425` | All seven findings, their tests, the README update and this report |
 
-(The commit SHA is recorded by the caller of this wave; the tree is a single coherent
-fix wave with no partially landed finding.)
+Single coherent commit on `feat-bounded-optimization-campaign`, parent `efd1bcb`.
+No finding was partially landed.
 
 ## Verification
 
