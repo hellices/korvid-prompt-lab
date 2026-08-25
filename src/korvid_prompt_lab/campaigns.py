@@ -12,13 +12,13 @@ import yaml  # type: ignore[import-untyped]
 
 from .contracts import (
     Campaign,
-    _ensure_keys,
     _require_mapping,
     _require_string,
     _require_unique_string_items,
 )
 
-_EXACT_OLLAMA_DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
+_CANONICAL_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
+_LIVE_HEX_DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,7 +29,7 @@ class SearchStage:
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any], *, index: int) -> SearchStage:
-        _ensure_required_keys(mapping, {"name", "metric_calls", "seeds"}, f"stages[{index}]")
+        _ensure_exact_keys(mapping, {"name", "metric_calls", "seeds"}, f"stages[{index}]")
         return cls(
             name=_require_string(mapping.get("name"), f"stages[{index}].name"),
             metric_calls=_require_positive_int(
@@ -47,12 +47,10 @@ class ModelTier:
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any], *, index: int) -> ModelTier:
-        _ensure_required_keys(mapping, {"name", "model", "digest"}, f"model_tiers[{index}]")
-        digest = _require_string(mapping.get("digest"), f"model_tiers[{index}].digest")
-        if _EXACT_OLLAMA_DIGEST_PATTERN.fullmatch(digest) is None:
-            raise ValueError(
-                f"model_tiers[{index}].digest must be the exact 64-hex digest reported by Ollama /api/tags"
-            )
+        _ensure_exact_keys(mapping, {"name", "model", "digest"}, f"model_tiers[{index}]")
+        digest = _require_canonical_digest(
+            mapping.get("digest"), f"model_tiers[{index}].digest"
+        )
         return cls(
             name=_require_string(mapping.get("name"), f"model_tiers[{index}].name"),
             model=_require_string(mapping.get("model"), f"model_tiers[{index}].model"),
@@ -81,7 +79,7 @@ class OptimizationCampaign:
     def from_mapping(
         cls, mapping: Mapping[str, Any], *, evaluation_campaign: Campaign
     ) -> OptimizationCampaign:
-        _ensure_required_keys(
+        _ensure_exact_keys(
             mapping,
             {
                 "schema_version",
@@ -197,6 +195,17 @@ def validate_model_tier_digests(
     *,
     http_get_json: Callable[[str], Mapping[str, Any]] = _http_get_json,
 ) -> None:
+    """Compare canonical manifest digests to live Ollama `/api/tags` digests.
+
+    `load_optimization_campaign()` is intentionally offline: it validates only
+    static manifest structure. Callers that already hold a live model endpoint
+    must invoke this function before allocating AKS experiment capacity.
+
+    Manifest digests are always canonical `sha256:<64 lowercase hex>`. Live
+    `/api/tags` currently returns either bare `64`-hex SHA-256 bytes or the
+    same value with the `sha256:` prefix; this function canonicalizes the live
+    wire value before comparing it to the manifest.
+    """
     payload = _require_mapping(
         http_get_json(f"{model_endpoint.rstrip('/')}/api/tags"), "model tags probe"
     )
@@ -208,9 +217,9 @@ def validate_model_tier_digests(
     for index, item in enumerate(raw_models):
         model = _require_mapping(item, f"model tags.models[{index}]")
         name = _require_string(model.get("name"), f"model tags.models[{index}].name")
-        digest = _require_string(model.get("digest"), f"model tags.models[{index}].digest")
-        if _EXACT_OLLAMA_DIGEST_PATTERN.fullmatch(digest) is None:
-            raise ValueError("model tags probe returned a non-immutable digest")
+        digest = _canonicalize_live_digest(
+            model.get("digest"), f"model tags.models[{index}].digest"
+        )
         digests_by_model.setdefault(name, []).append(digest)
 
     for tier in campaign.model_tiers:
@@ -223,11 +232,31 @@ def validate_model_tier_digests(
             raise ValueError(f"live /api/tags digest mismatch for model {tier.model}")
 
 
-def _ensure_required_keys(mapping: Mapping[str, Any], required: set[str], context: str) -> None:
-    _ensure_keys(mapping, required, context)
+def _ensure_exact_keys(mapping: Mapping[str, Any], required: set[str], context: str) -> None:
     missing = sorted(required - set(mapping))
+    unknown = sorted(set(mapping) - required)
     if missing:
         raise ValueError(f"{context} is missing required field(s): {', '.join(missing)}")
+    if unknown:
+        raise ValueError(f"{context} has unknown field(s): {', '.join(unknown)}")
+
+
+def _require_canonical_digest(value: Any, context: str) -> str:
+    digest = _require_string(value, context)
+    if _CANONICAL_DIGEST_PATTERN.fullmatch(digest) is None:
+        raise ValueError(f"{context} must be sha256:<64 lowercase hex>")
+    return digest
+
+
+def _canonicalize_live_digest(value: Any, context: str) -> str:
+    digest = _require_string(value, context)
+    if _CANONICAL_DIGEST_PATTERN.fullmatch(digest) is not None:
+        return digest
+    if _LIVE_HEX_DIGEST_PATTERN.fullmatch(digest) is not None:
+        return f"sha256:{digest}"
+    raise ValueError(
+        f"{context} must be sha256:<64 lowercase hex> or 64 lowercase hex bytes"
+    )
 
 
 def _require_positive_int(value: Any, context: str) -> int:

@@ -19,7 +19,8 @@ from korvid_prompt_lab.config import load_campaign
 from korvid_prompt_lab.contracts import Campaign, EvalCase, ProcessServing
 
 ROOT = Path(__file__).resolve().parents[1]
-EXACT_DIGEST = "0123456789abcdef" * 4
+EXACT_DIGEST_HEX = "0123456789abcdef" * 4
+EXACT_DIGEST = f"sha256:{EXACT_DIGEST_HEX}"
 
 
 def write_yaml(path: Path, payload: dict[str, Any]) -> Path:
@@ -141,7 +142,8 @@ def test_loads_bounded_disjoint_campaign(monkeypatch: pytest.MonkeyPatch) -> Non
     assert control.stages[2].name == "final"
     assert control.stages[2].seeds == (5,)
     assert control.model_tiers[0].model == "qwen3:0.6b"
-    assert re.fullmatch(r"[0-9a-f]{64}", control.model_tiers[0].digest)
+    assert control.model_tiers[0].digest == "sha256:7df6b6e09427a769808717c0a93cadc4ae99ed4eb8bf5ca557c90846becea435"
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", control.model_tiers[0].digest)
 
 
 @pytest.mark.parametrize(
@@ -217,9 +219,10 @@ def test_rejects_non_positive_budgets(
     "digest",
     [
         "qwen3:0.6b",
-        "sha256:" + ("1" * 64),
+        EXACT_DIGEST_HEX,
         "sha256:not-hex",
         "1234",
+        "SHA256:" + EXACT_DIGEST_HEX,
     ],
 )
 def test_rejects_mutable_or_invalid_model_digests(tmp_path: Path, digest: str) -> None:
@@ -259,6 +262,11 @@ def test_rejects_missing_required_limits(tmp_path: Path, field: str) -> None:
             lambda manifest: manifest["stages"][0].__setitem__("unexpected", True),
             "unknown field",
         ),
+        (
+            "control.yaml",
+            lambda manifest: manifest["model_tiers"][0].__setitem__("unexpected", True),
+            "unknown field",
+        ),
     ],
 )
 def test_rejects_unknown_keys(tmp_path: Path, path_name: str, mutator: Any, message: str) -> None:
@@ -270,7 +278,10 @@ def test_rejects_unknown_keys(tmp_path: Path, path_name: str, mutator: Any, mess
         load_optimization_campaign(path, qualification_evaluation_campaign())
 
 
-def test_validate_model_tier_digests_accepts_matching_live_tags(tmp_path: Path) -> None:
+@pytest.mark.parametrize("live_digest", [EXACT_DIGEST_HEX, EXACT_DIGEST])
+def test_validate_model_tier_digests_accepts_matching_live_tags(
+    tmp_path: Path, live_digest: str
+) -> None:
     path = write_yaml(tmp_path / "control.yaml", valid_manifest_mapping())
     control = load_optimization_campaign(path, qualification_evaluation_campaign())
 
@@ -279,8 +290,8 @@ def test_validate_model_tier_digests_accepts_matching_live_tags(tmp_path: Path) 
         "http://127.0.0.1:11434",
         http_get_json=lambda url: {
             "models": [
-                {"name": "qwen3:0.6b", "digest": EXACT_DIGEST},
-                {"name": "qwen3:14b", "digest": "f" * 64},
+                {"name": "qwen3:0.6b", "digest": live_digest},
+                {"name": "qwen3:14b", "digest": "sha256:" + ("f" * 64)},
             ]
         },
     )
@@ -294,14 +305,30 @@ def test_validate_model_tier_digests_accepts_matching_live_tags(tmp_path: Path) 
             {
                 "models": [
                     {"name": "qwen3:0.6b", "digest": EXACT_DIGEST},
-                    {"name": "qwen3:0.6b", "digest": EXACT_DIGEST},
+                    {"name": "qwen3:0.6b", "digest": EXACT_DIGEST_HEX},
                 ]
             },
             "duplicate",
         ),
         (
-            {"models": [{"name": "qwen3:0.6b", "digest": "f" * 64}]},
+            {"models": [{"name": "qwen3:0.6b", "digest": "sha256:" + ("f" * 64)}]},
             "mismatch",
+        ),
+        (
+            {"models": [{"name": "qwen3:0.6b", "digest": "SHA256:" + EXACT_DIGEST_HEX}]},
+            "sha256",
+        ),
+        (
+            {"models": [{"name": "qwen3:0.6b", "digest": "sha256:1234"}]},
+            "sha256",
+        ),
+        (
+            {"models": [{"name": "qwen3:0.6b", "digest": "md5:" + EXACT_DIGEST_HEX}]},
+            "sha256",
+        ),
+        (
+            {"models": [{"name": "qwen3:0.6b", "digest": 7}]},
+            "digest",
         ),
     ],
 )

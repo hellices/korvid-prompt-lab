@@ -30,7 +30,7 @@ stages:
 model_tiers:
   - name: small
     model: qwen3:0.6b
-    digest: 7df6b6e09427a769808717c0a93cadc4ae99ed4eb8bf5ca557c90846becea435
+    digest: sha256:7df6b6e09427a769808717c0a93cadc4ae99ed4eb8bf5ca557c90846becea435
 total_metric_call_limit: 240
 wall_clock_limit_seconds: 21600
 infrastructure_retry_limit: 1
