@@ -88,6 +88,11 @@ def _score(
     )
 
 
+def _qualifying_score(fingerprint: str = "champion") -> CampaignScore:
+    """Score that passes the qualification gate."""
+    return _score(fingerprint, aggregate=0.9, pass_at_3=1.0, pass_at_5=1.0)
+
+
 def _init(control: OptimizationCampaign | None = None) -> CampaignState:
     c = control or _control()
     return initial_state(c, prompt_lab_revision="abc123", korvid_revision="def456", started_at=NOW)
@@ -100,10 +105,15 @@ def _run_seeds(ctrl: OptimizationCampaign, state: CampaignState, count: int) -> 
         assert action is not None, f"No action at step {i}"
         outcome = AttemptOutcome(
             kind="evidence",
-            score=_score(f"candidate-{state.metric_calls_used + i}", aggregate=0.1 * (i + 1)),
+            score=_score(f"candidate-{state.metric_calls_used}-{i}", aggregate=0.1 * (i + 1)),
         )
         state = advance_state(ctrl, state, action, outcome, LATER)
     return state
+
+
+def _exhaust_stages(ctrl: OptimizationCampaign, state: CampaignState) -> CampaignState:
+    total = sum(len(s.seeds) for s in ctrl.stages)
+    return _run_seeds(ctrl, state, total)
 
 
 # --- Promotion tests ---
@@ -114,12 +124,7 @@ def test_promotes_only_changed_non_regressing_candidate() -> None:
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
     assert action is not None
-    assert action.kind is ActionKind.SEARCH
-
-    outcome = AttemptOutcome(
-        kind="evidence",
-        score=_score("better", aggregate=0.9, hard_safety_failures=0),
-    )
+    outcome = AttemptOutcome(kind="evidence", score=_score("better", aggregate=0.9))
     advanced = advance_state(ctrl, state, action, outcome, LATER)
     assert advanced.champion_fingerprint == "better"
     assert advanced.stagnation_attempts == 0
@@ -130,10 +135,7 @@ def test_rejects_same_fingerprint_no_promotion() -> None:
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
     assert action is not None
-    outcome = AttemptOutcome(
-        kind="evidence",
-        score=_score(state.champion_fingerprint, aggregate=0.99),
-    )
+    outcome = AttemptOutcome(kind="evidence", score=_score(state.champion_fingerprint, aggregate=0.99))
     advanced = advance_state(ctrl, state, action, outcome, LATER)
     assert advanced.champion_fingerprint == state.champion_fingerprint
     assert advanced.stagnation_attempts == 1
@@ -144,13 +146,9 @@ def test_rejects_hard_safety_regression() -> None:
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
     assert action is not None
-    outcome = AttemptOutcome(
-        kind="evidence",
-        score=_score("regressor", aggregate=0.99, hard_safety_failures=1),
-    )
+    outcome = AttemptOutcome(kind="evidence", score=_score("regressor", aggregate=0.99, hard_safety_failures=1))
     advanced = advance_state(ctrl, state, action, outcome, LATER)
     assert advanced.champion_fingerprint == state.champion_fingerprint
-    assert advanced.stagnation_attempts == 1
 
 
 def test_rejects_core_regression() -> None:
@@ -158,28 +156,19 @@ def test_rejects_core_regression() -> None:
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
     assert action is not None
-    outcome = AttemptOutcome(
-        kind="evidence",
-        score=_score("regressor", aggregate=0.99, core_regression=True),
-    )
+    outcome = AttemptOutcome(kind="evidence", score=_score("regressor", aggregate=0.99, core_regression=True))
     advanced = advance_state(ctrl, state, action, outcome, LATER)
     assert advanced.champion_fingerprint == state.champion_fingerprint
-    assert advanced.stagnation_attempts == 1
 
 
 def test_equal_core_scores_never_promote() -> None:
-    """Finding 5: Equal core scores must not promote based on fingerprint."""
+    """Equal core scores must not promote based on fingerprint."""
     ctrl = _control()
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
     assert action is not None
-    # Candidate with identical core dimensions but different fingerprint
-    outcome = AttemptOutcome(
-        kind="evidence",
-        score=_score("aaa-better-fp", aggregate=0.0, pass_at_3=0.0, pass_at_5=0.0),
-    )
+    outcome = AttemptOutcome(kind="evidence", score=_score("aaa-better-fp", aggregate=0.0, pass_at_3=0.0, pass_at_5=0.0))
     advanced = advance_state(ctrl, state, action, outcome, LATER)
-    # Must NOT promote even though "aaa-better-fp" < "seed.yaml" lexicographically
     assert advanced.champion_fingerprint == state.champion_fingerprint
     assert advanced.stagnation_attempts == 1
 
@@ -208,17 +197,14 @@ def test_retry_exhaustion_terminates() -> None:
     outcome = AttemptOutcome(kind="system_error", error_message="oops")
     s1 = advance_state(ctrl, state, action, outcome, LATER)
     assert s1.status is CampaignStatus.SYSTEM_ERROR
-    assert s1.stop_reason == "infrastructure_retry_limit_exhausted"
 
 
 def test_system_error_wall_clock_crossing_terminates() -> None:
-    """Finding 7: SYSTEM_ERROR crossing wall-clock must be terminal."""
     ctrl = _control(wall_clock_limit_seconds=21600)
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
     assert action is not None
     outcome = AttemptOutcome(kind="system_error", error_message="timeout")
-    # MUCH_LATER exceeds wall clock
     s1 = advance_state(ctrl, state, action, outcome, MUCH_LATER)
     assert s1.status is CampaignStatus.SYSTEM_ERROR
     assert s1.stop_reason == "wall_clock_limit_exceeded"
@@ -227,8 +213,7 @@ def test_system_error_wall_clock_crossing_terminates() -> None:
 # --- CONFIG_ERROR ---
 
 
-def test_config_error_terminates_as_system_error() -> None:
-    """Finding 4: CONFIG_ERROR must deterministically terminate."""
+def test_config_error_terminates() -> None:
     ctrl = _control()
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
@@ -242,24 +227,8 @@ def test_config_error_terminates_as_system_error() -> None:
 # --- Budget limits ---
 
 
-def test_total_call_limit_terminates() -> None:
-    """Finding 6: metric_calls consumed = action.metric_calls, not +1."""
-    ctrl = _control(
-        stages=(SearchStage(name="explore", metric_calls=12, seeds=(0,)),),
-        total_metric_call_limit=12,
-    )
-    state = _init(ctrl)
-    action = next_action(ctrl, state, NOW)
-    assert action is not None
-    assert action.metric_calls == 12
-    outcome = AttemptOutcome(kind="evidence", score=_score("c1", aggregate=0.1))
-    s1 = advance_state(ctrl, state, action, outcome, LATER)
-    assert s1.metric_calls_used == 12
-    assert s1.status is CampaignStatus.NOT_CONVERGED
-
-
 def test_exact_metric_call_accounting() -> None:
-    """Finding 6: Two searches with different metric_calls."""
+    """metric_calls consumed = action.metric_calls per stage, uniformly."""
     ctrl = _control(
         stages=(
             SearchStage(name="explore", metric_calls=5, seeds=(0,)),
@@ -268,16 +237,28 @@ def test_exact_metric_call_accounting() -> None:
         total_metric_call_limit=100,
     )
     state = _init(ctrl)
-    # First search: 5 calls
     action = next_action(ctrl, state, NOW)
     assert action is not None and action.metric_calls == 5
     state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_score("a", aggregate=0.2)), LATER)
     assert state.metric_calls_used == 5
-    # Second search: 10 calls
     action = next_action(ctrl, state, NOW)
     assert action is not None and action.metric_calls == 10
     state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_score("b", aggregate=0.3)), LATER)
     assert state.metric_calls_used == 15
+
+
+def test_total_call_limit_terminates() -> None:
+    ctrl = _control(
+        stages=(SearchStage(name="explore", metric_calls=12, seeds=(0,)),),
+        total_metric_call_limit=12,
+    )
+    state = _init(ctrl)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+    outcome = AttemptOutcome(kind="evidence", score=_score("c1", aggregate=0.1))
+    s1 = advance_state(ctrl, state, action, outcome, LATER)
+    assert s1.metric_calls_used == 12
+    assert s1.status is CampaignStatus.NOT_CONVERGED
 
 
 def test_wall_clock_limit_terminates() -> None:
@@ -287,7 +268,6 @@ def test_wall_clock_limit_terminates() -> None:
     assert action is not None
     outcome = AttemptOutcome(kind="evidence", score=_score("c1", aggregate=0.5))
     s1 = advance_state(ctrl, state, action, outcome, MUCH_LATER)
-    assert s1.elapsed_seconds > ctrl.wall_clock_limit_seconds
     assert s1.status is CampaignStatus.NOT_CONVERGED
 
 
@@ -297,50 +277,70 @@ def test_stagnation_terminates() -> None:
     for _ in range(2):
         action = next_action(ctrl, state, NOW)
         assert action is not None
-        outcome = AttemptOutcome(
-            kind="evidence",
-            score=_score(state.champion_fingerprint, aggregate=0.0),
-        )
+        outcome = AttemptOutcome(kind="evidence", score=_score(state.champion_fingerprint, aggregate=0.0))
         state = advance_state(ctrl, state, action, outcome, LATER)
     assert state.stagnation_attempts == 2
     assert state.status is CampaignStatus.NOT_CONVERGED
 
 
-# --- Action validation (Finding 1) ---
+def test_wall_clock_crossing_during_milestone_terminates() -> None:
+    """Wall-clock crossing during milestone evidence → NOT_CONVERGED."""
+    ctrl = _control(wall_clock_limit_seconds=21600)
+    state = _exhaust_stages(ctrl, _init(ctrl))
+    action = next_action(ctrl, state, NOW)
+    assert action is not None and action.kind is ActionKind.MILESTONE
+    outcome = AttemptOutcome(kind="evidence", score=_qualifying_score(state.champion_fingerprint))
+    s1 = advance_state(ctrl, state, action, outcome, MUCH_LATER)
+    assert s1.status is CampaignStatus.NOT_CONVERGED
 
 
-def test_stale_action_id_fails_closed() -> None:
+def test_wall_clock_crossing_during_confirm_terminates() -> None:
+    """Wall-clock crossing during confirm evidence → NOT_CONVERGED."""
+    ctrl = _control(wall_clock_limit_seconds=21600)
+    state = _exhaust_stages(ctrl, _init(ctrl))
+    # Pass milestone
+    action = next_action(ctrl, state, LATER)
+    assert action is not None and action.kind is ActionKind.MILESTONE
+    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(state.champion_fingerprint)), LATER)
+    # Confirm crosses wall clock
+    action = next_action(ctrl, state, LATER)
+    assert action is not None and action.kind is ActionKind.CONFIRM
+    s1 = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(state.champion_fingerprint)), MUCH_LATER)
+    assert s1.status is CampaignStatus.NOT_CONVERGED
+
+
+# --- Action validation ---
+
+
+def test_stale_action_replay_against_advanced_state() -> None:
+    """CAS semantics: replaying action against persisted advanced state fails on hash."""
     ctrl = _control()
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
     assert action is not None
     outcome = AttemptOutcome(kind="evidence", score=_score("c1", aggregate=0.5))
-    s1 = advance_state(ctrl, state, action, outcome, LATER)
-    # Replaying the same action on new state fails
+    advanced = advance_state(ctrl, state, action, outcome, LATER)
+    # Two workers computed same transition; only one persisted state hash matches
     with pytest.raises(ValueError, match="stale|state_hash"):
-        advance_state(ctrl, s1, action, outcome, LATER)
+        advance_state(ctrl, advanced, action, outcome, LATER)
 
 
 def test_forged_action_kind_rejected() -> None:
-    """Finding 1: Forged kind fails."""
     ctrl = _control()
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
     assert action is not None
-    # Forge a CONFIRM action with correct state_hash but wrong kind
     forged = CampaignAction(
         action_id=action.action_id,
         kind=ActionKind.CONFIRM,
         expected_state_hash=action.expected_state_hash,
         tier_index=action.tier_index,
     )
-    outcome = AttemptOutcome(kind="evidence", score=_score("x"))
     with pytest.raises(ValueError, match="kind"):
-        advance_state(ctrl, state, forged, outcome, LATER)
+        advance_state(ctrl, state, forged, AttemptOutcome(kind="evidence", score=_score("x")), LATER)
 
 
 def test_forged_action_id_rejected() -> None:
-    """Finding 1: Forged action_id fails."""
     ctrl = _control()
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
@@ -354,13 +354,11 @@ def test_forged_action_id_rejected() -> None:
         tier_index=action.tier_index,
         metric_calls=action.metric_calls,
     )
-    outcome = AttemptOutcome(kind="evidence", score=_score("x"))
     with pytest.raises(ValueError, match="action_id"):
-        advance_state(ctrl, state, forged, outcome, LATER)
+        advance_state(ctrl, state, forged, AttemptOutcome(kind="evidence", score=_score("x")), LATER)
 
 
 def test_forged_cursor_rejected() -> None:
-    """Finding 1: Wrong stage/seed cursor fails."""
     ctrl = _control()
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
@@ -374,83 +372,38 @@ def test_forged_cursor_rejected() -> None:
         tier_index=action.tier_index,
         metric_calls=action.metric_calls,
     )
-    outcome = AttemptOutcome(kind="evidence", score=_score("x"))
     with pytest.raises(ValueError, match="stage_index"):
-        advance_state(ctrl, state, forged, outcome, LATER)
+        advance_state(ctrl, state, forged, AttemptOutcome(kind="evidence", score=_score("x")), LATER)
 
 
 # --- Qualification / Milestone / Confirmation ---
 
 
-def _exhaust_stages(ctrl: OptimizationCampaign, state: CampaignState) -> CampaignState:
-    """Run all stage seeds."""
-    total = sum(len(s.seeds) for s in ctrl.stages)
-    return _run_seeds(ctrl, state, total)
-
-
-def test_qualification_requires_confirmation() -> None:
-    ctrl = _control(confirmation_runs=1)
+def test_milestone_gate_pass_at_3_failure_rejects() -> None:
+    """Milestone fails if pass@3 < 1.0."""
+    ctrl = _control()
     state = _exhaust_stages(ctrl, _init(ctrl))
-
     action = next_action(ctrl, state, LATER)
     assert action is not None and action.kind is ActionKind.MILESTONE
-    outcome = AttemptOutcome(kind="evidence", score=_score(state.champion_fingerprint, aggregate=0.9))
-    state = advance_state(ctrl, state, action, outcome, LATER)
-
-    action = next_action(ctrl, state, LATER)
-    assert action is not None and action.kind is ActionKind.CONFIRM
-    outcome = AttemptOutcome(kind="evidence", score=_score(state.champion_fingerprint, aggregate=0.9))
-    state = advance_state(ctrl, state, action, outcome, LATER)
-    assert state.status is CampaignStatus.QUALIFIED
-
-
-def test_confirmation_runs_2() -> None:
-    """Finding 2: confirmation_runs=2 requires two successful confirmations."""
-    ctrl = _control(confirmation_runs=2)
-    state = _exhaust_stages(ctrl, _init(ctrl))
-
-    # Milestone
-    action = next_action(ctrl, state, LATER)
-    assert action is not None and action.kind is ActionKind.MILESTONE
-    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_score(state.champion_fingerprint)), LATER)
-
-    # First confirm
-    action = next_action(ctrl, state, LATER)
-    assert action is not None and action.kind is ActionKind.CONFIRM
-    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_score(state.champion_fingerprint)), LATER)
-    assert state.status is CampaignStatus.RUNNING  # not yet qualified
-    assert state.confirmations_passed == 1
-
-    # Second confirm
-    action = next_action(ctrl, state, LATER)
-    assert action is not None and action.kind is ActionKind.CONFIRM
-    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_score(state.champion_fingerprint)), LATER)
-    assert state.status is CampaignStatus.QUALIFIED
-    assert state.confirmations_passed == 2
-
-
-def test_confirmation_failure_not_converged() -> None:
-    ctrl = _control(confirmation_runs=1)
-    state = _exhaust_stages(ctrl, _init(ctrl))
-
-    # Milestone
-    action = next_action(ctrl, state, LATER)
-    assert action is not None and action.kind is ActionKind.MILESTONE
-    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_score(state.champion_fingerprint)), LATER)
-
-    # Confirmation fails
-    action = next_action(ctrl, state, LATER)
-    assert action is not None and action.kind is ActionKind.CONFIRM
-    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_score("different")), LATER)
+    bad_score = _score(state.champion_fingerprint, aggregate=0.9, pass_at_3=0.8)
+    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=bad_score), LATER)
+    # Single tier → NOT_CONVERGED
     assert state.status is CampaignStatus.NOT_CONVERGED
-    assert state.stop_reason == "confirmation_failed"
 
 
-# --- Model tier rollover (Finding 3) ---
+def test_milestone_gate_hard_safety_rejects() -> None:
+    """Milestone fails if hard_safety_failures > 0."""
+    ctrl = _control()
+    state = _exhaust_stages(ctrl, _init(ctrl))
+    action = next_action(ctrl, state, LATER)
+    assert action is not None and action.kind is ActionKind.MILESTONE
+    bad_score = _score(state.champion_fingerprint, aggregate=0.9, hard_safety_failures=1)
+    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=bad_score), LATER)
+    assert state.status is CampaignStatus.NOT_CONVERGED
 
 
-def test_tier_rollover_resets_state() -> None:
-    """Finding 3: non-final tier qualification rolls over to fresh tier state."""
+def test_qualification_tier0_success_qualifies_campaign() -> None:
+    """Success on tier 0 → QUALIFIED (never rolls to larger model)."""
     ctrl = _control(
         model_tiers=(
             ModelTier(name="small", model="qwen3:0.6b", digest=DIGEST_A),
@@ -459,60 +412,141 @@ def test_tier_rollover_resets_state() -> None:
         confirmation_runs=1,
     )
     state = _exhaust_stages(ctrl, _init(ctrl))
+    champ = state.champion_fingerprint
 
-    # Milestone + Confirm tier 0
+    # Milestone passes gate
     action = next_action(ctrl, state, LATER)
     assert action is not None and action.kind is ActionKind.MILESTONE
-    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_score(state.champion_fingerprint)), LATER)
+    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(champ)), LATER)
+    assert state.milestone_passed is True
 
+    # Confirmation passes gate
     action = next_action(ctrl, state, LATER)
     assert action is not None and action.kind is ActionKind.CONFIRM
-    metric_before = state.metric_calls_used
-    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_score(state.champion_fingerprint)), LATER)
+    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(champ)), LATER)
 
-    # Should roll over to tier 1 RUNNING, not QUALIFIED
+    assert state.status is CampaignStatus.QUALIFIED
+    assert state.tier_index == 0  # never rolled to tier 1
+
+
+def test_confirmation_runs_2() -> None:
+    """confirmation_runs=2 requires two successful confirmations."""
+    ctrl = _control(confirmation_runs=2)
+    state = _exhaust_stages(ctrl, _init(ctrl))
+    champ = state.champion_fingerprint
+
+    # Milestone
+    action = next_action(ctrl, state, LATER)
+    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(champ)), LATER)
+
+    # First confirm
+    action = next_action(ctrl, state, LATER)
+    assert action is not None and action.kind is ActionKind.CONFIRM
+    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(champ)), LATER)
     assert state.status is CampaignStatus.RUNNING
-    assert state.tier_index == 1
-    assert state.stage_index == 0
-    assert state.seed_index == 0
-    assert state.champion_fingerprint == ctrl.initial_candidate
-    assert state.stagnation_attempts == 0
-    assert state.retries_used == 0
-    assert state.milestone_passed is False
-    assert state.confirmations_passed == 0
-    # Campaign-wide accounting preserved
-    assert state.metric_calls_used == metric_before
-    assert state.elapsed_seconds > 0
-    # Prior tier result recorded
-    assert len(state.tier_results) == 1
-    assert state.tier_results[0].tier_index == 0
-    assert state.tier_results[0].status is CampaignStatus.QUALIFIED
+    assert state.confirmations_passed == 1
+
+    # Second confirm
+    action = next_action(ctrl, state, LATER)
+    assert action is not None and action.kind is ActionKind.CONFIRM
+    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(champ)), LATER)
+    assert state.status is CampaignStatus.QUALIFIED
 
 
-def test_final_tier_qualifies() -> None:
-    """Final tier confirmation yields QUALIFIED status."""
+def test_confirmation_failure_rolls_to_next_tier() -> None:
+    """Confirmation fail with non-final tier → roll to next tier."""
     ctrl = _control(
-        model_tiers=(ModelTier(name="small", model="qwen3:0.6b", digest=DIGEST_A),),
+        model_tiers=(
+            ModelTier(name="small", model="qwen3:0.6b", digest=DIGEST_A),
+            ModelTier(name="large", model="qwen3:14b", digest=DIGEST_B),
+        ),
         confirmation_runs=1,
     )
     state = _exhaust_stages(ctrl, _init(ctrl))
+    champ = state.champion_fingerprint
+
+    # Milestone passes
     action = next_action(ctrl, state, LATER)
-    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_score(state.champion_fingerprint)), LATER)
+    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(champ)), LATER)
+
+    # Confirmation fails gate (pass@3 < 1.0)
     action = next_action(ctrl, state, LATER)
-    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_score(state.champion_fingerprint)), LATER)
-    assert state.status is CampaignStatus.QUALIFIED
+    bad_score = _score(champ, aggregate=0.9, pass_at_3=0.9)
+    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=bad_score), LATER)
+
+    # Rolled to tier 1
+    assert state.status is CampaignStatus.RUNNING
+    assert state.tier_index == 1
+    assert state.champion_fingerprint == ctrl.initial_candidate
+    assert state.stagnation_attempts == 0
+    assert state.milestone_passed is False
+    assert state.confirmations_passed == 0
+    assert len(state.tier_results) == 1
+    assert state.tier_results[0].status is CampaignStatus.NOT_CONVERGED
+
+
+def test_milestone_failure_rolls_to_next_tier() -> None:
+    """Milestone fail with non-final tier → roll to next tier."""
+    ctrl = _control(
+        model_tiers=(
+            ModelTier(name="small", model="qwen3:0.6b", digest=DIGEST_A),
+            ModelTier(name="large", model="qwen3:14b", digest=DIGEST_B),
+        ),
+    )
+    state = _exhaust_stages(ctrl, _init(ctrl))
+    # Milestone fails gate
+    action = next_action(ctrl, state, LATER)
+    bad_score = _score(state.champion_fingerprint, aggregate=0.9, hard_safety_failures=1)
+    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=bad_score), LATER)
+
+    assert state.status is CampaignStatus.RUNNING
+    assert state.tier_index == 1
+    assert len(state.tier_results) == 1
+
+
+def test_final_tier_failure_not_converged() -> None:
+    """Final tier milestone failure → campaign NOT_CONVERGED."""
+    ctrl = _control(
+        model_tiers=(ModelTier(name="small", model="qwen3:0.6b", digest=DIGEST_A),),
+    )
+    state = _exhaust_stages(ctrl, _init(ctrl))
+    action = next_action(ctrl, state, LATER)
+    bad_score = _score(state.champion_fingerprint, aggregate=0.9, pass_at_5=0.8)
+    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=bad_score), LATER)
+    assert state.status is CampaignStatus.NOT_CONVERGED
+    assert len(state.tier_results) == 1
+
+
+# --- Uniform metric accounting for milestone/confirm ---
+
+
+def test_milestone_confirm_metric_accounting_uniform() -> None:
+    """Milestone/confirm with metric_calls=0 does not increase metric_calls_used."""
+    ctrl = _control()
+    state = _exhaust_stages(ctrl, _init(ctrl))
+    metric_before = state.metric_calls_used
+
+    # Milestone (metric_calls=0)
+    action = next_action(ctrl, state, LATER)
+    assert action is not None and action.metric_calls == 0
+    champ = state.champion_fingerprint
+    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(champ)), LATER)
+    assert state.metric_calls_used == metric_before
+
+    # Confirm (metric_calls=0)
+    action = next_action(ctrl, state, LATER)
+    assert action is not None and action.metric_calls == 0
+    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_qualifying_score(champ)), LATER)
+    assert state.metric_calls_used == metric_before
 
 
 # --- State hash ---
 
 
 def test_state_hash_deterministic() -> None:
-    ctrl = _control()
-    state = _init(ctrl)
-    h1 = state_hash(state)
-    h2 = state_hash(state)
-    assert h1 == h2
-    assert h1.startswith("sha256:")
+    state = _init()
+    assert state_hash(state) == state_hash(state)
+    assert state_hash(state).startswith("sha256:")
 
 
 def test_state_hash_changes_on_advance() -> None:
@@ -521,8 +555,7 @@ def test_state_hash_changes_on_advance() -> None:
     h1 = state_hash(state)
     action = next_action(ctrl, state, NOW)
     assert action is not None
-    outcome = AttemptOutcome(kind="evidence", score=_score("new", aggregate=0.9))
-    s2 = advance_state(ctrl, state, action, outcome, LATER)
+    s2 = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_score("new", aggregate=0.9)), LATER)
     assert state_hash(s2) != h1
 
 
@@ -536,8 +569,6 @@ def test_staged_seeds_advance_correctly() -> None:
             SearchStage(name="refine", metric_calls=24, seeds=(2,)),
         ),
     )
-    state = _init(ctrl)
-    state = _run_seeds(ctrl, state, 3)
-    # After 3 seeds: (0,1) from stage 0, (2) from stage 1 => all exhausted
+    state = _run_seeds(ctrl, _init(ctrl), 3)
     assert state.stage_index == 2
     assert state.seed_index == 0

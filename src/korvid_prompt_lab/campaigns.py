@@ -419,11 +419,7 @@ class CampaignState:
 
 
 def _score_rank_key_no_fp(score: CampaignScore) -> tuple[Any, ...]:
-    """Core ranking dimensions without fingerprint tie-break.
-
-    Order: systemic zero, core regression, hard-safety presence,
-    hard-safety count, aggregate (neg), pass@3 (neg), pass@5 (neg).
-    """
+    """Core ranking dimensions without fingerprint tie-break."""
     is_systemic_zero = score.aggregate == 0.0 and score.hard_safety_failures > 0
     return (
         is_systemic_zero,
@@ -437,12 +433,19 @@ def _score_rank_key_no_fp(score: CampaignScore) -> tuple[Any, ...]:
 
 
 def _is_strictly_better(candidate: CampaignScore, champion: CampaignScore) -> bool:
-    """Candidate must be strictly better on core dimensions to promote.
-
-    Equal core scores never promote — fingerprint tie-break only applies
-    among candidates that already have at least one core improvement.
-    """
+    """Candidate must be strictly better on core dimensions to promote."""
     return _score_rank_key_no_fp(candidate) < _score_rank_key_no_fp(champion)
+
+
+def _passes_qualification_gate(score: CampaignScore) -> bool:
+    """Qualification gate: no hard-safety failures, no core regression, perfect pass rates."""
+    if score.hard_safety_failures != 0:
+        return False
+    if score.core_regression:
+        return False
+    if score.pass_at_3 != 1.0:
+        return False
+    return score.pass_at_5 == 1.0
 
 
 def state_hash(state: CampaignState) -> str:
@@ -566,7 +569,6 @@ def next_action(
     sh = state_hash(state)
     action_id = str(uuid.uuid5(uuid.NAMESPACE_URL, sh))
 
-    # If stages not exhausted, SEARCH
     if not _seeds_exhausted(control, state):
         stage = control.stages[state.stage_index]
         return CampaignAction(
@@ -579,7 +581,6 @@ def next_action(
             metric_calls=stage.metric_calls,
         )
 
-    # Stages exhausted: milestone then confirm(s)
     if not state.milestone_passed:
         return CampaignAction(
             action_id=action_id,
@@ -606,7 +607,13 @@ def _validate_action(
     state: CampaignState,
     action: CampaignAction,
 ) -> None:
-    """Validate action matches the controller-planned next action exactly."""
+    """Validate action matches the controller-planned next action exactly.
+
+    Pure deterministic check. Replay prevention against the persisted advanced
+    state relies on expected_state_hash mismatch (CAS semantics). Two workers
+    may compute the same transition, but only one prior-state hash may be
+    persisted; reapplying to the persisted advanced state fails on hash.
+    """
     current_hash = state_hash(state)
     if action.expected_state_hash != current_hash:
         raise ValueError(
@@ -614,7 +621,6 @@ def _validate_action(
             f"got {current_hash}"
         )
 
-    # Compute what the planned action should be
     planned = next_action(control, state, datetime.fromisoformat(state.started_at))
     if planned is None:
         raise ValueError("no valid action for current state")
@@ -635,6 +641,87 @@ def _validate_action(
         raise ValueError("action seed_index mismatch")
     if action.metric_calls != planned.metric_calls:
         raise ValueError("action metric_calls mismatch")
+
+
+def _make_fresh_tier_state(
+    state: CampaignState,
+    control: OptimizationCampaign,
+    next_tier: int,
+    elapsed: float,
+    new_metric_calls: int,
+    tier_result: TierResult,
+) -> CampaignState:
+    """Create a fresh state for the next tier, preserving campaign-wide accounting."""
+    fresh_score = CampaignScore(
+        fingerprint=control.initial_candidate,
+        aggregate=0.0,
+        hard_safety_failures=0,
+        core_regression=False,
+        pass_at_3=0.0,
+        pass_at_5=0.0,
+    )
+    return CampaignState(
+        schema_version=state.schema_version,
+        campaign_id=state.campaign_id,
+        prompt_lab_revision=state.prompt_lab_revision,
+        korvid_revision=state.korvid_revision,
+        status=CampaignStatus.RUNNING,
+        tier_index=next_tier,
+        stage_index=0,
+        seed_index=0,
+        champion_fingerprint=control.initial_candidate,
+        champion_score=fresh_score,
+        metric_calls_used=new_metric_calls,
+        elapsed_seconds=elapsed,
+        stagnation_attempts=0,
+        retries_used=0,
+        started_at=state.started_at,
+        milestone_passed=False,
+        confirmations_passed=0,
+        tier_results=state.tier_results + (tier_result,),
+    )
+
+
+def _handle_tier_failure(
+    state: CampaignState,
+    control: OptimizationCampaign,
+    elapsed: float,
+    new_metric_calls: int,
+    stop_reason: str,
+) -> CampaignState:
+    """Handle tier failure: roll to next tier or terminate campaign."""
+    tier_result = TierResult(
+        tier_index=state.tier_index,
+        champion_fingerprint=state.champion_fingerprint,
+        champion_score=state.champion_score,
+        status=CampaignStatus.NOT_CONVERGED,
+    )
+    if state.tier_index < len(control.model_tiers) - 1:
+        return _make_fresh_tier_state(
+            state, control, state.tier_index + 1, elapsed, new_metric_calls, tier_result
+        )
+    # Final tier — campaign NOT_CONVERGED
+    return CampaignState(
+        schema_version=state.schema_version,
+        campaign_id=state.campaign_id,
+        prompt_lab_revision=state.prompt_lab_revision,
+        korvid_revision=state.korvid_revision,
+        status=CampaignStatus.NOT_CONVERGED,
+        tier_index=state.tier_index,
+        stage_index=state.stage_index,
+        seed_index=state.seed_index,
+        champion_fingerprint=state.champion_fingerprint,
+        champion_score=state.champion_score,
+        metric_calls_used=new_metric_calls,
+        elapsed_seconds=elapsed,
+        stagnation_attempts=state.stagnation_attempts,
+        retries_used=state.retries_used,
+        started_at=state.started_at,
+        milestone_passed=state.milestone_passed,
+        confirmations_passed=state.confirmations_passed,
+        stop_reason=stop_reason,
+        tier_results=state.tier_results + (tier_result,),
+    )
 
 
 def advance_state(
@@ -677,7 +764,6 @@ def advance_state(
     # --- SYSTEM_ERROR outcome ---
     if outcome.kind == "system_error":
         new_retries = state.retries_used + 1
-        # Check if wall-clock exceeded
         wall_clock_exceeded = elapsed > control.wall_clock_limit_seconds
         if new_retries >= control.infrastructure_retry_limit or wall_clock_exceeded:
             stop = "wall_clock_limit_exceeded" if wall_clock_exceeded else "infrastructure_retry_limit_exhausted"
@@ -727,11 +813,13 @@ def advance_state(
     if outcome.kind != "evidence" or outcome.score is None:
         raise ValueError(f"unexpected outcome kind: {outcome.kind}")
 
+    # Uniform metric accounting for all evidence actions
+    new_metric_calls = state.metric_calls_used + action.metric_calls
+
     if action.kind is ActionKind.SEARCH:
-        new_metric_calls = state.metric_calls_used + action.metric_calls
         candidate_score = outcome.score
 
-        # Promotion: must be different fingerprint AND strictly better on core dims
+        # Promotion: different fingerprint AND strictly better on core dims
         if (
             candidate_score.fingerprint != state.champion_fingerprint
             and _is_strictly_better(candidate_score, state.champion_score)
@@ -753,7 +841,7 @@ def advance_state(
             new_stage_index += 1
             new_seed_index = 0
 
-        # Determine status
+        # Budget check
         new_status = CampaignStatus.RUNNING
         stop_reason: str | None = None
         if new_metric_calls >= control.total_metric_call_limit:
@@ -789,31 +877,9 @@ def advance_state(
         )
 
     if action.kind is ActionKind.MILESTONE:
-        return CampaignState(
-            schema_version=state.schema_version,
-            campaign_id=state.campaign_id,
-            prompt_lab_revision=state.prompt_lab_revision,
-            korvid_revision=state.korvid_revision,
-            status=CampaignStatus.RUNNING,
-            tier_index=state.tier_index,
-            stage_index=state.stage_index,
-            seed_index=state.seed_index,
-            champion_fingerprint=state.champion_fingerprint,
-            champion_score=state.champion_score,
-            metric_calls_used=state.metric_calls_used,
-            elapsed_seconds=elapsed,
-            stagnation_attempts=state.stagnation_attempts,
-            retries_used=state.retries_used,
-            started_at=state.started_at,
-            milestone_passed=True,
-            confirmations_passed=state.confirmations_passed,
-            tier_results=state.tier_results,
-        )
-
-    if action.kind is ActionKind.CONFIRM:
-        # Confirmation: score fingerprint must match champion
-        if outcome.score.fingerprint != state.champion_fingerprint:
-            # Confirmation failed — NOT_CONVERGED
+        # Budget check first
+        if new_metric_calls >= control.total_metric_call_limit or elapsed > control.wall_clock_limit_seconds:
+            stop = "total_metric_call_limit" if new_metric_calls >= control.total_metric_call_limit else "wall_clock_limit_exceeded"
             return CampaignState(
                 schema_version=state.schema_version,
                 campaign_id=state.campaign_id,
@@ -825,58 +891,75 @@ def advance_state(
                 seed_index=state.seed_index,
                 champion_fingerprint=state.champion_fingerprint,
                 champion_score=state.champion_score,
-                metric_calls_used=state.metric_calls_used,
+                metric_calls_used=new_metric_calls,
                 elapsed_seconds=elapsed,
                 stagnation_attempts=state.stagnation_attempts,
                 retries_used=state.retries_used,
                 started_at=state.started_at,
                 milestone_passed=state.milestone_passed,
                 confirmations_passed=state.confirmations_passed,
-                stop_reason="confirmation_failed",
+                stop_reason=stop,
                 tier_results=state.tier_results,
             )
 
+        # Gate check: milestone must pass qualification gate
+        if not _passes_qualification_gate(outcome.score):
+            return _handle_tier_failure(state, control, elapsed, new_metric_calls, "milestone_failed")
+
+        return CampaignState(
+            schema_version=state.schema_version,
+            campaign_id=state.campaign_id,
+            prompt_lab_revision=state.prompt_lab_revision,
+            korvid_revision=state.korvid_revision,
+            status=CampaignStatus.RUNNING,
+            tier_index=state.tier_index,
+            stage_index=state.stage_index,
+            seed_index=state.seed_index,
+            champion_fingerprint=state.champion_fingerprint,
+            champion_score=state.champion_score,
+            metric_calls_used=new_metric_calls,
+            elapsed_seconds=elapsed,
+            stagnation_attempts=state.stagnation_attempts,
+            retries_used=state.retries_used,
+            started_at=state.started_at,
+            milestone_passed=True,
+            confirmations_passed=state.confirmations_passed,
+            tier_results=state.tier_results,
+        )
+
+    if action.kind is ActionKind.CONFIRM:
+        # Budget check first
+        if new_metric_calls >= control.total_metric_call_limit or elapsed > control.wall_clock_limit_seconds:
+            stop = "total_metric_call_limit" if new_metric_calls >= control.total_metric_call_limit else "wall_clock_limit_exceeded"
+            return CampaignState(
+                schema_version=state.schema_version,
+                campaign_id=state.campaign_id,
+                prompt_lab_revision=state.prompt_lab_revision,
+                korvid_revision=state.korvid_revision,
+                status=CampaignStatus.NOT_CONVERGED,
+                tier_index=state.tier_index,
+                stage_index=state.stage_index,
+                seed_index=state.seed_index,
+                champion_fingerprint=state.champion_fingerprint,
+                champion_score=state.champion_score,
+                metric_calls_used=new_metric_calls,
+                elapsed_seconds=elapsed,
+                stagnation_attempts=state.stagnation_attempts,
+                retries_used=state.retries_used,
+                started_at=state.started_at,
+                milestone_passed=state.milestone_passed,
+                confirmations_passed=state.confirmations_passed,
+                stop_reason=stop,
+                tier_results=state.tier_results,
+            )
+
+        # Confirmation must pass qualification gate
+        if not _passes_qualification_gate(outcome.score):
+            return _handle_tier_failure(state, control, elapsed, new_metric_calls, "confirmation_failed")
+
         new_confirmations = state.confirmations_passed + 1
         if new_confirmations >= control.confirmation_runs:
-            # All confirmations passed — check tier rollover
-            if state.tier_index < len(control.model_tiers) - 1:
-                # Tier qualified — record result, roll over to next tier
-                tier_result = TierResult(
-                    tier_index=state.tier_index,
-                    champion_fingerprint=state.champion_fingerprint,
-                    champion_score=state.champion_score,
-                    status=CampaignStatus.QUALIFIED,
-                )
-                next_tier = state.tier_index + 1
-                fresh_score = CampaignScore(
-                    fingerprint=control.initial_candidate,
-                    aggregate=0.0,
-                    hard_safety_failures=0,
-                    core_regression=False,
-                    pass_at_3=0.0,
-                    pass_at_5=0.0,
-                )
-                return CampaignState(
-                    schema_version=state.schema_version,
-                    campaign_id=state.campaign_id,
-                    prompt_lab_revision=state.prompt_lab_revision,
-                    korvid_revision=state.korvid_revision,
-                    status=CampaignStatus.RUNNING,
-                    tier_index=next_tier,
-                    stage_index=0,
-                    seed_index=0,
-                    champion_fingerprint=control.initial_candidate,
-                    champion_score=fresh_score,
-                    metric_calls_used=state.metric_calls_used,
-                    elapsed_seconds=elapsed,
-                    stagnation_attempts=0,
-                    retries_used=0,
-                    started_at=state.started_at,
-                    milestone_passed=False,
-                    confirmations_passed=0,
-                    tier_results=state.tier_results + (tier_result,),
-                )
-            # Final tier qualified
+            # All confirmations passed — campaign QUALIFIED (never roll to larger model)
             return CampaignState(
                 schema_version=state.schema_version,
                 campaign_id=state.campaign_id,
@@ -888,7 +971,7 @@ def advance_state(
                 seed_index=state.seed_index,
                 champion_fingerprint=state.champion_fingerprint,
                 champion_score=state.champion_score,
-                metric_calls_used=state.metric_calls_used,
+                metric_calls_used=new_metric_calls,
                 elapsed_seconds=elapsed,
                 stagnation_attempts=state.stagnation_attempts,
                 retries_used=state.retries_used,
@@ -910,7 +993,7 @@ def advance_state(
             seed_index=state.seed_index,
             champion_fingerprint=state.champion_fingerprint,
             champion_score=state.champion_score,
-            metric_calls_used=state.metric_calls_used,
+            metric_calls_used=new_metric_calls,
             elapsed_seconds=elapsed,
             stagnation_attempts=state.stagnation_attempts,
             retries_used=state.retries_used,
