@@ -474,6 +474,7 @@ class TestCLIAdvance:
         new_state = json.loads(output_state.read_text())
         assert new_state["status"] == "running"
         assert new_state["seed_index"] == 1
+        assert new_state["metric_calls_used"] == 10
 
     def test_system_error_advances_retry_without_consuming_budget(
         self, tmp_path: Path,

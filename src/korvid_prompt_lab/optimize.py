@@ -15,6 +15,7 @@ from gepa.core.adapter import ProposalFn
 
 from .adapter import KorvidGEPAAdapter
 from .artifacts import write_json_artifact
+from .campaigns import GEPA_REFLECTION_MINIBATCH_SIZE
 from .contracts import Candidate, EvalCase
 from .reflection import DSPyInstructionProposer
 from .runner import KorvidProcessRunner
@@ -103,6 +104,7 @@ def optimize_campaign(
         valset=list(validation_cases),
         adapter=cast(Any, adapter),
         custom_candidate_proposer=custom_candidate_proposer,
+        reflection_minibatch_size=GEPA_REFLECTION_MINIBATCH_SIZE,
         max_metric_calls=max_metric_calls,
         run_dir=str(run_dir),
         seed=seed,

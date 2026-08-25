@@ -21,6 +21,8 @@ from .contracts import (
     _require_unique_string_items,
 )
 
+GEPA_REFLECTION_MINIBATCH_SIZE = 3
+
 _CANONICAL_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 _LIVE_HEX_DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
 
@@ -147,9 +149,16 @@ class OptimizationCampaign:
         total_metric_call_limit = _require_positive_int(
             mapping.get("total_metric_call_limit"), "total_metric_call_limit"
         )
-        planned_metric_calls = sum(stage.metric_calls * len(stage.seeds) for stage in stages)
+        gepa_iteration_cost = GEPA_REFLECTION_MINIBATCH_SIZE + len(validation_case_ids)
+        planned_metric_calls = sum(
+            (stage.metric_calls + gepa_iteration_cost - 1) * len(stage.seeds)
+            for stage in stages
+        )
         if planned_metric_calls > total_metric_call_limit:
-            raise ValueError("total_metric_call_limit must cover every staged search attempt")
+            raise ValueError(
+                "total_metric_call_limit must cover every staged search attempt "
+                "including bounded GEPA iteration overshoot"
+            )
 
         return cls(
             schema_version=1,
@@ -394,6 +403,7 @@ class AttemptOutcome:
     kind: str  # "evidence" | "system_error" | "config_error"
     score: CampaignScore | None = None
     error_message: str | None = None
+    metric_calls_used: int | None = None
 
 
 _CANDIDATE_FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
@@ -676,6 +686,11 @@ def next_action(
 
     if not _seeds_exhausted(control, state):
         stage = control.stages[state.stage_index]
+        if (
+            state.metric_calls_used + max_search_metric_calls(control, stage.metric_calls)
+            > control.total_metric_call_limit
+        ):
+            return None
         return CampaignAction(
             action_id=action_id,
             kind=ActionKind.SEARCH,
@@ -705,6 +720,19 @@ def next_action(
         )
 
     return None
+
+
+def max_search_metric_calls(
+    control: OptimizationCampaign,
+    max_metric_calls: int,
+) -> int:
+    """Bound GEPA's atomic-iteration overshoot above its stop threshold."""
+    return (
+        max_metric_calls
+        + GEPA_REFLECTION_MINIBATCH_SIZE
+        + len(control.validation_case_ids)
+        - 1
+    )
 
 
 def _validate_action(
@@ -804,10 +832,12 @@ def _next_tier_action_fits(
     )
     if planned is None:
         return False
-    return (
-        candidate_state.metric_calls_used + planned.metric_calls
-        <= control.total_metric_call_limit
+    required_calls = (
+        max_search_metric_calls(control, planned.metric_calls)
+        if planned.kind is ActionKind.SEARCH
+        else planned.metric_calls
     )
+    return candidate_state.metric_calls_used + required_calls <= control.total_metric_call_limit
 
 
 def _handle_tier_exhaustion(
@@ -956,8 +986,27 @@ def advance_state(
     if outcome.kind != "evidence" or outcome.score is None:
         raise ValueError(f"unexpected outcome kind: {outcome.kind}")
 
-    # Uniform metric accounting
-    new_metric_calls = state.metric_calls_used + action.metric_calls
+    metric_calls_used = (
+        action.metric_calls
+        if outcome.metric_calls_used is None
+        else outcome.metric_calls_used
+    )
+    if (
+        isinstance(metric_calls_used, bool)
+        or not isinstance(metric_calls_used, int)
+        or metric_calls_used < 0
+    ):
+        raise ValueError("outcome.metric_calls_used must be a non-negative integer")
+    if action.kind is ActionKind.SEARCH:
+        maximum = max_search_metric_calls(control, action.metric_calls)
+        if metric_calls_used > maximum:
+            raise ValueError(
+                f"outcome.metric_calls_used ({metric_calls_used}) exceeds "
+                f"bounded GEPA maximum ({maximum})"
+            )
+    elif metric_calls_used != 0:
+        raise ValueError("milestone and confirmation outcomes must use zero metric calls")
+    new_metric_calls = state.metric_calls_used + metric_calls_used
 
     if action.kind is ActionKind.SEARCH:
         candidate_score = outcome.score
@@ -1020,6 +1069,17 @@ def advance_state(
             return _handle_tier_exhaustion(
                 intermediate, control, elapsed, new_metric_calls, "stagnation_limit"
             )
+        elif (
+            new_stage_index < len(control.stages)
+            and new_metric_calls
+            + max_search_metric_calls(
+                control,
+                control.stages[new_stage_index].metric_calls,
+            )
+            > control.total_metric_call_limit
+        ):
+            new_status = CampaignStatus.NOT_CONVERGED
+            stop_reason = "total_metric_call_limit"
 
         return CampaignState(
             schema_version=state.schema_version,
