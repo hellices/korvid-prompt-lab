@@ -323,3 +323,192 @@ now "mypy clean", not "clean except known noise".
 4. **Marker artifact deletion is not defended against.** An operator with artifact
    delete permission can remove a lineage marker and re-run a consumed lineage. That
    is the same trust level already required to rewrite campaign evidence.
+
+---
+
+# Wave 2 — re-review fix wave
+
+The wave 1 re-review raised four new findings. Every one is fixed at its root and
+proven by a failing-first test.
+
+| Commit | Scope |
+| --- | --- |
+| `WAVE2_SHA` | All four wave 2 findings, tests, README recovery docs, this report |
+
+## Finding 1 (Critical) — `KORVID_AKS_MODEL` was never exported to `attempt`
+
+**Root cause.** The wrapper and the round script need `KORVID_AKS_MODEL`, but the
+`attempt` step's `env:` never set it, so the very first `korvid-campaign` call in
+every run would have died on an unset variable. The existing script tests hid this
+because they built the subprocess environment with `dict(os.environ)` and the
+developer shell happened to export the variable.
+
+**Fix.**
+- `scripts/run-optimization-campaign-step.sh` now requires the variable in its
+  required-env preamble (`: "${KORVID_AKS_MODEL:?...}"`) *before* any planning, so a
+  missing model fails in milliseconds instead of after a download.
+- The `identity` job publishes a new validated `model` output taken from tier 0 of
+  the validated manifest, and the `attempt` step binds
+  `KORVID_AKS_MODEL: ${{ needs.identity.outputs.model }}`.
+- `tests/test_optimization_campaign_script.py::run_step` was rewritten to build the
+  subprocess environment explicitly from a small `_INHERITED_ENV` allowlist plus the
+  variables under test, with an `omit_env` parameter. No test can now pass because of
+  a leaked ambient `KORVID_AKS_MODEL`.
+
+**RED evidence.** With the explicit environment and the new tests in place, before the
+wrapper/workflow change: `3 failed, 1 passed`
+(`test_missing_model_env_fails_before_planning`,
+`test_attempt_supplies_every_environment_the_wrapper_requires`,
+`test_attempt_binds_the_validated_identity_model`).
+**GREEN.** `uv run --frozen pytest -q tests/test_optimization_campaign_script.py
+tests/test_optimization_campaign_workflow.py` → `33 passed`.
+
+## Finding 2 (High) — multi-tier rollover wrote a *path* into `champion_fingerprint`
+
+**Root cause.** `_make_fresh_tier_state` reset the champion to
+`control.initial_candidate`, which is a manifest **path** (`seed.yaml`), not a
+candidate fingerprint. The next `validate_state_binding` / packaging step would reject
+it, so every campaign that survived tier 0 hard-failed on rollover.
+
+**Fix — carry the real seed fingerprint in state.**
+- `CampaignState` gained a required `seed_candidate_fingerprint: str` (bare 64-hex),
+  validated by a new public `validate_seed_candidate_fingerprint`.
+- It participates in `state_hash`, in `_serialize_state`/`_load_state`, and in
+  `validate_state_binding`'s tamper check, so it cannot be edited in a downloaded
+  artifact.
+- `initial_state(...)` now *requires* it; the workflow `prepare` step computes it once
+  as `load_candidate(initial_candidate_path).fingerprint` and passes it in. The
+  continuation path re-derives it from the same manifest candidate and rejects a state
+  whose stored value disagrees.
+- `_make_fresh_tier_state` seeds the new tier's `champion_fingerprint`,
+  `champion_score.fingerprint` and `seed_candidate_fingerprint` from that validated
+  real fingerprint. The initial candidate **path** survives only as control config.
+- The value is bound end to end: `prepare` emits `seed-candidate-fingerprint`,
+  `attempt` passes `CAMPAIGN_SEED_FINGERPRINT`, the wrapper forwards
+  `--expected-seed-fingerprint`, and `_enforce_identity_bindings` compares it. The
+  `package` step re-checks it and adds the seed candidate to the champion-source set
+  so a rolled tier can actually resolve its champion.
+- The dead `replace(...)`/`CampaignScore` patch-up in `prepare` was deleted.
+
+**RED evidence.** `tests/test_campaign_state.py` → `40 failed, 4 passed` before the
+field existed. The dedicated end-to-end proof
+`tests/test_campaign_tier_rollover.py` (2 tests: run the real `prepare` step, roll to
+tier 1 through the real state machine, assert the rolled fingerprint is the canonical
+`load_candidate(...).fingerprint`, then run the real `package` step) was proven RED by
+temporarily restoring `control.initial_candidate` in `_make_fresh_tier_state` →
+`2 failed`.
+**GREEN.** `2 passed`; `tests/test_campaign_artifacts.py tests/test_campaign_cli.py` →
+`78 passed`; workflow/package/script suites → `51 passed`.
+
+## Finding 3 (High) — marker consumption was irreversible
+
+**Root cause.** Wave 5's durable marker is claimed *after* the state upload and
+*before* dispatch. Any failure in that window (cleanup, dispatch, runner loss) left the
+lineage consumed with no legal continuation, permanently wedging the campaign — and a
+naive re-run would redo hours of GPU work only to be refused at claim time.
+
+**Fix — a narrow, proof-carrying recovery path.**
+- The `identity` trust check now also admits a prior run whose conclusion is
+  `failure`, and publishes `prior-run-conclusion`. `success` and `failure` are the only
+  admissible conclusions.
+- Three new steps run **before `prepare`** and therefore before the Azure login, the
+  Korvid token and the `attempt` step:
+  - `recovery-scan` (github-script) lists the failed run's own artifacts, applies the
+    same producer-trust predicate as Finding 4, and requires **exactly one** matching
+    `campaign-lineage-<id>-(initial|sha256-…)` artifact.
+  - `recovery-download` fetches it with `run-id: inputs.prior_run_id`.
+  - `recovery-verify` validates the package shape (a single regular
+    `lineage-marker.json`, no symlink), the exact 8-key schema, `schema_version == 1`,
+    the campaign id, that the artifact name matches the marker content, that
+    `producer_run_id == prior_run_id`, that the revisions are 40-hex and equal the
+    dispatched refs, that the transition is forward, and the decisive invariant
+    **`to_state_hash == expected_state_hash`**. Only then does it emit `verified=true`.
+- `prepare` receives `PRIOR_RUN_CONCLUSION` and `RECOVERY_VERIFIED` and raises
+  `SystemExit` when a `failure`-conclusion prior run lacks the proof. Every other failed
+  prior run therefore remains rejected exactly as before.
+- Re-running the failed job itself is now caught: `lineage-scan` reports a
+  `marker-scope` of `current` when the only trusted marker belongs to this run, and
+  `lineage-reject` stops **before the wrapper** with a bounded recovery instruction
+  naming the produced `to_state_hash` and the producer run id. The foreign-duplicate
+  message names the same recovery dispatch.
+- Owned cleanup failure is **not** made success-shaped: the `Enforce terminal` step
+  still requires `CLEANUP_OUTCOME == success` (asserted by
+  `test_owned_cleanup_failure_is_never_success_shaped`).
+- `README.md` documents the operator procedure and its trust implications: a campaign
+  id is single-use per lineage step for the 90-day retention window, and deleting a
+  marker deliberately re-opens that step.
+
+## Finding 4 (Medium) — `lineage-scan` trusted any repository artifact by name
+
+**Root cause.** `listArtifactsForRepo` is repository-wide. Any workflow — including a
+fork PR run or an unrelated workflow — could upload an artifact with the marker name
+and permanently consume a lineage, a cheap denial of service.
+
+**Fix.** `lineage-scan` now requires, for every candidate artifact:
+- artifact-level: name match, not expired, a producing run id, and
+  `workflow_run.repository_id == head_repository_id == context.payload.repository.id`
+  with `head_branch == default_branch`;
+- run-level (memoised `getWorkflowRun`): `path` exactly
+  `.github/workflows/optimization-campaign.yml`, `event == 'workflow_dispatch'`,
+  `head_branch == default_branch`, and both `repository.id` and `head_repository.id`
+  equal to the authoritative repository id with a case-insensitive `full_name` match.
+
+An untrusted artifact is `core.warning`ed and skipped — it never masks a trusted one
+later in the list, and never fails the run. A `getWorkflowRun` error means untrusted,
+not fatal. An incomplete repository context fails closed. Once trusted, malformed
+marker **content** still fails closed in `lineage-reject`. Pagination is exercised
+(`github.paginate` with `per_page: 100` and the `name` filter).
+
+**RED evidence (findings 3 + 4 together).** With the new
+`tests/test_campaign_lineage_marker.py` harness (explicit `context.payload.repository`,
+paginating `github.paginate`, `getWorkflowRun` stub, `repository_id` /
+`head_repository_id` / `head_branch` on artifacts) and the pre-wave-2 workflow:
+`36 failed, 20 passed`.
+**GREEN.** `uv run --frozen pytest -q tests/test_campaign_lineage_marker.py` →
+`56 passed`, covering: foreign workflow path, fork head repository, non-default branch,
+untrusted event, unresolvable run, foreign repository id, untrusted-does-not-mask-
+trusted, pagination, `marker-scope` foreign/current, incomplete repository context,
+recovery marker accept/reject matrix, recovery step ordering and `if:` gating, the
+`prepare` recovery gate, the rerun instruction, and the cleanup terminal contract.
+
+## Wave 2 verification
+
+| Check | Result |
+| --- | --- |
+| `uv run --frozen pytest -q` | `995 passed, 6 skipped` (plus the identity-outputs assertion updated to include `prior-run-conclusion`) |
+| `uv run --frozen ruff check .` | All checks passed |
+| `uv run --frozen mypy --python-version 3.12 src tests` | Success: no issues found in 50 source files |
+| `bash -n` on every `git ls-files '*.sh'` | clean |
+| `bash -n` on every workflow `run:` body | 26 bodies clean |
+| `compile()` on every embedded `<<'PY'` heredoc | 6 bodies clean |
+| `git diff --check` | clean |
+
+## Wave 2 self-review
+
+- **Ordering.** `recovery-scan` → `recovery-download` → `recovery-verify` → `prepare`
+  all precede `korvid-token`, `azure` and `attempt`; `download` still precedes
+  `recovery-scan` so the artifact and the marker are checked together. Asserted by
+  `test_recovery_proof_precedes_any_expensive_work`.
+- **Claim/dispatch ordering is unchanged.** The marker is still claimed after the
+  evidence upload and before dispatch; recovery makes that window survivable rather
+  than moving it, which keeps the "no duplicate lineage" invariant intact.
+- **Recovery cannot widen the duplicate window.** A recovery continuation still has to
+  claim the *next* marker (`sha256-<to_state_hash>`), so a second recovery from the same
+  failed run is refused at claim time exactly like any duplicate.
+- **No secret exposure.** The recovery steps use `github.token` only through
+  `github-token:` inputs, never in argv or logs; the token-hygiene test still passes.
+- **Fail-closed everywhere.** Zero, multiple, expired or untrusted recovery markers all
+  `setFailed`; every content mismatch raises `SystemExit`.
+
+## Wave 2 residual concerns
+
+1. **Still not executed against live GitHub Actions.** As in wave 1, the JavaScript and
+   embedded Python are executed as real subprocesses with stubbed Octokit and fixture
+   data. A live canary — including one deliberate post-upload failure followed by a
+   recovery dispatch — is still required before merge.
+2. **`actions/download-artifact` with `run-id` for the recovery marker** is exercised
+   only structurally (name, path, `run-id`, `repository`, `github-token`), not against
+   the live API.
+3. **Marker artifact deletion remains undefended**, and now additionally means an
+   operator can re-open a lineage step. This is documented in `README.md` as a trusted
+   operator action; it is the same permission level that can already rewrite evidence.

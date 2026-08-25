@@ -397,6 +397,9 @@ class AttemptOutcome:
     error_message: str | None = None
 
 
+_CANDIDATE_FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
+
+
 @dataclass(frozen=True, slots=True)
 class CampaignAction:
     action_id: str
@@ -427,6 +430,7 @@ class CampaignState:
     stage_index: int
     seed_index: int
     champion_fingerprint: str
+    seed_candidate_fingerprint: str
     champion_score: CampaignScore
     model_identity: ModelIdentity
     metric_calls_used: int
@@ -506,6 +510,7 @@ def state_hash(state: CampaignState) -> str:
         "stage_index": state.stage_index,
         "seed_index": state.seed_index,
         "champion_fingerprint": state.champion_fingerprint,
+        "seed_candidate_fingerprint": state.seed_candidate_fingerprint,
         "champion_score_fingerprint": state.champion_score.fingerprint,
         "champion_score_aggregate": state.champion_score.aggregate,
         "champion_score_hard_safety_failures": state.champion_score.hard_safety_failures,
@@ -537,11 +542,19 @@ def initial_state(
     prompt_lab_revision: str,
     korvid_revision: str,
     started_at: datetime,
+    seed_candidate_fingerprint: str,
 ) -> CampaignState:
-    """Create the initial campaign state."""
+    """Create the initial campaign state.
+
+    ``seed_candidate_fingerprint`` is the *resolved* fingerprint of
+    ``control.initial_candidate``. The manifest only ever carries the candidate
+    path as configuration; the state carries the real candidate identity so a
+    later tier rollover can re-seed without inventing a fingerprint.
+    """
+    validate_seed_candidate_fingerprint(seed_candidate_fingerprint)
     tier = control.model_tiers[0]
     initial_score = CampaignScore(
-        fingerprint=control.initial_candidate,
+        fingerprint=seed_candidate_fingerprint,
         aggregate=0.0,
         hard_safety_failures=0,
         core_regression=False,
@@ -558,7 +571,8 @@ def initial_state(
         tier_index=0,
         stage_index=0,
         seed_index=0,
-        champion_fingerprint=control.initial_candidate,
+        champion_fingerprint=seed_candidate_fingerprint,
+        seed_candidate_fingerprint=seed_candidate_fingerprint,
         champion_score=initial_score,
         model_identity=ModelIdentity(name=tier.name, model=tier.model, digest=tier.digest),
         metric_calls_used=0,
@@ -593,6 +607,22 @@ def _budget_exceeded(control: OptimizationCampaign, state: CampaignState) -> boo
     return state.stagnation_attempts >= control.stagnation_attempt_limit
 
 
+def validate_seed_candidate_fingerprint(fingerprint: str) -> None:
+    """A seed candidate identity must be a canonical candidate fingerprint.
+
+    Guards against the manifest's ``initial_candidate`` *path* leaking into the
+    state as if it were a candidate identity: nothing downstream could ever
+    resolve such a value back to a real candidate file.
+    """
+    if not isinstance(fingerprint, str) or not _CANDIDATE_FINGERPRINT_RE.fullmatch(
+        fingerprint
+    ):
+        raise ValueError(
+            "seed_candidate_fingerprint must be a canonical candidate fingerprint "
+            f"(64 lowercase hex characters), got {fingerprint!r}"
+        )
+
+
 def validate_state_binding(control: OptimizationCampaign, state: CampaignState) -> None:
     """Bind a state to its control manifest before any planning decision."""
     if state.campaign_id != control.campaign_id:
@@ -610,6 +640,7 @@ def validate_state_binding(control: OptimizationCampaign, state: CampaignState) 
             f"stage_index {state.stage_index} is outside the declared stages "
             f"(0..{len(control.stages)})"
         )
+    validate_seed_candidate_fingerprint(state.seed_candidate_fingerprint)
     _validate_model_identity(control, state)
 
 
@@ -728,8 +759,10 @@ def _make_fresh_tier_state(
 ) -> CampaignState:
     """Create a fresh state for the next tier, preserving campaign-wide accounting."""
     tier = control.model_tiers[next_tier]
+    seed_fingerprint = state.seed_candidate_fingerprint
+    validate_seed_candidate_fingerprint(seed_fingerprint)
     fresh_score = CampaignScore(
-        fingerprint=control.initial_candidate,
+        fingerprint=seed_fingerprint,
         aggregate=0.0,
         hard_safety_failures=0,
         core_regression=False,
@@ -746,7 +779,8 @@ def _make_fresh_tier_state(
         tier_index=next_tier,
         stage_index=0,
         seed_index=0,
-        champion_fingerprint=control.initial_candidate,
+        champion_fingerprint=seed_fingerprint,
+        seed_candidate_fingerprint=seed_fingerprint,
         champion_score=fresh_score,
         model_identity=ModelIdentity(name=tier.name, model=tier.model, digest=tier.digest),
         metric_calls_used=new_metric_calls,
@@ -810,6 +844,7 @@ def _handle_tier_exhaustion(
         stage_index=state.stage_index,
         seed_index=state.seed_index,
         champion_fingerprint=state.champion_fingerprint,
+        seed_candidate_fingerprint=state.seed_candidate_fingerprint,
         champion_score=state.champion_score,
         model_identity=state.model_identity,
         metric_calls_used=new_metric_calls,
@@ -849,6 +884,7 @@ def advance_state(
             stage_index=state.stage_index,
             seed_index=state.seed_index,
             champion_fingerprint=state.champion_fingerprint,
+            seed_candidate_fingerprint=state.seed_candidate_fingerprint,
             champion_score=state.champion_score,
             model_identity=state.model_identity,
             metric_calls_used=state.metric_calls_used,
@@ -881,6 +917,7 @@ def advance_state(
                 stage_index=state.stage_index,
                 seed_index=state.seed_index,
                 champion_fingerprint=state.champion_fingerprint,
+                seed_candidate_fingerprint=state.seed_candidate_fingerprint,
                 champion_score=state.champion_score,
                 model_identity=state.model_identity,
                 metric_calls_used=state.metric_calls_used,
@@ -903,6 +940,7 @@ def advance_state(
             stage_index=state.stage_index,
             seed_index=state.seed_index,
             champion_fingerprint=state.champion_fingerprint,
+            seed_candidate_fingerprint=state.seed_candidate_fingerprint,
             champion_score=state.champion_score,
             model_identity=state.model_identity,
             metric_calls_used=state.metric_calls_used,
@@ -968,6 +1006,7 @@ def advance_state(
                 stage_index=new_stage_index,
                 seed_index=new_seed_index,
                 champion_fingerprint=new_champion_fp,
+                seed_candidate_fingerprint=state.seed_candidate_fingerprint,
                 champion_score=new_champion_score,
                 model_identity=state.model_identity,
                 metric_calls_used=new_metric_calls,
@@ -993,6 +1032,7 @@ def advance_state(
             stage_index=new_stage_index,
             seed_index=new_seed_index,
             champion_fingerprint=new_champion_fp,
+            seed_candidate_fingerprint=state.seed_candidate_fingerprint,
             champion_score=new_champion_score,
             model_identity=state.model_identity,
             metric_calls_used=new_metric_calls,
@@ -1027,6 +1067,7 @@ def advance_state(
                 stage_index=state.stage_index,
                 seed_index=state.seed_index,
                 champion_fingerprint=state.champion_fingerprint,
+                seed_candidate_fingerprint=state.seed_candidate_fingerprint,
                 champion_score=state.champion_score,
                 model_identity=state.model_identity,
                 metric_calls_used=new_metric_calls,
@@ -1054,6 +1095,7 @@ def advance_state(
             stage_index=state.stage_index,
             seed_index=state.seed_index,
             champion_fingerprint=state.champion_fingerprint,
+            seed_candidate_fingerprint=state.seed_candidate_fingerprint,
             champion_score=state.champion_score,
             model_identity=state.model_identity,
             metric_calls_used=new_metric_calls,
@@ -1087,6 +1129,7 @@ def advance_state(
                 stage_index=state.stage_index,
                 seed_index=state.seed_index,
                 champion_fingerprint=state.champion_fingerprint,
+                seed_candidate_fingerprint=state.seed_candidate_fingerprint,
                 champion_score=state.champion_score,
                 model_identity=state.model_identity,
                 metric_calls_used=new_metric_calls,
@@ -1116,6 +1159,7 @@ def advance_state(
                 stage_index=state.stage_index,
                 seed_index=state.seed_index,
                 champion_fingerprint=state.champion_fingerprint,
+                seed_candidate_fingerprint=state.seed_candidate_fingerprint,
                 champion_score=state.champion_score,
                 model_identity=state.model_identity,
                 metric_calls_used=new_metric_calls,
@@ -1138,6 +1182,7 @@ def advance_state(
             stage_index=state.stage_index,
             seed_index=state.seed_index,
             champion_fingerprint=state.champion_fingerprint,
+            seed_candidate_fingerprint=state.seed_candidate_fingerprint,
             champion_score=state.champion_score,
             model_identity=state.model_identity,
             metric_calls_used=new_metric_calls,

@@ -14,6 +14,10 @@ source "${SCRIPT_DIR}/lib/reflection-provider.sh"
 : "${GROUNDING_CAMPAIGN:?GROUNDING_CAMPAIGN is required}"
 : "${KORVID_AKS_NAMESPACE:?KORVID_AKS_NAMESPACE is required}"
 : "${KORVID_AKS_SERVICE:?KORVID_AKS_SERVICE is required}"
+# The evaluation campaign resolves its model list from this variable, so the
+# strict control loader used by `korvid-campaign plan` below needs it long
+# before the planned tier model is known and re-exported.
+: "${KORVID_AKS_MODEL:?KORVID_AKS_MODEL is required}"
 
 if [[ -e "$CAMPAIGN_OUTPUT_ROOT" || -L "$CAMPAIGN_OUTPUT_ROOT" ]]; then
   echo "campaign output already exists: $CAMPAIGN_OUTPUT_ROOT" >&2
@@ -48,6 +52,9 @@ fi
 if [[ -n "${KORVID_REVISION:-}" ]]; then
   _binding_args+=(--expected-korvid-revision "$KORVID_REVISION")
 fi
+if [[ -n "${CAMPAIGN_SEED_FINGERPRINT:-}" ]]; then
+  _binding_args+=(--expected-seed-fingerprint "$CAMPAIGN_SEED_FINGERPRINT")
+fi
 
 _action_path="${_work_root}/action.json"
 if ! korvid-campaign plan \
@@ -72,6 +79,7 @@ from korvid_prompt_lab.campaigns import (
     load_optimization_campaign,
     next_action,
     state_hash,
+    validate_seed_candidate_fingerprint,
 )
 from korvid_prompt_lab.config import load_campaign, load_candidate
 
@@ -118,6 +126,7 @@ if payload != expected_action or payload["expected_state_hash"] != expected:
 candidate = load_candidate(candidate_path)
 if candidate.fingerprint != state.champion_fingerprint:
     raise SystemExit("candidate fingerprint does not match the state champion")
+validate_seed_candidate_fingerprint(state.seed_candidate_fingerprint)
 tier = control.model_tiers[planned.tier_index]
 if (
     state.model_identity.name,

@@ -43,7 +43,9 @@ jobs:
       manifest-sha256: ${{ steps.manifest.outputs.manifest-sha256 }}
       evaluation-campaign: ${{ steps.manifest.outputs.evaluation-campaign }}
       initial-candidate: ${{ steps.manifest.outputs.initial-candidate }}
+      model: ${{ steps.manifest.outputs.model }}
       expected-artifact-hash: ${{ steps.validate.outputs.expected-artifact-hash }}
+      prior-run-conclusion: ${{ steps.trust.outputs.prior-run-conclusion }}
     steps:
       - name: Validate dispatch input shapes
         id: validate
@@ -228,13 +230,24 @@ jobs:
               if (headRepository.toLowerCase() !== expectedRepository.toLowerCase() ||
                   prior.data.path !== '.github/workflows/optimization-campaign.yml' ||
                   prior.data.event !== 'workflow_dispatch' ||
-                  prior.data.head_branch !== defaultBranch ||
-                  prior.data.conclusion !== 'success') {
+                  prior.data.head_branch !== defaultBranch) {
                 core.setFailed(
-                  'prior_run_id is not a successful trusted optimization campaign run'
+                  'prior_run_id is not a trusted optimization campaign run'
                 );
                 return;
               }
+              // A `failure` conclusion is only admissible as a *recovery* input:
+              // the campaign job additionally requires the exact safe artifact
+              // for the expected state and a trusted lineage marker produced by
+              // that same run before any expensive work may start.
+              if (prior.data.conclusion !== 'success' &&
+                  prior.data.conclusion !== 'failure') {
+                core.setFailed(
+                  'prior_run_id did not conclude as success or failure'
+                );
+                return;
+              }
+              core.setOutput('prior-run-conclusion', prior.data.conclusion);
             }
 
       - name: Checkout trusted Prompt Lab identity
@@ -321,6 +334,7 @@ jobs:
               stream.write(f"manifest-sha256=sha256:{digest}\n")
               stream.write(f"evaluation-campaign={evaluation_relative.as_posix()}\n")
               stream.write(f"initial-candidate={control.initial_candidate}\n")
+              stream.write(f"model={first_tier['model']}\n")
           PY
 
   campaign:
@@ -378,6 +392,191 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.prior_run_id }}
 
+      - name: Locate the lineage marker of a failed producer run
+        id: recovery-scan
+        if: inputs.prior_run_id != '' && needs.identity.outputs.prior-run-conclusion == 'failure'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
+        env:
+          CAMPAIGN_ID: ${{ needs.identity.outputs.campaign-id }}
+          PRIOR_RUN_ID: ${{ inputs.prior_run_id }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const campaignId = String(process.env.CAMPAIGN_ID || '');
+            if (!/^[a-z0-9][a-z0-9._-]{0,62}$/.test(campaignId)) {
+              core.setFailed('campaign id is invalid');
+              return;
+            }
+            const priorRunId = String(process.env.PRIOR_RUN_ID || '');
+            if (!/^[0-9]+$/.test(priorRunId)) {
+              core.setFailed('prior run id is invalid');
+              return;
+            }
+            const repository = (context.payload && context.payload.repository) || {};
+            const repositoryId = repository.id;
+            const defaultBranch = repository.default_branch;
+            const repositoryName = String(repository.full_name || '');
+            if (repositoryId === undefined || repositoryId === null ||
+                !defaultBranch || !repositoryName) {
+              core.setFailed('repository context is incomplete for lineage trust');
+              return;
+            }
+            const WORKFLOW_PATH = '.github/workflows/optimization-campaign.yml';
+            let prior;
+            try {
+              prior = await github.rest.actions.getWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: Number(priorRunId),
+              });
+            } catch (error) {
+              core.setFailed('prior run does not identify a run in this repository');
+              return;
+            }
+            const data = (prior && prior.data) || {};
+            const head = data.head_repository || {};
+            const own = data.repository || {};
+            const trustedProducer = data.path === WORKFLOW_PATH
+              && data.event === 'workflow_dispatch'
+              && data.head_branch === defaultBranch
+              && String(head.full_name || '').toLowerCase()
+                 === repositoryName.toLowerCase()
+              && Number(head.id) === Number(repositoryId)
+              && Number(own.id) === Number(repositoryId);
+            if (!trustedProducer) {
+              core.setFailed(
+                'prior run is not a trusted optimization campaign dispatch'
+              );
+              return;
+            }
+            const namePattern = new RegExp(
+              '^campaign-lineage-' + campaignId +
+              '-(initial|sha256-[0-9a-f]{64})$'
+            );
+            const artifacts = await github.paginate(
+              github.rest.actions.listWorkflowRunArtifacts,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: Number(priorRunId),
+                per_page: 100,
+              },
+            );
+            const markers = [];
+            for (const artifact of artifacts) {
+              if (!artifact || artifact.expired) {
+                continue;
+              }
+              if (!namePattern.test(String(artifact.name || ''))) {
+                continue;
+              }
+              const workflowRun = artifact.workflow_run || {};
+              if (Number(workflowRun.repository_id) !== Number(repositoryId) ||
+                  Number(workflowRun.head_repository_id) !== Number(repositoryId) ||
+                  workflowRun.head_branch !== defaultBranch ||
+                  String(workflowRun.id) !== priorRunId) {
+                continue;
+              }
+              markers.push(String(artifact.name));
+            }
+            if (markers.length !== 1) {
+              core.setFailed(
+                'failed prior run ' + priorRunId + ' does not carry exactly one ' +
+                'trusted lineage marker (' + markers.length + ' found); it cannot ' +
+                'be continued'
+              );
+              return;
+            }
+            core.setOutput('marker-name', markers[0]);
+
+      - name: Download the failed producer's lineage marker
+        id: recovery-download
+        if: steps.recovery-scan.outputs.marker-name != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ${{ steps.recovery-scan.outputs.marker-name }}
+          path: prompt-lab/artifacts/optimization-campaign/lineage-recovery
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.prior_run_id }}
+
+      - name: Prove the failed producer really produced this exact state
+        id: recovery-verify
+        if: steps.recovery-scan.outputs.marker-name != ''
+        working-directory: prompt-lab
+        shell: bash
+        env:
+          CAMPAIGN_ID: ${{ needs.identity.outputs.campaign-id }}
+          PRIOR_RUN_ID: ${{ inputs.prior_run_id }}
+          EXPECTED_STATE_HASH: ${{ inputs.expected_state_hash }}
+          MARKER_NAME: ${{ steps.recovery-scan.outputs.marker-name }}
+          PROMPT_LAB_REF: ${{ inputs.prompt_lab_ref }}
+          KORVID_REF: ${{ inputs.korvid_ref }}
+          LINEAGE_RECOVERY_ROOT: ${{ github.workspace }}/prompt-lab/artifacts/optimization-campaign/lineage-recovery
+        run: |
+          set -Eeuo pipefail
+          python3 - "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          recovery_root = Path(os.environ["LINEAGE_RECOVERY_ROOT"]).resolve()
+          marker_path = recovery_root / "lineage-marker.json"
+          if marker_path.is_symlink() or not marker_path.is_file():
+              raise SystemExit("recovery lineage marker is not a regular file")
+          entries = {item.name for item in recovery_root.iterdir()}
+          if entries != {"lineage-marker.json"}:
+              raise SystemExit("recovery lineage marker package has an invalid shape")
+          marker = json.loads(marker_path.read_text(encoding="utf-8"))
+          if not isinstance(marker, dict):
+              raise SystemExit("recovery lineage marker is not a mapping")
+          if set(marker) != {
+              "schema_version",
+              "campaign_id",
+              "from_state_key",
+              "from_state_hash",
+              "to_state_hash",
+              "producer_run_id",
+              "prompt_lab_revision",
+              "korvid_revision",
+          }:
+              raise SystemExit("recovery lineage marker has an invalid shape")
+          if marker["schema_version"] != 1:
+              raise SystemExit("recovery lineage marker schema_version must be 1")
+          if marker["campaign_id"] != os.environ["CAMPAIGN_ID"]:
+              raise SystemExit("recovery lineage marker campaign_id mismatch")
+          expected_name = (
+              f"campaign-lineage-{marker['campaign_id']}-{marker['from_state_key']}"
+          )
+          if expected_name != os.environ["MARKER_NAME"]:
+              raise SystemExit("recovery lineage marker name does not match its content")
+          if str(marker["producer_run_id"]) != os.environ["PRIOR_RUN_ID"]:
+              raise SystemExit("recovery lineage marker was produced by another run")
+          expected_state_hash = os.environ["EXPECTED_STATE_HASH"]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_state_hash):
+              raise SystemExit("expected_state_hash must be sha256:<64 lowercase hex>")
+          # The decisive recovery invariant: the failed run really did produce
+          # exactly the state this run intends to continue from.
+          if marker["to_state_hash"] != expected_state_hash:
+              raise SystemExit(
+                  "recovery lineage marker proves run "
+                  f"{marker['producer_run_id']} produced {marker['to_state_hash']}, "
+                  f"not the requested {expected_state_hash}"
+              )
+          if marker["from_state_hash"] == expected_state_hash:
+              raise SystemExit("recovery lineage marker is not a forward transition")
+          if marker["prompt_lab_revision"] != os.environ["PROMPT_LAB_REF"] or \
+                  marker["korvid_revision"] != os.environ["KORVID_REF"]:
+              raise SystemExit("recovery lineage marker revision mismatch")
+          for field in ("prompt_lab_revision", "korvid_revision"):
+              if not re.fullmatch(r"[0-9a-f]{40}", str(marker[field])):
+                  raise SystemExit(f"recovery lineage marker {field} is invalid")
+          with Path(sys.argv[1]).open("a", encoding="utf-8") as stream:
+              stream.write("verified=true\n")
+          PY
+
       - name: Verify or initialize exact prior state
         id: prepare
         working-directory: prompt-lab
@@ -391,6 +590,8 @@ jobs:
           PROMPT_LAB_REF: ${{ inputs.prompt_lab_ref }}
           KORVID_REF: ${{ inputs.korvid_ref }}
           PRIOR_RUN_ID: ${{ inputs.prior_run_id }}
+          PRIOR_RUN_CONCLUSION: ${{ needs.identity.outputs.prior-run-conclusion }}
+          RECOVERY_VERIFIED: ${{ steps.recovery-verify.outputs.verified }}
           EXPECTED_STATE_HASH: ${{ inputs.expected_state_hash }}
           PRIOR_ROOT: ${{ github.workspace }}/prompt-lab/artifacts/optimization-campaign/prior
           CAMPAIGN_ROOT: ${{ github.workspace }}/prompt-lab/artifacts/optimization-campaign
@@ -405,7 +606,6 @@ jobs:
           import re
           import shutil
           import sys
-          from dataclasses import replace
           from datetime import UTC, datetime
           from pathlib import Path
 
@@ -415,7 +615,6 @@ jobs:
           )
           from korvid_prompt_lab.campaign_cli import _load_state
           from korvid_prompt_lab.campaigns import (
-              CampaignScore,
               initial_state,
               load_optimization_campaign,
               next_action,
@@ -446,6 +645,13 @@ jobs:
           if control.campaign_id != os.environ["CAMPAIGN_ID"]:
               raise SystemExit("campaign_id changed after trusted preflight")
 
+          # The manifest carries the seed candidate *path* as configuration; the
+          # state carries its real fingerprint, so a tier rollover can re-seed
+          # with a resolvable candidate identity instead of a path string.
+          seed_candidate_fingerprint = load_candidate(
+              initial_candidate_path
+          ).fingerprint
+
           state_path = campaign_root / "prior-state.json"
           candidate_path = campaign_root / "prior-candidate.yaml"
           if state_path.exists() or state_path.is_symlink():
@@ -464,6 +670,15 @@ jobs:
               lineage_from_key = "initial"
           lineage_marker_name = f"campaign-lineage-{control.campaign_id}-{lineage_from_key}"
           if os.environ["PRIOR_RUN_ID"]:
+              # A failed producer run may only be continued when a trusted
+              # lineage marker from that same run proved it really produced this
+              # exact state. Anything else is an ordinary rejected failure.
+              if os.environ.get("PRIOR_RUN_CONCLUSION") == "failure" and \
+                      os.environ.get("RECOVERY_VERIFIED") != "true":
+                  raise SystemExit(
+                      "a failed prior run may only be continued with a verified "
+                      "lineage recovery marker"
+                  )
               prior_root = Path(os.environ["PRIOR_ROOT"]).resolve()
               safe_campaign = prior_root / "safe-campaign"
               required = {
@@ -523,6 +738,8 @@ jobs:
                   raise SystemExit("prior state revision mismatch")
               if state.status.value != "running":
                   raise SystemExit("only a RUNNING prior state may continue")
+              if state.seed_candidate_fingerprint != seed_candidate_fingerprint:
+                  raise SystemExit("prior state seed candidate fingerprint mismatch")
               candidate = load_candidate(safe_campaign / "champion-candidate.yaml")
               if candidate.fingerprint != state.champion_fingerprint:
                   raise SystemExit("prior champion candidate does not match state")
@@ -531,25 +748,12 @@ jobs:
                   safe_campaign / "champion-candidate.yaml", candidate_path
               )
           else:
-              candidate = load_candidate(initial_candidate_path)
               state = initial_state(
                   control,
                   prompt_lab_revision=os.environ["PROMPT_LAB_REF"],
                   korvid_revision=os.environ["KORVID_REF"],
                   started_at=datetime.now(tz=UTC),
-              )
-              state = replace(
-                  state,
-                  champion_fingerprint=candidate.fingerprint,
-                  champion_score=CampaignScore(
-                      fingerprint=candidate.fingerprint,
-                      aggregate=0.0,
-                      hard_safety_failures=0,
-                      core_regression=False,
-                      systemic_failures=0,
-                      pass_at_3=0.0,
-                      pass_at_5=0.0,
-                  ),
+                  seed_candidate_fingerprint=seed_candidate_fingerprint,
               )
               expected_state_hash = state_hash(state)
               state_path.write_text(
@@ -567,6 +771,7 @@ jobs:
               stream.write(f"action-kind={action.kind.value}\n")
               stream.write(f"lineage-from-key={lineage_from_key}\n")
               stream.write(f"lineage-marker-name={lineage_marker_name}\n")
+              stream.write(f"seed-candidate-fingerprint={seed_candidate_fingerprint}\n")
           PY
 
       - name: Scan for an already-consumed campaign lineage input
@@ -586,6 +791,54 @@ jobs:
               return;
             }
             const currentRunId = String(process.env.CURRENT_RUN_ID || '');
+            const repository = (context.payload && context.payload.repository) || {};
+            const repositoryId = repository.id;
+            const defaultBranch = repository.default_branch;
+            const repositoryName = String(repository.full_name || '');
+            if (repositoryId === undefined || repositoryId === null ||
+                !defaultBranch || !repositoryName) {
+              core.setFailed('repository context is incomplete for lineage trust');
+              return;
+            }
+            const WORKFLOW_PATH = '.github/workflows/optimization-campaign.yml';
+            // A repository-scoped artifact name proves nothing about who wrote
+            // it. Only this repository's own default-branch dispatches of this
+            // exact workflow may consume a campaign lineage.
+            const isSameRepositoryArtifact = (workflowRun) => (
+              Number(workflowRun.repository_id) === Number(repositoryId)
+              && Number(workflowRun.head_repository_id) === Number(repositoryId)
+              && workflowRun.head_branch === defaultBranch
+            );
+            const trustedRuns = new Map();
+            const isTrustedProducerRun = async (runId) => {
+              const key = String(runId);
+              if (trustedRuns.has(key)) {
+                return trustedRuns.get(key);
+              }
+              let run;
+              try {
+                run = await github.rest.actions.getWorkflowRun({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: Number(runId),
+                });
+              } catch (error) {
+                trustedRuns.set(key, false);
+                return false;
+              }
+              const data = (run && run.data) || {};
+              const head = data.head_repository || {};
+              const own = data.repository || {};
+              const trusted = data.path === WORKFLOW_PATH
+                && data.event === 'workflow_dispatch'
+                && data.head_branch === defaultBranch
+                && String(head.full_name || '').toLowerCase()
+                   === repositoryName.toLowerCase()
+                && Number(head.id) === Number(repositoryId)
+                && Number(own.id) === Number(repositoryId);
+              trustedRuns.set(key, trusted);
+              return trusted;
+            };
             const artifacts = await github.paginate(
               github.rest.actions.listArtifactsForRepo,
               {
@@ -595,18 +848,45 @@ jobs:
                 per_page: 100,
               },
             );
-            const claims = artifacts.filter((artifact) => {
+            let foreignRunId = '';
+            let currentRunMarker = '';
+            for (const artifact of artifacts) {
               if (!artifact || artifact.name !== markerName || artifact.expired) {
-                return false;
+                continue;
               }
-              const producer = artifact.workflow_run && artifact.workflow_run.id;
-              return producer !== undefined
-                && producer !== null
-                && String(producer) !== currentRunId;
-            });
+              const workflowRun = artifact.workflow_run || {};
+              const producer = workflowRun.id;
+              if (producer === undefined || producer === null) {
+                continue;
+              }
+              if (!isSameRepositoryArtifact(workflowRun)) {
+                core.warning(
+                  'ignoring lineage marker artifact from an untrusted producer run ' +
+                  String(producer)
+                );
+                continue;
+              }
+              if (!(await isTrustedProducerRun(producer))) {
+                core.warning(
+                  'ignoring lineage marker artifact whose producing run ' +
+                  String(producer) + ' is not a trusted campaign dispatch'
+                );
+                continue;
+              }
+              if (String(producer) === currentRunId) {
+                if (!currentRunMarker) {
+                  currentRunMarker = String(producer);
+                }
+                continue;
+              }
+              foreignRunId = String(producer);
+              break;
+            }
+            const markerRunId = foreignRunId || currentRunMarker;
+            core.setOutput('marker-run-id', markerRunId);
             core.setOutput(
-              'marker-run-id',
-              claims.length ? String(claims[0].workflow_run.id) : '',
+              'marker-scope',
+              markerRunId === '' ? '' : (foreignRunId ? 'foreign' : 'current'),
             );
 
       - name: Download the conflicting campaign lineage marker
@@ -630,6 +910,7 @@ jobs:
           LINEAGE_FROM_KEY: ${{ steps.prepare.outputs.lineage-from-key }}
           EXPECTED_STATE_HASH: ${{ inputs.expected_state_hash }}
           MARKER_RUN_ID: ${{ steps.lineage-scan.outputs.marker-run-id }}
+          MARKER_SCOPE: ${{ steps.lineage-scan.outputs.marker-scope }}
           LINEAGE_CONFLICT_ROOT: ${{ github.workspace }}/prompt-lab/artifacts/optimization-campaign/lineage-conflict
         run: |
           set -Eeuo pipefail
@@ -675,10 +956,25 @@ jobs:
           for field in ("prompt_lab_revision", "korvid_revision"):
               if not re.fullmatch(r"[0-9a-f]{40}", str(marker[field])):
                   raise SystemExit(f"conflicting lineage marker {field} is invalid")
+          if os.environ.get("MARKER_SCOPE") == "current":
+              # A re-run of an attempt that already claimed its lineage. Redoing
+              # the expensive action here would burn hours and still be refused
+              # at claim time, so stop with a bounded recovery instruction.
+              raise SystemExit(
+                  "this run already produced campaign state "
+                  f"{marker['to_state_hash']} and claimed lineage "
+                  f"{marker['from_state_key']}; do not re-run this job. Recover by "
+                  "dispatching optimization-campaign.yml with "
+                  f"prior_run_id={marker['producer_run_id']} and "
+                  f"expected_state_hash={marker['to_state_hash']}"
+              )
           raise SystemExit(
               "campaign lineage input was already consumed by run "
               f"{marker['producer_run_id']}; refusing to duplicate "
-              f"{marker['from_state_key']} -> {marker['to_state_hash']}"
+              f"{marker['from_state_key']} -> {marker['to_state_hash']}. Recover by "
+              f"dispatching optimization-campaign.yml with "
+              f"prior_run_id={marker['producer_run_id']} and "
+              f"expected_state_hash={marker['to_state_hash']}"
           )
           PY
 
@@ -772,6 +1068,7 @@ jobs:
           CAMPAIGN_OUTPUT_ROOT: ${{ github.workspace }}/prompt-lab/artifacts/optimization-campaign/next
           CAMPAIGN_EXPECTED_PRIOR_HASH: ${{ steps.prepare.outputs.prior-state-hash }}
           CAMPAIGN_MANIFEST_SHA256: ${{ needs.identity.outputs.manifest-sha256 }}
+          CAMPAIGN_SEED_FINGERPRINT: ${{ steps.prepare.outputs.seed-candidate-fingerprint }}
           GROUNDING_CAMPAIGN: ${{ needs.identity.outputs.evaluation-campaign }}
           GROUNDING_REFLECTION_MODEL: ${{ steps.prepare.outputs.action-kind == 'search' && vars.GROUNDING_REFLECTION_MODEL || '' }}
           GROUNDING_REFLECTION_CREDENTIAL: >-
@@ -783,6 +1080,7 @@ jobs:
           KORVID_SOURCE_ROOT: ${{ github.workspace }}/korvid
           KORVID_AKS_NAMESPACE: ${{ vars.KORVID_AKS_NAMESPACE }}
           KORVID_AKS_SERVICE: ${{ vars.KORVID_AKS_SERVICE }}
+          KORVID_AKS_MODEL: ${{ needs.identity.outputs.model }}
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/korvid-uv-env
           PROMPT_LAB_REVISION: ${{ inputs.prompt_lab_ref }}
           KORVID_REVISION: ${{ inputs.korvid_ref }}
@@ -807,6 +1105,8 @@ jobs:
           PROMPT_LAB_REF: ${{ inputs.prompt_lab_ref }}
           KORVID_REF: ${{ inputs.korvid_ref }}
           CURRENT_CANDIDATE: ${{ steps.prepare.outputs.candidate-path }}
+          SEED_CANDIDATE: ${{ needs.identity.outputs.initial-candidate }}
+          SEED_CANDIDATE_FINGERPRINT: ${{ steps.prepare.outputs.seed-candidate-fingerprint }}
           NEXT_ROOT: ${{ github.workspace }}/prompt-lab/artifacts/optimization-campaign/next
           SAFE_UPLOAD_ROOT: ${{ github.workspace }}/prompt-lab/artifacts/optimization-campaign/safe-upload
           WRAPPER_EXIT: ${{ steps.attempt.outputs.wrapper-exit }}
@@ -870,6 +1170,16 @@ jobs:
               if best.is_file():
                   candidates.append(best)
           candidates.append(Path(os.environ["CURRENT_CANDIDATE"]).resolve())
+          # A tier rollover re-seeds the new tier with the campaign's seed
+          # candidate, so that candidate must remain packageable as champion.
+          seed_candidate = (Path.cwd() / os.environ["SEED_CANDIDATE"]).resolve()
+          if seed_candidate.is_file() and not seed_candidate.is_symlink():
+              if load_candidate(seed_candidate).fingerprint != \
+                      os.environ["SEED_CANDIDATE_FINGERPRINT"]:
+                  raise SystemExit("seed candidate fingerprint changed mid-run")
+              candidates.append(seed_candidate)
+          if state.seed_candidate_fingerprint != os.environ["SEED_CANDIDATE_FINGERPRINT"]:
+              raise SystemExit("rendered state seed candidate fingerprint changed")
           champion_source = None
           for candidate_path in candidates:
               if candidate_path.is_symlink() or not candidate_path.is_file():

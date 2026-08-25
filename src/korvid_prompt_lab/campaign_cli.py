@@ -37,6 +37,7 @@ from .campaigns import (
     load_optimization_campaign,
     next_action,
     state_hash,
+    validate_seed_candidate_fingerprint,
     validate_state_binding,
 )
 from .config import load_campaign
@@ -51,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
         target.add_argument("--expected-manifest-sha256", type=str, default=None)
         target.add_argument("--expected-prompt-lab-revision", type=str, default=None)
         target.add_argument("--expected-korvid-revision", type=str, default=None)
+        target.add_argument("--expected-seed-fingerprint", type=str, default=None)
 
     # plan
     plan_p = sub.add_parser("plan", help="Emit next action as JSON.")
@@ -132,6 +134,7 @@ def _load_state(path: Path) -> CampaignState:
         stage_index=data["stage_index"],
         seed_index=data["seed_index"],
         champion_fingerprint=data["champion_fingerprint"],
+        seed_candidate_fingerprint=data["seed_candidate_fingerprint"],
         champion_score=CampaignScore(
             fingerprint=score_data["fingerprint"],
             aggregate=score_data["aggregate"],
@@ -268,6 +271,14 @@ def _enforce_identity_bindings(
             "korvid_revision mismatch: state has "
             f"{state.korvid_revision!r}, expected {expected_korvid!r}"
         )
+    expected_seed = getattr(args, "expected_seed_fingerprint", None)
+    if expected_seed:
+        validate_seed_candidate_fingerprint(expected_seed)
+        if state.seed_candidate_fingerprint != expected_seed:
+            raise ValueError(
+                "seed_candidate_fingerprint mismatch: state has "
+                f"{state.seed_candidate_fingerprint!r}, expected {expected_seed!r}"
+            )
     validate_state_binding(control, state)
 
 

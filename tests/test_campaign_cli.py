@@ -96,6 +96,9 @@ def _write_control(path: Path, **overrides: object) -> None:
             _write_evaluation_campaign(evaluation_path, campaign_id=evaluation_id)
 
 
+SEED_FINGERPRINT = "7" * 64
+
+
 def _make_state(started_at: str | None = None) -> CampaignState:
     if started_at is None:
         started_at = datetime.now(tz=UTC).isoformat()
@@ -108,9 +111,10 @@ def _make_state(started_at: str | None = None) -> CampaignState:
         tier_index=0,
         stage_index=0,
         seed_index=0,
-        champion_fingerprint="seed.yaml",
+        champion_fingerprint=SEED_FINGERPRINT,
+        seed_candidate_fingerprint=SEED_FINGERPRINT,
         champion_score=CampaignScore(
-            fingerprint="seed.yaml",
+            fingerprint=SEED_FINGERPRINT,
             aggregate=0.0,
             hard_safety_failures=0,
             core_regression=False,
@@ -219,7 +223,7 @@ def _write_evidence(
         "schema_version": 1,
         "status": "changed",
         "outcome": "improved",
-        "seed_candidate_fingerprint": "seed.yaml",
+        "seed_candidate_fingerprint": SEED_FINGERPRINT,
         "best_candidate_fingerprint": candidate_fingerprint,
         "contract": {
             "campaign_id": "test-campaign",
@@ -263,7 +267,7 @@ def _write_evidence(
             "schema_version": 1,
             "campaign_id": "test-campaign",
             "candidate_id": "cand-1",
-            "seed_candidate_fingerprint": "seed.yaml",
+            "seed_candidate_fingerprint": SEED_FINGERPRINT,
             "train_case_ids": ["case-a", "case-b"],
             "validation_case_ids": ["case-c"],
             "max_metric_calls": 12,
@@ -274,7 +278,7 @@ def _write_evidence(
         "best_idx": 1,
         "best_validation_score": 0.6,
         "best_candidate_fingerprint": candidate_fingerprint,
-        "seed_candidate_fingerprint": "seed.yaml",
+        "seed_candidate_fingerprint": SEED_FINGERPRINT,
         "best_candidate_differs_from_seed": True,
         "train_case_ids": ["case-a", "case-b"],
         "validation_case_ids": ["case-c"],
@@ -336,6 +340,7 @@ class TestCLIPlan:
             status=CampaignStatus.QUALIFIED,
             tier_index=0, stage_index=2, seed_index=3,
             champion_fingerprint="fp",
+            seed_candidate_fingerprint=SEED_FINGERPRINT,
             champion_score=CampaignScore(
                 fingerprint="fp", aggregate=0.9,
                 hard_safety_failures=0, core_regression=False,

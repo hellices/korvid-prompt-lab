@@ -1128,7 +1128,27 @@ before it dispatches a continuation, a run claims a durable repository-scoped
 state hash (`initial` for the first run). A later run that was handed the same
 prior state finds that marker through the GitHub API and stops before any
 expensive work, so duplicate lineages cannot be produced even from separately
-downloaded copies of the same state. Results for model tiers are independent: candidates,
+downloaded copies of the same state. Only this repository's own
+`workflow_dispatch` runs of `.github/workflows/optimization-campaign.yml` on the
+default branch can produce a trusted marker; artifacts uploaded from forks,
+other workflows, other events, or other repositories are ignored rather than
+allowed to consume a lineage.
+
+If a run fails *after* it uploaded its state and claimed its marker, the
+campaign is recoverable rather than wedged. Dispatch a continuation with
+`prior_run_id` set to the failed producer run and `expected_state_hash` set to
+the `to_state_hash` that run reported (the failure message of a re-run names
+both). The continuation is admitted only when the exact safe campaign artifact
+for that state **and** a trusted lineage marker produced by that same run both
+validate and agree on campaign id, revisions, and the produced state hash; every
+other failed prior run stays rejected. Re-running the failed job itself is
+refused early — before any expensive wrapper call — with that same recovery
+instruction, so no GPU time is burned twice. A campaign id is therefore
+single-use per lineage step for the 90-day artifact retention window; deleting a
+lineage marker artifact deliberately re-opens that step and must be treated as a
+trusted operator action.
+
+Results for model tiers are independent: candidates,
 scores, and holdout evidence from one tier do not qualify another tier.
 `QUALIFIED` still requires explicit publication approval through the existing
 reviewed publication path; this workflow never publishes automatically.

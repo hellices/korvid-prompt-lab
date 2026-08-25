@@ -266,6 +266,8 @@ class TestWorkflowPackagingAcceptsSafeProjections:
                 "PROMPT_LAB_REF": "a" * 40,
                 "KORVID_REF": "b" * 40,
                 "CURRENT_CANDIDATE": prepared["candidate-path"],
+                "SEED_CANDIDATE": INITIAL_CANDIDATE.relative_to(ROOT).as_posix(),
+                "SEED_CANDIDATE_FINGERPRINT": prepared["seed-candidate-fingerprint"],
                 "NEXT_ROOT": str(next_root),
                 "SAFE_UPLOAD_ROOT": str(scratch / "safe-upload"),
                 "WRAPPER_EXIT": "0",

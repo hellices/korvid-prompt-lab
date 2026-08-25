@@ -27,22 +27,40 @@ _CONTROL = _ROOT / "examples/optimization-campaigns/qwen3-small-operator.yaml"
 _EVALUATION = _ROOT / "examples/campaigns/aks-small-operator-qualification.yaml"
 _CANDIDATE = _ROOT / "examples/candidates/shipped-small.yaml"
 
+# The wrapper runs under an explicitly-constructed environment. Only generic
+# process plumbing is inherited; every campaign variable must be supplied.
+_INHERITED_ENV = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SHELL",
+    "USER",
+    "LOGNAME",
+    "VIRTUAL_ENV",
+    "PYTHONPATH",
+    "SYSTEMROOT",
+)
+
 
 def _state(kind: str) -> CampaignState:
     os.environ.setdefault("KORVID_AKS_MODEL", "qwen3:0.6b")
     os.environ.setdefault("KORVID_AKS_NAMESPACE", "ollama")
     os.environ.setdefault("KORVID_AKS_SERVICE", "ollama")
     control = load_optimization_campaign(_CONTROL, load_campaign(_EVALUATION))
+    fingerprint = load_candidate(_CANDIDATE).fingerprint
     state = initial_state(
         control,
         prompt_lab_revision="a" * 40,
         korvid_revision="b" * 40,
         started_at=datetime.now(tz=UTC),
+        seed_candidate_fingerprint=fingerprint,
     )
-    fingerprint = load_candidate(_CANDIDATE).fingerprint
     state = replace(
         state,
-        champion_fingerprint=fingerprint,
         champion_score=CampaignScore(
             fingerprint=fingerprint,
             aggregate=0.5,
@@ -174,6 +192,7 @@ def run_step(
     campaign_command_mode: str = "delegate",
     expected_hash: str | None = None,
     extra_env: dict[str, str] | None = None,
+    omit_env: tuple[str, ...] = (),
 ) -> tuple[subprocess.CompletedProcess[str], list[Any], Path]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     state = _state(kind)
@@ -190,7 +209,14 @@ def run_step(
             evidence_mode=evidence_mode,
         )
     output = tmp_path / "campaign-output"
-    env = dict(os.environ)
+    # The subprocess environment is built explicitly, exactly like the workflow
+    # `attempt` step: nothing the wrapper needs may be inherited implicitly from
+    # this pytest process (which sets KORVID_AKS_MODEL for in-process loading).
+    env = {
+        name: os.environ[name]
+        for name in _INHERITED_ENV
+        if name in os.environ
+    }
     env.update(
         {
             "CAMPAIGN_CONTROL": str(_CONTROL),
@@ -203,6 +229,7 @@ def run_step(
             "GROUNDING_REFLECTION_CREDENTIAL": "test-token",
             "KORVID_AKS_NAMESPACE": "ollama",
             "KORVID_AKS_SERVICE": "ollama",
+            "KORVID_AKS_MODEL": "qwen3:0.6b",
             "KORVID_SOURCE_ROOT": "/fake/korvid",
             "WORKFLOW_RUN_URL": "https://example.test/run/1",
             "PROMPT_LAB_REVISION": "a" * 40,
@@ -243,6 +270,8 @@ def run_step(
     if not reflection_configured:
         env.pop("GROUNDING_REFLECTION_MODEL", None)
         env.pop("GROUNDING_REFLECTION_CREDENTIAL", None)
+    for name in omit_env:
+        env.pop(name, None)
     result = subprocess.run(
         ["bash", str(_SCRIPT)],
         cwd=_ROOT,
@@ -504,5 +533,39 @@ def test_wrapper_accepts_the_exact_manifest_identity(tmp_path: Path) -> None:
     # The matching identity is accepted: the round actually ran and the
     # transient failure was recorded as a normal system-error transition.
     assert "manifest identity mismatch" not in (result.stderr + result.stdout)
+    assert calls
+    assert (output / "campaign-state.json").is_file()
+
+
+def test_wrapper_requires_the_evaluation_model_env_before_planning(
+    tmp_path: Path,
+) -> None:
+    """KORVID_AKS_MODEL is a hard precondition, not an implicit inheritance.
+
+    The evaluation campaign declares ``models: [env:KORVID_AKS_MODEL]``, so the
+    strict control loader needs it during ``korvid-campaign plan``. The wrapper
+    must fail fast in its required-environment preamble rather than dying deep
+    inside campaign planning.
+    """
+    result, calls, output = run_step(
+        tmp_path,
+        omit_env=("KORVID_AKS_MODEL",),
+    )
+
+    combined = result.stderr + result.stdout
+    assert result.returncode != 0
+    assert "KORVID_AKS_MODEL is required" in combined
+    assert "campaign planning failed" not in combined
+    assert not calls
+    assert not output.exists()
+
+
+def test_wrapper_plans_successfully_with_the_supplied_model_env(
+    tmp_path: Path,
+) -> None:
+    """With the variable explicitly supplied, planning reaches the round."""
+    result, calls, output = run_step(tmp_path)
+
+    assert "KORVID_AKS_MODEL" not in (result.stderr + result.stdout)
     assert calls
     assert (output / "campaign-state.json").is_file()

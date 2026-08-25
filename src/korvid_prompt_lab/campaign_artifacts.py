@@ -1309,6 +1309,7 @@ def _serialize_state(state: CampaignState) -> dict[str, Any]:
         "stage_index": state.stage_index,
         "seed_index": state.seed_index,
         "champion_fingerprint": state.champion_fingerprint,
+        "seed_candidate_fingerprint": state.seed_candidate_fingerprint,
         "champion_score": {
             "fingerprint": state.champion_score.fingerprint,
             "aggregate": state.champion_score.aggregate,

@@ -35,6 +35,9 @@ MUCH_LATER = datetime(2026, 1, 15, 18, 1, 0, tzinfo=UTC)
 DIGEST_A = "sha256:" + "a" * 64
 DIGEST_B = "sha256:" + "b" * 64
 
+# A real candidate fingerprint is a bare sha256 hex digest, never a manifest path.
+SEED_FINGERPRINT = "9" * 64
+
 
 def _control(
     *,
@@ -98,7 +101,13 @@ def _qualifying_score(fingerprint: str) -> CampaignScore:
 
 def _init(control: OptimizationCampaign | None = None) -> CampaignState:
     c = control or _control()
-    return initial_state(c, prompt_lab_revision="abc123", korvid_revision="def456", started_at=NOW)
+    return initial_state(
+        c,
+        prompt_lab_revision="abc123",
+        korvid_revision="def456",
+        started_at=NOW,
+        seed_candidate_fingerprint=SEED_FINGERPRINT,
+    )
 
 
 def _run_seeds(ctrl: OptimizationCampaign, state: CampaignState, count: int) -> CampaignState:
@@ -651,6 +660,7 @@ def test_model_identity_tamper_rejected() -> None:
         stage_index=state.stage_index,
         seed_index=state.seed_index,
         champion_fingerprint=state.champion_fingerprint,
+        seed_candidate_fingerprint=state.seed_candidate_fingerprint,
         champion_score=state.champion_score,
         model_identity=ModelIdentity(name="tampered", model="bad", digest=DIGEST_B),
         metric_calls_used=state.metric_calls_used,
@@ -680,3 +690,86 @@ def test_state_hash_changes_on_advance() -> None:
     assert action is not None
     s2 = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_score("new", aggregate=0.9)), LATER)
     assert state_hash(s2) != h1
+
+
+# --- Seed candidate fingerprint (wave 2 finding 2) ---
+
+
+def test_initial_state_carries_the_real_seed_candidate_fingerprint() -> None:
+    """The seed candidate identity is a fingerprint, never a manifest path."""
+    ctrl = _control()
+    state = _init(ctrl)
+
+    assert state.seed_candidate_fingerprint == SEED_FINGERPRINT
+    assert state.champion_fingerprint == SEED_FINGERPRINT
+    assert state.champion_score.fingerprint == SEED_FINGERPRINT
+    assert ctrl.initial_candidate not in (
+        state.champion_fingerprint,
+        state.champion_score.fingerprint,
+        state.seed_candidate_fingerprint,
+    )
+
+
+def test_initial_state_rejects_a_path_shaped_seed_fingerprint() -> None:
+    ctrl = _control()
+    with pytest.raises(ValueError, match="seed_candidate_fingerprint"):
+        initial_state(
+            ctrl,
+            prompt_lab_revision="abc123",
+            korvid_revision="def456",
+            started_at=NOW,
+            seed_candidate_fingerprint=ctrl.initial_candidate,
+        )
+
+
+def test_seed_candidate_fingerprint_participates_in_the_state_hash() -> None:
+    ctrl = _control()
+    state = _init(ctrl)
+    other = initial_state(
+        ctrl,
+        prompt_lab_revision="abc123",
+        korvid_revision="def456",
+        started_at=NOW,
+        seed_candidate_fingerprint="8" * 64,
+    )
+
+    assert state_hash(state) != state_hash(other)
+
+
+def test_state_binding_rejects_a_tampered_seed_fingerprint() -> None:
+    from dataclasses import replace as _replace
+
+    from korvid_prompt_lab.campaigns import validate_state_binding
+
+    ctrl = _control()
+    state = _replace(_init(ctrl), seed_candidate_fingerprint="examples/seed.yaml")
+    with pytest.raises(ValueError, match="seed_candidate_fingerprint"):
+        validate_state_binding(ctrl, state)
+
+
+def test_tier_roll_seeds_the_next_tier_with_the_real_seed_fingerprint() -> None:
+    """Rolling into a new tier must never persist a path as the champion."""
+    ctrl = _two_tier_control()
+    state = _init(ctrl)
+    # Promote a genuinely different champion inside tier 0 first, so the rolled
+    # state cannot accidentally match by reusing the previous champion.
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+    state = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(kind="evidence", score=_score("c" * 64, aggregate=0.9)),
+        LATER,
+    )
+    assert state.champion_fingerprint == "c" * 64
+
+    state = _stagnate_to_tier_roll(ctrl, state)
+
+    assert state.status is CampaignStatus.RUNNING
+    assert state.tier_index == 1
+    assert state.seed_candidate_fingerprint == SEED_FINGERPRINT
+    assert state.champion_fingerprint == SEED_FINGERPRINT
+    assert state.champion_score.fingerprint == SEED_FINGERPRINT
+    assert state.champion_score.aggregate == 0.0
+    assert state.tier_results[-1].champion_fingerprint == "c" * 64

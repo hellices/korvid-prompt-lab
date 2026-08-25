@@ -141,7 +141,9 @@ def test_trigger_inputs_permissions_and_protected_job_are_exact() -> None:
         "manifest-sha256": "${{ steps.manifest.outputs.manifest-sha256 }}",
         "evaluation-campaign": "${{ steps.manifest.outputs.evaluation-campaign }}",
         "initial-candidate": "${{ steps.manifest.outputs.initial-candidate }}",
+        "model": "${{ steps.manifest.outputs.model }}",
         "expected-artifact-hash": "${{ steps.validate.outputs.expected-artifact-hash }}",
+        "prior-run-conclusion": "${{ steps.trust.outputs.prior-run-conclusion }}",
     }
 
 
@@ -346,6 +348,7 @@ def test_prepare_initialization_executes_and_writes_github_output() -> None:
             "action-kind",
             "lineage-from-key",
             "lineage-marker-name",
+            "seed-candidate-fingerprint",
         }
         assert entries["lineage-from-key"] == "initial"
         assert entries["lineage-marker-name"] == (
@@ -656,3 +659,36 @@ def test_readme_distinguishes_canary_qualification_and_terminal_states() -> None
         "explicit publication approval",
     ):
         assert exact_contract in section
+
+
+def test_attempt_supplies_every_environment_the_wrapper_requires() -> None:
+    """The wrapper's required-env preamble must be fully satisfied by `attempt`.
+
+    Wave 2 finding 1: the evaluation campaign resolves `env:KORVID_AKS_MODEL`,
+    so the strict control loader used by `korvid-campaign plan` needs it before
+    the wrapper can export the planned tier model itself.
+    """
+    workflow = load_workflow()
+    attempt = step(workflow, "campaign", "attempt")
+    script = (ROOT / "scripts" / "run-optimization-campaign-step.sh").read_text(
+        encoding="utf-8"
+    )
+    required = set(re.findall(r'^: "\$\{([A-Z0-9_]+):\?', script, re.MULTILINE))
+
+    assert "KORVID_AKS_MODEL" in required
+    job_env = set(workflow["jobs"]["campaign"].get("env") or {})
+    supplied = set(attempt["env"]) | job_env
+    assert required <= supplied, sorted(required - supplied)
+
+
+def test_attempt_binds_the_validated_identity_model() -> None:
+    workflow = load_workflow()
+    attempt = step(workflow, "campaign", "attempt")
+    assert attempt["env"]["KORVID_AKS_MODEL"] == (
+        "${{ needs.identity.outputs.model }}"
+    )
+    outputs = workflow["jobs"]["identity"]["outputs"]
+    assert outputs["model"] == "${{ steps.manifest.outputs.model }}"
+    identity = step(workflow, "identity", "manifest")
+    body = str(identity["run"])
+    assert 'stream.write(f"model={first_tier[\'model\']}\\n")' in body

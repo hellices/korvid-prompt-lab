@@ -67,9 +67,12 @@ def _control() -> OptimizationCampaign:
     )
 
 
+SEED_FINGERPRINT = "7" * 64
+
+
 def _state(
     *,
-    champion_fingerprint: str = "seed.yaml",
+    champion_fingerprint: str = SEED_FINGERPRINT,
     stage_index: int = 0,
     seed_index: int = 0,
     metric_calls_used: int = 0,
@@ -84,6 +87,7 @@ def _state(
         stage_index=stage_index,
         seed_index=seed_index,
         champion_fingerprint=champion_fingerprint,
+        seed_candidate_fingerprint=SEED_FINGERPRINT,
         champion_score=CampaignScore(
             fingerprint=champion_fingerprint,
             aggregate=0.0,
@@ -140,7 +144,7 @@ def _write_search_evidence(
     evaluated_case_ids: tuple[str, ...] = ("case-c",),
     models: tuple[str, ...] = ("qwen3:0.6b",),
     seed: int = 0,
-    seed_candidate_fingerprint: str = "seed.yaml",
+    seed_candidate_fingerprint: str = SEED_FINGERPRINT,
     total_metric_calls: int = 10,
     max_metric_calls: int = 12,
     train_case_ids: tuple[str, ...] = ("case-a", "case-b"),
@@ -581,7 +585,7 @@ class TestLoadRoundOutcome:
         eval_summary = {
             "bundle_kind": "milestone",
             "candidate_id": "cand-1",
-            "candidate_fingerprint": "seed.yaml",
+            "candidate_fingerprint": SEED_FINGERPRINT,
             "campaign_id": "test-campaign",
             "campaign_case_ids": ["case-d"],
             "evaluated_case_ids": ["case-d"],
@@ -607,7 +611,7 @@ class TestLoadRoundOutcome:
             "schema_version": 1,
             "campaign_id": "test-campaign",
             "candidate_id": "cand-1",
-            "candidate_fingerprint": "seed.yaml",
+            "candidate_fingerprint": SEED_FINGERPRINT,
             "models": ["qwen3:0.6b"],
             "aggregate_score": 1.0,
             "model_scores": {"qwen3:0.6b": 1.0},
@@ -648,7 +652,7 @@ class TestLoadRoundOutcome:
         eval_summary = {
             "bundle_kind": "milestone",
             "candidate_id": "cand-1",
-            "candidate_fingerprint": "seed.yaml",
+            "candidate_fingerprint": SEED_FINGERPRINT,
             "campaign_id": "test-campaign",
             "campaign_case_ids": ["case-d"],
             "evaluated_case_ids": ["case-d"],
@@ -674,7 +678,7 @@ class TestLoadRoundOutcome:
             "schema_version": 1,
             "campaign_id": "test-campaign",
             "candidate_id": "cand-1",
-            "candidate_fingerprint": "seed.yaml",
+            "candidate_fingerprint": SEED_FINGERPRINT,
             "models": ["qwen3:0.6b"],
             "aggregate_score": 1.0,
             "model_scores": {"qwen3:0.6b": 1.0},
@@ -699,8 +703,8 @@ class TestLoadRoundOutcome:
             "schema_version": 1,
             "status": "unchanged",
             "outcome": "unchanged",
-            "seed_candidate_fingerprint": "seed.yaml",
-            "best_candidate_fingerprint": "seed.yaml",
+            "seed_candidate_fingerprint": SEED_FINGERPRINT,
+            "best_candidate_fingerprint": SEED_FINGERPRINT,
             "contract": {
                 "campaign_id": "test-campaign",
                 "models": ["qwen3:0.6b"],
@@ -766,6 +770,7 @@ class TestRenderCampaignSummary:
             stage_index=2,
             seed_index=3,
             champion_fingerprint="fp_q",
+            seed_candidate_fingerprint=SEED_FINGERPRINT,
             champion_score=CampaignScore(
                 fingerprint="fp_q", aggregate=0.9,
                 hard_safety_failures=0, core_regression=False,
