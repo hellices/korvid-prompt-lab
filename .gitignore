@@ -13,4 +13,3 @@ artifacts/
 registry/
 *.kubeconfig
 .kubeconfig-*.yaml
-uv.lock
