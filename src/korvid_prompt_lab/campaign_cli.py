@@ -367,7 +367,11 @@ def _cmd_advance(args: argparse.Namespace) -> int:
             pass_at_3=outcome_data.pass_at_3,
             pass_at_5=outcome_data.pass_at_5,
         )
-        attempt = AttemptOutcome(kind="evidence", score=score)
+        attempt = AttemptOutcome(
+            kind="evidence",
+            score=score,
+            metric_calls_used=outcome_data.metric_calls_used,
+        )
     else:
         if args.evidence is not None:
             print(
@@ -446,7 +450,11 @@ def _cmd_validate_evidence(args: argparse.Namespace) -> int:
             control,
             state,
             action,
-            AttemptOutcome(kind="evidence", score=score),
+            AttemptOutcome(
+                kind="evidence",
+                score=score,
+                metric_calls_used=outcome_data.metric_calls_used,
+            ),
             datetime.now(tz=UTC),
         )
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
