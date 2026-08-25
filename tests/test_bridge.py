@@ -121,7 +121,7 @@ def test_build_worker_invocation_runs_the_worker_in_the_checkout_uv_environment(
         "--turn-timeout",
         "120.0",
     )
-    assert env["PYTHONPATH"].split(":")[0] == str(root)
+    assert env["PYTHONPATH"].split(":")[:2] == [str(root / "src"), str(root)]
     assert env["PYTHONDONTWRITEBYTECODE"] == "1"
 
 
@@ -135,7 +135,7 @@ def test_build_worker_invocation_prepends_the_checkout_to_an_existing_pythonpath
         env={"KORVID_UV_BIN": "uv", "PYTHONPATH": "/existing/path"},
     )
 
-    assert env["PYTHONPATH"] == f"{root}:/existing/path"
+    assert env["PYTHONPATH"] == f"{root / 'src'}:{root}:/existing/path"
 
 
 def test_build_worker_invocation_forwards_runtime_policy_flags(tmp_path: Path) -> None:
@@ -167,7 +167,7 @@ def test_bridge_check_imports_builds_worker_preflight(monkeypatch: pytest.Monkey
     )
 
     assert command[-1] == "--check-imports"
-    assert env["PYTHONPATH"] == "/korvid"
+    assert env["PYTHONPATH"] == "/korvid/src:/korvid"
 
 
 def test_build_worker_invocation_requires_a_uv_executable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
