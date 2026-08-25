@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -11,8 +12,15 @@ import yaml  # type: ignore[import-untyped]
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from korvid_prompt_lab.campaigns import (
+    ActionKind,
+    AttemptOutcome,
+    CampaignScore,
+    CampaignStatus,
     OptimizationCampaign,
+    advance_state,
+    initial_state,
     load_optimization_campaign,
+    next_action,
     validate_model_tier_digests,
 )
 from korvid_prompt_lab.config import load_campaign
@@ -146,6 +154,80 @@ def test_loads_bounded_disjoint_campaign(monkeypatch: pytest.MonkeyPatch) -> Non
     assert re.fullmatch(r"sha256:[0-9a-f]{64}", control.model_tiers[0].digest)
 
 
+def test_loads_single_transition_live_canary(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KORVID_AKS_NAMESPACE", "ollama")
+    monkeypatch.setenv("KORVID_AKS_SERVICE", "ollama")
+    monkeypatch.setenv("KORVID_AKS_MODEL", "qwen3:0.6b")
+    evaluation = load_campaign(ROOT / "examples/campaigns/aks-small-operator-qualification.yaml")
+    control = load_optimization_campaign(
+        ROOT / "examples/optimization-campaigns/qwen3-small-operator-canary.yaml",
+        evaluation,
+    )
+
+    assert control.campaign_id == "qwen3-small-operator-canary"
+    assert len(control.stages) == 1
+    assert control.stages[0].name == "explore"
+    assert control.stages[0].metric_calls == 4
+    assert control.stages[0].seeds == (0,)
+    assert control.total_metric_call_limit == 4
+    assert control.infrastructure_retry_limit == 0
+    assert control.train_case_ids == (
+        "scale-deployment-up",
+        "restart-denied",
+        "scale-no-op",
+    )
+    assert control.validation_case_ids == (
+        "scale-deployment-down",
+        "restart-deployment",
+        "scale-rbac-denied",
+    )
+    assert control.milestone_case_ids == (
+        "scale-ambiguous-namespace",
+        "restart-approval-expired",
+        "restart-daemonset",
+        "scale-same-name-replacement",
+        "scale-statefulset-down",
+        "edit-unsupported",
+    )
+    assert control.model_tiers[0].digest == (
+        "sha256:7df6b6e09427a769808717c0a93cadc4ae99ed4eb8bf5ca557c90846becea435"
+    )
+
+    state = initial_state(
+        control,
+        prompt_lab_revision="a" * 40,
+        korvid_revision="b" * 40,
+        started_at=datetime(2026, 8, 26, tzinfo=UTC),
+        seed_candidate_fingerprint="c" * 64,
+    )
+    action = next_action(control, state, datetime(2026, 8, 26, 0, 0, 1, tzinfo=UTC))
+    assert action is not None
+    assert action.kind is ActionKind.SEARCH
+    assert action.metric_calls == 4
+    terminal = advance_state(
+        control,
+        state,
+        action,
+        AttemptOutcome(
+            kind="evidence",
+            score=CampaignScore(
+                fingerprint="d" * 64,
+                aggregate=0.5,
+                hard_safety_failures=0,
+                core_regression=False,
+                systemic_failures=0,
+                pass_at_3=0.0,
+                pass_at_5=0.0,
+            ),
+        ),
+        datetime(2026, 8, 26, 0, 5, tzinfo=UTC),
+    )
+    assert terminal.status is CampaignStatus.NOT_CONVERGED
+    assert terminal.stop_reason == "total_metric_call_limit"
+    assert terminal.metric_calls_used == 4
+    assert next_action(control, terminal, datetime(2026, 8, 26, 0, 5, 1, tzinfo=UTC)) is None
+
+
 @pytest.mark.parametrize(
     ("field", "duplicate"),
     [
@@ -198,7 +280,6 @@ def test_rejects_duplicate_stage_seeds(tmp_path: Path) -> None:
     [
         (lambda manifest: manifest.__setitem__("total_metric_call_limit", 0), "total_metric_call_limit"),
         (lambda manifest: manifest.__setitem__("wall_clock_limit_seconds", 0), "wall_clock_limit_seconds"),
-        (lambda manifest: manifest.__setitem__("infrastructure_retry_limit", 0), "infrastructure_retry_limit"),
         (lambda manifest: manifest.__setitem__("stagnation_attempt_limit", 0), "stagnation_attempt_limit"),
         (lambda manifest: manifest.__setitem__("confirmation_runs", 0), "confirmation_runs"),
         (lambda manifest: manifest["stages"][0].__setitem__("metric_calls", 0), "stages\\[0\\]\\.metric_calls"),
@@ -212,6 +293,15 @@ def test_rejects_non_positive_budgets(
     path = write_yaml(tmp_path / "control.yaml", manifest)
 
     with pytest.raises(ValueError, match=message):
+        load_optimization_campaign(path, qualification_evaluation_campaign())
+
+
+def test_rejects_negative_infrastructure_retry_limit(tmp_path: Path) -> None:
+    manifest = valid_manifest_mapping()
+    manifest["infrastructure_retry_limit"] = -1
+    path = write_yaml(tmp_path / "control.yaml", manifest)
+
+    with pytest.raises(ValueError, match="infrastructure_retry_limit"):
         load_optimization_campaign(path, qualification_evaluation_campaign())
 
 
