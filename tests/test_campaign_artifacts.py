@@ -529,11 +529,26 @@ class TestLoadRoundOutcome:
         with pytest.raises(ValueError, match="seed mismatch"):
             load_round_outcome(root, action, control=_control(), state=_state())
 
+    def test_search_accepts_and_reports_bounded_gepa_overshoot(
+        self, tmp_path: Path,
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root, total_metric_calls=15)
+
+        outcome = load_round_outcome(
+            root,
+            _search_action(),
+            control=_control(),
+            state=_state(),
+        )
+
+        assert outcome.metric_calls_used == 15
+
     def test_search_rejects_metric_budget_exceeded(self, tmp_path: Path) -> None:
         root = tmp_path / "evidence"
-        _write_search_evidence(root, total_metric_calls=999)
+        _write_search_evidence(root, total_metric_calls=16)
         action = _search_action()
-        with pytest.raises(ValueError, match="exceeds action budget"):
+        with pytest.raises(ValueError, match="exceeds bounded GEPA maximum"):
             load_round_outcome(root, action, control=_control(), state=_state())
 
     def test_search_rejects_wrong_seed_fingerprint(self, tmp_path: Path) -> None:

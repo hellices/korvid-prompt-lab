@@ -335,21 +335,84 @@ def test_exact_metric_accounting() -> None:
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
     assert action is not None and action.metric_calls == 5
-    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_score("a", aggregate=0.2)), LATER)
-    assert state.metric_calls_used == 5
+    state = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(
+            kind="evidence",
+            score=_score("a", aggregate=0.2),
+            metric_calls_used=7,
+        ),
+        LATER,
+    )
+    assert state.metric_calls_used == 7
     action = next_action(ctrl, state, NOW)
     assert action is not None and action.metric_calls == 10
-    state = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_score("b", aggregate=0.3)), LATER)
-    assert state.metric_calls_used == 15
+    state = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(
+            kind="evidence",
+            score=_score("b", aggregate=0.3),
+            metric_calls_used=13,
+        ),
+        LATER,
+    )
+    assert state.metric_calls_used == 20
 
 
 def test_total_call_limit_terminates() -> None:
-    ctrl = _control(stages=(SearchStage(name="x", metric_calls=12, seeds=(0,)),), total_metric_call_limit=12)
+    ctrl = _control(
+        stages=(SearchStage(name="x", metric_calls=12, seeds=(0,)),),
+        total_metric_call_limit=15,
+    )
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
     assert action is not None
-    s1 = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_score("c1", aggregate=0.1)), LATER)
+    s1 = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(
+            kind="evidence",
+            score=_score("c1", aggregate=0.1),
+            metric_calls_used=15,
+        ),
+        LATER,
+    )
     assert s1.status is CampaignStatus.NOT_CONVERGED
+
+
+def test_remaining_budget_below_next_gepa_bound_terminates() -> None:
+    ctrl = _control(
+        stages=(
+            SearchStage(name="a", metric_calls=5, seeds=(0,)),
+            SearchStage(name="b", metric_calls=10, seeds=(1,)),
+        ),
+        total_metric_call_limit=19,
+    )
+    state = _init(ctrl)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+
+    terminal = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(
+            kind="evidence",
+            score=_score("a", aggregate=0.2),
+            metric_calls_used=7,
+        ),
+        LATER,
+    )
+
+    assert terminal.status is CampaignStatus.NOT_CONVERGED
+    assert terminal.stop_reason == "total_metric_call_limit"
+    assert terminal.metric_calls_used == 7
+    assert next_action(ctrl, terminal, LATER) is None
 
 
 def test_wall_clock_crossing_during_confirm_terminates() -> None:
@@ -432,7 +495,7 @@ def _stagnate_to_tier_roll(
 
 def test_tier_roll_without_metric_budget_terminates_not_converged() -> None:
     """A next tier that cannot afford one legal action must not start RUNNING."""
-    ctrl = _two_tier_control(total_metric_call_limit=25)
+    ctrl = _two_tier_control(total_metric_call_limit=38)
     state = _stagnate_to_tier_roll(ctrl, _init(ctrl))
 
     assert state.status is CampaignStatus.NOT_CONVERGED
@@ -442,7 +505,7 @@ def test_tier_roll_without_metric_budget_terminates_not_converged() -> None:
 
 def test_tier_roll_with_exact_metric_budget_still_rolls() -> None:
     """Budget that exactly covers the next tier's first action still rolls."""
-    ctrl = _two_tier_control(total_metric_call_limit=36)
+    ctrl = _two_tier_control(total_metric_call_limit=39)
     state = _stagnate_to_tier_roll(ctrl, _init(ctrl))
 
     assert state.status is CampaignStatus.RUNNING

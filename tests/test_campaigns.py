@@ -169,7 +169,7 @@ def test_loads_single_transition_live_canary(monkeypatch: pytest.MonkeyPatch) ->
     assert control.stages[0].name == "explore"
     assert control.stages[0].metric_calls == 4
     assert control.stages[0].seeds == (0,)
-    assert control.total_metric_call_limit == 4
+    assert control.total_metric_call_limit == 9
     assert control.infrastructure_retry_limit == 0
     assert control.train_case_ids == (
         "scale-deployment-up",
@@ -210,6 +210,7 @@ def test_loads_single_transition_live_canary(monkeypatch: pytest.MonkeyPatch) ->
         action,
         AttemptOutcome(
             kind="evidence",
+            metric_calls_used=9,
             score=CampaignScore(
                 fingerprint="d" * 64,
                 aggregate=0.5,
@@ -224,7 +225,7 @@ def test_loads_single_transition_live_canary(monkeypatch: pytest.MonkeyPatch) ->
     )
     assert terminal.status is CampaignStatus.NOT_CONVERGED
     assert terminal.stop_reason == "total_metric_call_limit"
-    assert terminal.metric_calls_used == 4
+    assert terminal.metric_calls_used == 9
     assert next_action(control, terminal, datetime(2026, 8, 26, 0, 5, 1, tzinfo=UTC)) is None
 
 

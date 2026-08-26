@@ -26,6 +26,7 @@ from .campaigns import (
     CampaignState,
     CampaignStatus,
     OptimizationCampaign,
+    max_search_metric_calls,
     next_action,
     state_hash,
 )
@@ -636,6 +637,7 @@ class RoundOutcome:
     evaluated_case_ids: tuple[str, ...]
     action_id: str
     milestone_passed: bool
+    metric_calls_used: int
 
 
 # ---------------------------------------------------------------------------
@@ -900,6 +902,7 @@ def load_round_outcome(
     )
 
     core_regression = False
+    metric_calls_used = 0
     if action.kind is ActionKind.SEARCH:
         comparison_summary = _load_safe_json(safe_root, "comparison-summary.json")
         core_regression = _validate_comparison_summary(
@@ -909,7 +912,7 @@ def load_round_outcome(
             eval_summary=eval_summary,
             expected_case_ids=expected_case_ids,
         )
-        _validate_search_optimization_evidence(
+        metric_calls_used = _validate_search_optimization_evidence(
             safe_root,
             action,
             control,
@@ -964,6 +967,7 @@ def load_round_outcome(
         evaluated_case_ids=tuple(evaluated_case_ids),
         action_id=action.action_id,
         milestone_passed=milestone_passed,
+        metric_calls_used=metric_calls_used,
     )
 
 def _validate_search_optimization_evidence(
@@ -975,7 +979,7 @@ def _validate_search_optimization_evidence(
     round_summary: dict[str, Any],
     eval_summary: dict[str, Any],
     comparison_summary: dict[str, Any],
-) -> None:
+) -> int:
     """Validate optimization-summary.json and best-candidate.yaml for SEARCH."""
     opt_summary = _load_safe_json(safe_root, "optimization-summary.json")
     _ensure_exact_keys(opt_summary, _OPTIMIZATION_SUMMARY_REQUIRED_KEYS, "optimization-summary")
@@ -1001,10 +1005,11 @@ def _validate_search_optimization_evidence(
         opt_summary.get("total_metric_calls"),
         "optimization-summary.total_metric_calls",
     )
-    if total_metric_calls > action.metric_calls:
+    maximum_metric_calls = max_search_metric_calls(control, action.metric_calls)
+    if total_metric_calls > maximum_metric_calls:
         raise ValueError(
             f"optimization-summary.total_metric_calls ({total_metric_calls}) "
-            f"exceeds action budget ({action.metric_calls})"
+            f"exceeds bounded GEPA maximum ({maximum_metric_calls})"
         )
 
     seed_fp = _require_str(
@@ -1135,6 +1140,7 @@ def _validate_search_optimization_evidence(
             "optimization-summary.best_candidate_differs_from_seed mismatch with "
             "seed_candidate_fingerprint"
         )
+    return total_metric_calls
 
 
 # ---------------------------------------------------------------------------
