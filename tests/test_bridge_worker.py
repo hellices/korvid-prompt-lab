@@ -383,8 +383,16 @@ def test_install_agent_panel_mount_barrier_waits_before_worker_queries() -> None
     events: list[str] = []
     panel_type = type("AgentPanel", (), {})
 
+    class FakePilot:
+        pause_count = 0
+
+        async def pause(self) -> None:
+            self.pause_count += 1
+            events.append("lifecycle-pause")
+            app.screen.panel_count = 0 if self.pause_count == 1 else 1
+
     class FakeScreen:
-        panel_count = 0
+        panel_count = 1
 
         def query(self, widget_type: type[object]) -> list[object]:
             assert widget_type is panel_type
@@ -396,21 +404,22 @@ def test_install_agent_panel_mount_barrier_waits_before_worker_queries() -> None
         @asynccontextmanager
         async def run_test(self) -> Any:
             events.append("run-test-entered")
-            yield object()
+            yield FakePilot()
 
         def query(self, widget_type: type[object]) -> list[object]:
             assert widget_type is panel_type
-            return [object()]
+            return self.screen.query(widget_type)
 
     async def until(
-        _pilot: object,
+        pilot: FakePilot,
         condition: Any,
         *,
         label: str,
     ) -> None:
         events.append(label)
-        assert condition() is False
-        app.screen.panel_count = 1
+        if condition():
+            return
+        await pilot.pause()
         assert condition() is True
 
     module = SimpleNamespace(
@@ -429,7 +438,69 @@ def test_install_agent_panel_mount_barrier_waits_before_worker_queries() -> None
 
     asyncio.run(exercise())
 
-    assert events == ["run-test-entered", "agent panel mounted", "worker-query"]
+    assert events == [
+        "run-test-entered",
+        "lifecycle-pause",
+        "agent panel mounted",
+        "lifecycle-pause",
+        "worker-query",
+    ]
+
+
+def test_install_agent_panel_mount_barrier_matches_app_query_scope() -> None:
+    panel_type = type("AgentPanel", (), {})
+    observations: list[bool] = []
+
+    class FakePilot:
+        async def pause(self) -> None:
+            return None
+
+    class FakeScreen:
+        def query(self, widget_type: type[object]) -> list[object]:
+            assert widget_type is panel_type
+            return [object()]
+
+    class FakeApp:
+        screen = FakeScreen()
+        default_panel_count = 0
+
+        @asynccontextmanager
+        async def run_test(self) -> Any:
+            yield FakePilot()
+
+        def query(self, widget_type: type[object]) -> list[object]:
+            assert widget_type is panel_type
+            return [object()] * self.default_panel_count
+
+    async def until(
+        _pilot: FakePilot,
+        condition: Any,
+        *,
+        label: str,
+    ) -> None:
+        assert label == "agent panel mounted"
+        observations.append(bool(condition()))
+        if observations[-1]:
+            return
+        app.default_panel_count = 1
+        observations.append(bool(condition()))
+
+    module = SimpleNamespace(
+        AgentPanel=panel_type,
+        KorvidApp=FakeApp,
+        until=until,
+    )
+    app = FakeApp()
+
+    bridge_worker.install_agent_panel_mount_barrier(module)
+
+    async def exercise() -> None:
+        async with app.run_test():
+            assert app.query(panel_type)
+
+    asyncio.run(exercise())
+
+    assert observations == [False, True]
 
 
 # --- journey selection and prompt parity ---------------------------------------
