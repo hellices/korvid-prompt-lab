@@ -7,7 +7,7 @@ import re
 import shlex
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -467,6 +467,10 @@ def write_safe_evidence(
             best_candidate_yaml,
         )
 
+    safe_evaluation_artifact_refs = (
+        "evaluation-summary.json",
+        *safe_response_paths,
+    )
     summary_payload = {
         "schema_version": 1,
         "campaign_id": report.campaign_id,
@@ -506,8 +510,9 @@ def write_safe_evidence(
             *extra_copied_artifacts,
             *safe_response_paths,
         ],
-        # …and the safe artifact names the evaluation run itself recorded.
-        "evaluation_artifact_refs": list(report.artifact_refs),
+        # …and where the evaluation run's artifacts were projected in this
+        # safe package.
+        "evaluation_artifact_refs": list(safe_evaluation_artifact_refs),
         "prompt_lab_revision": prompt_lab_revision,
         "korvid_revision": korvid_revision,
         "workflow_run_url": workflow_run_url,
@@ -525,7 +530,11 @@ def write_safe_evidence(
         if comparison is not None
         else render_single_evaluation_markdown(report)
     )
-    details = render_round_markdown(report).rstrip()
+    safe_report = replace(
+        report,
+        artifact_refs=safe_evaluation_artifact_refs,
+    )
+    details = render_round_markdown(safe_report).rstrip()
     markdown_lines: list[str] = [
         headline.rstrip(),
         "",
