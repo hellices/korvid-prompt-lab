@@ -379,9 +379,10 @@ def install_agent_panel_mount_barrier(module: Any) -> None:
         **kwargs: Any,
     ) -> Any:
         async with run_test(app, *args, **kwargs) as pilot:
+            await pilot.pause()
             await until(
                 pilot,
-                lambda: len(app.screen.query(panel_type)) > 0,
+                lambda: len(app.query(panel_type)) > 0,
                 label="agent panel mounted",
             )
             yield pilot
