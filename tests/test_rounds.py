@@ -180,6 +180,10 @@ def test_round_cli_writes_safe_package_and_prints_markdown_path_only(tmp_path: P
     assert summary_payload["prompt_lab_revision"] == "1234567"
     assert summary_payload["korvid_revision"] == "89abcde"
     assert summary_payload["workflow_run_url"] == "https://github.example/actions/runs/42"
+    assert summary_payload["evaluation_artifact_refs"] == [
+        "evaluation-summary.json",
+        "responses/case-a-model-a-r01.json"
+    ]
     assert "raw answer" not in (safe_output / "round-summary.md").read_text(encoding="utf-8")
 
 
@@ -460,9 +464,17 @@ def test_safe_round_summary_json_publishes_the_full_result_contract(
     assert payload["model_scores"] == {LIVE_MODEL: 0.01}
     assert {run["run_id"]: run["elapsed_seconds"] for run in payload["runs"]} == LIVE_WALL_TIMES
     assert payload["reproduction_command"] == list(LIVE_REPRODUCTION_COMMAND)
-    assert payload["evaluation_artifact_refs"] == list(
-        build_round_report(artifact_root).artifact_refs
+    assert payload["evaluation_artifact_refs"] == [
+        "evaluation-summary.json",
+        *[f"responses/{run['run_id']}.json" for run in payload["runs"]],
+    ]
+    assert all(
+        (safe_output / ref).is_file()
+        for ref in payload["evaluation_artifact_refs"]
     )
+    markdown = (safe_output / "round-summary.md").read_text(encoding="utf-8")
+    assert "`runs/" not in markdown
+    assert "responses/aks-restart-denied-qwen3-0.6b-r01.json" in markdown
     assert sorted(payload["artifact_refs"]) == sorted(
         path.relative_to(safe_output).as_posix()
         for path in safe_output.rglob("*")
