@@ -125,7 +125,7 @@ def test_loads_bounded_disjoint_campaign(monkeypatch: pytest.MonkeyPatch) -> Non
     )
 
     assert isinstance(control, OptimizationCampaign)
-    assert control.campaign_id == "qwen3-small-operator-v4"
+    assert control.campaign_id == "qwen3-small-operator-v5"
     assert control.train_case_ids == (
         "scale-deployment-up",
         "restart-denied",

@@ -89,7 +89,7 @@ def _prepare_initial(scratch: Path, manifest: Path) -> dict[str, str]:
             "PATH": _path(),
             "HOME": str(scratch),
             "MANIFEST": _relative(manifest),
-            "CAMPAIGN_ID": "qwen3-small-operator-v4",
+            "CAMPAIGN_ID": "qwen3-small-operator-v5",
             "MANIFEST_SHA256": (
                 "sha256:" + hashlib.sha256(manifest.read_bytes()).hexdigest()
             ),
@@ -264,7 +264,7 @@ class TestTierRolloverSeedIdentity:
                 "PATH": _path(),
                 "HOME": str(scratch),
                 "MANIFEST": _relative(manifest),
-                "CAMPAIGN_ID": "qwen3-small-operator-v4",
+                "CAMPAIGN_ID": "qwen3-small-operator-v5",
                 "MANIFEST_SHA256": (
                     "sha256:" + hashlib.sha256(manifest.read_bytes()).hexdigest()
                 ),
