@@ -210,7 +210,7 @@ class TestWorkflowPackagingAcceptsSafeProjections:
             code,
             {
                 "MANIFEST": MANIFEST.relative_to(ROOT).as_posix(),
-                "CAMPAIGN_ID": "qwen3-small-operator-v3",
+                "CAMPAIGN_ID": "qwen3-small-operator-v4",
                 "MANIFEST_SHA256": (
                     "sha256:" + hashlib.sha256(MANIFEST.read_bytes()).hexdigest()
                 ),
@@ -259,7 +259,7 @@ class TestWorkflowPackagingAcceptsSafeProjections:
             code,
             {
                 "MANIFEST": MANIFEST.relative_to(ROOT).as_posix(),
-                "CAMPAIGN_ID": "qwen3-small-operator-v3",
+                "CAMPAIGN_ID": "qwen3-small-operator-v4",
                 "MANIFEST_SHA256": (
                     "sha256:" + hashlib.sha256(MANIFEST.read_bytes()).hexdigest()
                 ),
@@ -306,7 +306,7 @@ class TestWorkflowPackagingAcceptsSafeProjections:
             code,
             {
                 "MANIFEST": MANIFEST.relative_to(ROOT).as_posix(),
-                "CAMPAIGN_ID": "qwen3-small-operator-v3",
+                "CAMPAIGN_ID": "qwen3-small-operator-v4",
                 "MANIFEST_SHA256": (
                     "sha256:" + hashlib.sha256(MANIFEST.read_bytes()).hexdigest()
                 ),
