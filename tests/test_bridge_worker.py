@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -376,6 +377,52 @@ def test_install_prompt_overrides_binds_overrides_only_in_the_worker_process() -
 def test_install_prompt_overrides_requires_a_patchable_module() -> None:
     with pytest.raises(WorkerConfigurationError, match="build_profile"):
         install_prompt_overrides(SimpleNamespace(), object())
+
+
+def test_install_agent_panel_mount_barrier_waits_before_worker_queries() -> None:
+    events: list[str] = []
+    panel_type = type("AgentPanel", (), {})
+
+    class FakeApp:
+        panel_count = 0
+
+        @asynccontextmanager
+        async def run_test(self) -> Any:
+            events.append("run-test-entered")
+            yield object()
+
+        def query(self, widget_type: type[object]) -> list[object]:
+            assert widget_type is panel_type
+            return [object()] * self.panel_count
+
+    async def until(
+        _pilot: object,
+        condition: Any,
+        *,
+        label: str,
+    ) -> None:
+        events.append(label)
+        assert condition() is False
+        app.panel_count = 1
+        assert condition() is True
+
+    module = SimpleNamespace(
+        AgentPanel=panel_type,
+        KorvidApp=FakeApp,
+        until=until,
+    )
+    app = FakeApp()
+
+    bridge_worker.install_agent_panel_mount_barrier(module)
+
+    async def exercise() -> None:
+        async with app.run_test():
+            events.append("worker-query")
+            assert app.query(panel_type)
+
+    asyncio.run(exercise())
+
+    assert events == ["run-test-entered", "agent panel mounted", "worker-query"]
 
 
 # --- journey selection and prompt parity ---------------------------------------
@@ -864,6 +911,22 @@ def _fake_korvid(run_journey: Any) -> Any:
 
     operation_app = ModuleType("fake_operation_app")
     operation_app.build_profile = lambda name, **kwargs: SimpleNamespace(name=name)  # type: ignore[attr-defined]
+    operation_app.AgentPanel = type("AgentPanel", (), {})  # type: ignore[attr-defined]
+
+    class FakeApp:
+        @asynccontextmanager
+        async def run_test(self) -> Any:
+            yield object()
+
+        def query(self, _widget_type: type[object]) -> list[object]:
+            return [object()]
+
+    async def until(_pilot: object, condition: Any, *, label: str) -> None:
+        assert label == "agent panel mounted"
+        assert condition()
+
+    operation_app.KorvidApp = FakeApp  # type: ignore[attr-defined]
+    operation_app.until = until  # type: ignore[attr-defined]
     journey = SimpleNamespace(
         id="scale-deployment-up",
         turns=("Scale checkout-a in shop-a from 2 to 3 replicas.",),
