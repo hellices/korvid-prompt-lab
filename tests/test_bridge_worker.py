@@ -383,8 +383,15 @@ def test_install_agent_panel_mount_barrier_waits_before_worker_queries() -> None
     events: list[str] = []
     panel_type = type("AgentPanel", (), {})
 
-    class FakeApp:
+    class FakeScreen:
         panel_count = 0
+
+        def query(self, widget_type: type[object]) -> list[object]:
+            assert widget_type is panel_type
+            return [object()] * self.panel_count
+
+    class FakeApp:
+        screen = FakeScreen()
 
         @asynccontextmanager
         async def run_test(self) -> Any:
@@ -393,7 +400,7 @@ def test_install_agent_panel_mount_barrier_waits_before_worker_queries() -> None
 
         def query(self, widget_type: type[object]) -> list[object]:
             assert widget_type is panel_type
-            return [object()] * self.panel_count
+            return [object()]
 
     async def until(
         _pilot: object,
@@ -403,7 +410,7 @@ def test_install_agent_panel_mount_barrier_waits_before_worker_queries() -> None
     ) -> None:
         events.append(label)
         assert condition() is False
-        app.panel_count = 1
+        app.screen.panel_count = 1
         assert condition() is True
 
     module = SimpleNamespace(
@@ -418,7 +425,7 @@ def test_install_agent_panel_mount_barrier_waits_before_worker_queries() -> None
     async def exercise() -> None:
         async with app.run_test():
             events.append("worker-query")
-            assert app.query(panel_type)
+            assert app.screen.query(panel_type)
 
     asyncio.run(exercise())
 
