@@ -26,6 +26,7 @@ import os
 import re
 import sys
 from collections.abc import Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -358,6 +359,34 @@ def install_prompt_overrides(module: Any, overrides: Any) -> None:
             "korvid operation harness does not expose a patchable build_profile"
         )
     module.build_profile = functools.partial(build_profile, overrides=overrides)
+
+
+def install_agent_panel_mount_barrier(module: Any) -> None:
+    """Wait for Korvid's composed agent panel before its harness queries it."""
+    app_type = getattr(module, "KorvidApp", None)
+    panel_type = getattr(module, "AgentPanel", None)
+    until = getattr(module, "until", None)
+    run_test = getattr(app_type, "run_test", None)
+    if app_type is None or panel_type is None or not callable(until) or not callable(run_test):
+        raise WorkerConfigurationError(
+            "korvid operation harness does not expose the UI mount barrier dependencies"
+        )
+
+    @asynccontextmanager
+    async def run_test_after_agent_panel_mount(
+        app: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        async with run_test(app, *args, **kwargs) as pilot:
+            await until(
+                pilot,
+                lambda: len(app.query(panel_type)) > 0,
+                label="agent panel mounted",
+            )
+            yield pilot
+
+    app_type.run_test = run_test_after_agent_panel_mount
 
 
 # --- journey selection ----------------------------------------------------------
@@ -778,6 +807,7 @@ def run_bridge(
 
     overrides = korvid.prompt_overrides(**map_components_to_overrides(request.components))
     install_prompt_overrides(korvid.operation_app, overrides)
+    install_agent_panel_mount_barrier(korvid.operation_app)
 
     provider_factory = _build_provider_factory(
         korvid,
