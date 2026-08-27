@@ -321,7 +321,7 @@ def test_prepare_initialization_executes_and_writes_github_output() -> None:
     env.update(
         {
             "MANIFEST": manifest.relative_to(ROOT).as_posix(),
-            "CAMPAIGN_ID": "qwen3-small-operator-v5",
+            "CAMPAIGN_ID": "qwen3-small-operator-v6",
             "MANIFEST_SHA256": (
                 "sha256:" + hashlib.sha256(manifest.read_bytes()).hexdigest()
             ),
@@ -367,7 +367,7 @@ def test_prepare_initialization_executes_and_writes_github_output() -> None:
         }
         assert entries["lineage-from-key"] == "initial"
         assert entries["lineage-marker-name"] == (
-            "campaign-lineage-qwen3-small-operator-v5-initial"
+            "campaign-lineage-qwen3-small-operator-v6-initial"
         )
         assert re.fullmatch(r"sha256:[0-9a-f]{64}", entries["prior-state-hash"])
         assert entries["action-kind"] == "search"
