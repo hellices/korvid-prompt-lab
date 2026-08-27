@@ -371,6 +371,7 @@ def _cmd_advance(args: argparse.Namespace) -> int:
             kind="evidence",
             score=score,
             metric_calls_used=outcome_data.metric_calls_used,
+            search_improved=outcome_data.search_improved,
         )
     else:
         if args.evidence is not None:

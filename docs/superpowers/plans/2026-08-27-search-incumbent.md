@@ -4,7 +4,7 @@
 
 **Goal:** Persist the first measured and subsequently improved search candidate across campaign actions without weakening qualification or publication.
 
-**Architecture:** Recognize the first SEARCH result from immutable state cursor/accounting fields and establish it as the measured incumbent. Reuse existing score ordering thereafter; keep milestone, confirmation, and publication gates unchanged.
+**Architecture:** Recognize the first SEARCH result from immutable state cursor/accounting fields and use its validated comparison outcome to establish an improved incumbent or record an unchanged seed baseline. Reuse existing score ordering thereafter; keep milestone, confirmation, and publication gates unchanged.
 
 **Tech Stack:** Python 3.12, pytest, GitHub Actions, YAML
 
@@ -29,8 +29,9 @@
 
 - [ ] **Step 1: Write failing tests**
 
-Add tests proving that the first unsafe candidate replaces the synthetic seed
-score and that a same-fingerprint seed records its real score.
+Add tests proving that the first improved unsafe candidate replaces the
+synthetic seed score and that an unchanged same-fingerprint seed records its
+real score while counting stagnation.
 
 - [ ] **Step 2: Verify RED**
 
@@ -44,10 +45,11 @@ Expected: both tests fail under the synthetic zero-safety baseline.
 
 - [ ] **Step 3: Implement the first-search predicate**
 
-Add a private predicate over tier, stage, seed, metric calls, and stagnation.
-Allow that first SEARCH score to establish the incumbent when it has zero
-systemic failures and no core regression. Keep `_is_strictly_better` unchanged
-for every subsequent result.
+Add a private predicate over tier, stage, seed, metric calls, stagnation, and
+seed identity. Carry the validated comparison outcome through `RoundOutcome`
+and `AttemptOutcome`. Establish a new first incumbent only for `improved`, and
+record an unchanged seed baseline without resetting stagnation. Keep
+`_is_strictly_better` unchanged for every subsequent result.
 
 - [ ] **Step 4: Verify search ordering and strict gates**
 

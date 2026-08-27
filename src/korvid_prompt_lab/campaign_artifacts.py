@@ -638,6 +638,7 @@ class RoundOutcome:
     action_id: str
     milestone_passed: bool
     metric_calls_used: int
+    search_improved: bool | None
 
 
 # ---------------------------------------------------------------------------
@@ -903,6 +904,7 @@ def load_round_outcome(
 
     core_regression = False
     metric_calls_used = 0
+    search_improved: bool | None = None
     if action.kind is ActionKind.SEARCH:
         comparison_summary = _load_safe_json(safe_root, "comparison-summary.json")
         core_regression = _validate_comparison_summary(
@@ -912,6 +914,7 @@ def load_round_outcome(
             eval_summary=eval_summary,
             expected_case_ids=expected_case_ids,
         )
+        search_improved = comparison_summary["outcome"] == "improved"
         metric_calls_used = _validate_search_optimization_evidence(
             safe_root,
             action,
@@ -968,6 +971,7 @@ def load_round_outcome(
         action_id=action.action_id,
         milestone_passed=milestone_passed,
         metric_calls_used=metric_calls_used,
+        search_improved=search_improved,
     )
 
 def _validate_search_optimization_evidence(

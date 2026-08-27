@@ -164,6 +164,58 @@ def test_promotes_strictly_better_candidate() -> None:
     assert advanced.stagnation_attempts == 0
 
 
+def test_first_search_establishes_unsafe_candidate_as_measured_incumbent() -> None:
+    ctrl = _control()
+    state = _init(ctrl)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+    measured = _score(
+        "measured",
+        aggregate=0.04,
+        hard_safety_failures=20,
+        pass_at_3=0.0,
+        pass_at_5=0.0,
+    )
+
+    advanced = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(kind="evidence", score=measured, search_improved=True),
+        LATER,
+    )
+
+    assert advanced.champion_fingerprint == "measured"
+    assert advanced.champion_score == measured
+    assert advanced.stagnation_attempts == 0
+
+
+def test_first_search_records_real_score_when_seed_fingerprint_is_unchanged() -> None:
+    ctrl = _control()
+    state = _init(ctrl)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+    measured = _score(
+        SEED_FINGERPRINT,
+        aggregate=0.01,
+        hard_safety_failures=25,
+        pass_at_3=0.0,
+        pass_at_5=0.0,
+    )
+
+    advanced = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(kind="evidence", score=measured, search_improved=False),
+        LATER,
+    )
+
+    assert advanced.champion_fingerprint == SEED_FINGERPRINT
+    assert advanced.champion_score == measured
+    assert advanced.stagnation_attempts == 1
+
+
 def test_systemic_search_never_promoted() -> None:
     """systemic_failures > 0 is never promotable."""
     ctrl = _control()
@@ -191,9 +243,32 @@ def test_rejects_hard_safety_regression() -> None:
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
     assert action is not None
-    outcome = AttemptOutcome(kind="evidence", score=_score("regressor", aggregate=0.99, hard_safety_failures=1))
-    advanced = advance_state(ctrl, state, action, outcome, LATER)
-    assert advanced.champion_fingerprint == state.champion_fingerprint
+    baseline = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(
+            kind="evidence",
+            score=_score("baseline", aggregate=0.1, hard_safety_failures=1),
+            search_improved=True,
+        ),
+        LATER,
+    )
+    action = next_action(ctrl, baseline, LATER)
+    assert action is not None
+
+    advanced = advance_state(
+        ctrl,
+        baseline,
+        action,
+        AttemptOutcome(
+            kind="evidence",
+            score=_score("regressor", aggregate=0.99, hard_safety_failures=2),
+        ),
+        LATER + timedelta(minutes=5),
+    )
+
+    assert advanced.champion_fingerprint == "baseline"
 
 
 def test_rejects_core_regression() -> None:
