@@ -333,6 +333,7 @@ class TestLoadRoundOutcome:
         outcome = load_round_outcome(root, action, control=ctrl, state=st)
         assert outcome.candidate_fingerprint == expected_fingerprint
         assert outcome.aggregate_score == 0.6
+        assert outcome.search_improved is True
 
     def test_evidence_campaign_id_binds_to_evaluation_campaign(
         self, tmp_path: Path,

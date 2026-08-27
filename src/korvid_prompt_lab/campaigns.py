@@ -404,6 +404,7 @@ class AttemptOutcome:
     score: CampaignScore | None = None
     error_message: str | None = None
     metric_calls_used: int | None = None
+    search_improved: bool | None = None
 
 
 _CANDIDATE_FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
@@ -478,6 +479,17 @@ def _is_strictly_better(candidate: CampaignScore, champion: CampaignScore) -> bo
         # A core-metric regression never promotes, however far the aggregate rose.
         return False
     return _score_rank_key_no_fp(candidate) < _score_rank_key_no_fp(champion)
+
+
+def _has_unmeasured_incumbent(state: CampaignState) -> bool:
+    return (
+        state.tier_index == 0
+        and state.stage_index == 0
+        and state.seed_index == 0
+        and state.metric_calls_used == 0
+        and state.stagnation_attempts == 0
+        and state.champion_fingerprint == state.seed_candidate_fingerprint
+    )
 
 
 def _passes_qualification_gate(score: CampaignScore) -> bool:
@@ -1011,14 +1023,29 @@ def advance_state(
     if action.kind is ActionKind.SEARCH:
         candidate_score = outcome.score
 
-        # Promotion: different fingerprint, no systemic, strictly better
-        if (
+        first_measurement = (
+            _has_unmeasured_incumbent(state)
+            and outcome.search_improved is True
+            and candidate_score.systemic_failures == 0
+            and not candidate_score.core_regression
+        )
+        if first_measurement or (
             candidate_score.fingerprint != state.champion_fingerprint
             and _is_strictly_better(candidate_score, state.champion_score)
         ):
             new_champion_fp = candidate_score.fingerprint
             new_champion_score = candidate_score
             new_stagnation = 0
+        elif (
+            _has_unmeasured_incumbent(state)
+            and outcome.search_improved is False
+            and candidate_score.fingerprint == state.champion_fingerprint
+            and candidate_score.systemic_failures == 0
+            and not candidate_score.core_regression
+        ):
+            new_champion_fp = state.champion_fingerprint
+            new_champion_score = candidate_score
+            new_stagnation = state.stagnation_attempts + 1
         else:
             new_champion_fp = state.champion_fingerprint
             new_champion_score = state.champion_score
