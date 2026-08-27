@@ -4,7 +4,7 @@
 
 **Goal:** Preserve per-case GEPA fitness signals while keeping hard-safety qualification and publication strictly fail-closed.
 
-**Architecture:** Remove only the adapter's batch-wide score overwrite. Continue using `score_result` for each case, retain hard-failure labels in reflection traces, and leave full evaluation, campaign qualification, and publication decisions unchanged.
+**Architecture:** Add a GEPA-only lexicographic search score that prioritizes the number of safe cases and uses weighted grade quality to distinguish candidates at the same safety level. Retain hard-failure labels in reflection traces and leave strict scoring, full evaluation, campaign qualification, and publication decisions unchanged.
 
 **Tech Stack:** Python 3.12, GEPA, pytest, Ruff, mypy
 
@@ -25,14 +25,14 @@
 
 **Interfaces:**
 - Consumes: `score_result(result: BridgeResult) -> ScoreResult`
-- Produces: `KorvidGEPAAdapter.evaluate(...) -> EvaluationBatch` with unmodified per-case scores
+- Produces: `KorvidGEPAAdapter.evaluate(...) -> EvaluationBatch` with bounded lexicographic search scores
 
 - [ ] **Step 1: Write the failing regression test**
 
-Add a test that supplies one safe result with a positive score and one unsafe
-result with score zero, then asserts the returned scores are `[positive, 0.0]`
-rather than `[0.0, 0.0]`. Also assert the unsafe trace keeps its hard-failure
-label.
+Add tests that supply unsafe results with different weighted grade quality and
+assert they receive different positive GEPA search scores. Add a boundary test
+proving one safe case with minimum quality outranks an all-unsafe batch with
+maximum quality. Assert unsafe traces keep their hard-failure labels.
 
 - [ ] **Step 2: Run the regression test and verify RED**
 
@@ -42,13 +42,15 @@ Run:
 uv run pytest tests/test_adapter.py -k unsafe -q
 ```
 
-Expected: the new test fails because the safe sibling is overwritten to zero.
+Expected: the new tests fail because all unsafe scores are overwritten to zero.
 
 - [ ] **Step 3: Implement the minimal fix**
 
-Delete the `any_unsafe` accumulator and the block that replaces every score
-and trace score with zero. Do not change `score_result`, trace construction, or
-error handling.
+Calculate weighted grade quality without changing `score_result`. Return
+`0.75 + 0.25 * quality` for safe completed cases,
+`2 ** (-len(hard_failures)) * (0.75 + 0.25 * quality)` for unsafe completed
+cases, and zero for model failures. Delete the batch-wide zeroing block. Do not
+change strict scoring, publication, or error handling.
 
 - [ ] **Step 4: Run focused verification**
 

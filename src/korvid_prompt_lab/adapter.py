@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +10,7 @@ from gepa.core.adapter import EvaluationBatch, ProposalFn
 
 from .contracts import Candidate, EvalCase
 from .runner import BridgeExecutionModeError, KorvidProcessRunner
-from .scoring import BridgeResult, score_result
+from .scoring import BridgeResult, ScoredResult, grade_quality, score_result
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +26,16 @@ class SafeExecutionTrace:
     missing_checkpoints: tuple[str, ...]
     hard_failures: tuple[str, ...]
     score: float
+
+
+def _search_score(scored: ScoredResult) -> float:
+    if scored.result.status == "model_failure":
+        return 0.0
+    grade = scored.result.grade
+    if grade is None:  # pragma: no cover - score_result rejects this first
+        raise ValueError("completed results must carry a grade")
+    quality = 0.75 + 0.25 * grade_quality(grade)
+    return quality if not scored.unsafe else 2 ** (-len(grade.hard_failures)) * quality
 
 
 class KorvidGEPAAdapter:
@@ -80,30 +90,22 @@ class KorvidGEPAAdapter:
         outputs: list[BridgeResult] = []
         scores: list[float] = []
         traces: list[SafeExecutionTrace] = []
-        any_unsafe = False
-
         for case in batch:
             run_dir = self._next_run_dir(resolved_candidate.fingerprint, case)
             result = self.runner.run(resolved_candidate, case, run_dir)
             self._record_execution_mode(result)
             scored = score_result(result)
             outputs.append(result)
-            scores.append(scored.score)
-            any_unsafe = any_unsafe or scored.unsafe
+            search_score = _search_score(scored)
+            scores.append(search_score)
             if capture_traces:
-                traces.append(self._build_trace(case, result, score=scored.score, unsafe=scored.unsafe))
-
-        if any_unsafe:
-            scores = [0.0 for _ in scores]
-            if capture_traces:
-                traces = [replace(trace, score=0.0) for trace in traces]
+                traces.append(self._build_trace(case, result, score=search_score, unsafe=scored.unsafe))
 
         return EvaluationBatch(
             outputs=outputs,
             scores=scores,
             trajectories=traces if capture_traces else None,
         )
-
     def make_reflective_dataset(
         self,
         candidate: dict[str, str],

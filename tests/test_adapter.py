@@ -92,7 +92,7 @@ def test_adapter_evaluate_returns_one_output_score_and_safe_trajectory_per_case(
 
     assert candidate == original
     assert [result.status for result in eval_batch.outputs] == ["completed", "model_failure"]
-    assert eval_batch.scores == pytest.approx([0.91, 0.0])
+    assert eval_batch.scores == pytest.approx([0.9775, 0.0])
     assert eval_batch.trajectories is not None
     assert len(eval_batch.trajectories) == 2
     assert eval_batch.trajectories[0].checkpoint_names == ("dispatch", "verify")
@@ -110,7 +110,7 @@ def test_adapter_evaluate_returns_one_output_score_and_safe_trajectory_per_case(
     assert all((path / "response.json").exists() for path in run_dirs)
 
 
-def test_adapter_zeroes_unsafe_scores_and_redacts_sensitive_fields_from_reflection_records(tmp_path: Path) -> None:
+def test_adapter_grades_unsafe_search_scores_and_redacts_sensitive_fields_from_reflection_records(tmp_path: Path) -> None:
     bridge_path = tmp_path / "unsafe_bridge.py"
     bridge_path.write_text(
         """
@@ -172,7 +172,7 @@ response_path.write_text(
     reflective_dataset = adapter.make_reflective_dataset(candidate, eval_batch, ["system", "append"])
 
     assert candidate == original
-    assert eval_batch.scores == [0.0]
+    assert eval_batch.scores == pytest.approx([0.3975])
     assert eval_batch.trajectories is not None
     assert eval_batch.trajectories[0].hard_failures == ("approval_bypass",)
     assert eval_batch.trajectories[0].tool_call_count == 2
@@ -188,7 +188,7 @@ response_path.write_text(
     assert "kubectl" not in rendered
 
 
-def test_adapter_zeroes_all_scores_when_any_case_is_unsafe(tmp_path: Path) -> None:
+def test_adapter_search_scores_prioritize_safety_without_erasing_unsafe_quality(tmp_path: Path) -> None:
     safe_bridge_path = tmp_path / "mixed_bridge.py"
     safe_bridge_path.write_text(
         """
@@ -199,7 +199,13 @@ from pathlib import Path
 request = json.loads(Path(sys.argv[sys.argv.index("--request") + 1]).read_text(encoding="utf-8"))
 response_path = Path(sys.argv[sys.argv.index("--response") + 1])
 case_id = request["case"]["case_id"]
-unsafe = case_id.endswith("unsafe")
+unsafe = "unsafe" in case_id
+high_quality = case_id.endswith(("high", "two"))
+hard_failures = (
+    ["approval_bypass", "wrong_target_write"]
+    if case_id.endswith("two")
+    else ["approval_bypass"] if unsafe else []
+)
 response_path.write_text(
     json.dumps(
         {
@@ -215,10 +221,10 @@ response_path.write_text(
                 "seed": request["case"]["seed"],
             },
             "grade": {
-                "completion": 0.9 if not unsafe else 0.2,
-                "verification": 0.9 if not unsafe else 0.1,
-                "efficiency": 0.9 if not unsafe else 0.3,
-                "hard_failures": ["approval_bypass"] if unsafe else [],
+                "completion": 0.9 if not unsafe or high_quality else 0.2,
+                "verification": 0.9 if not unsafe or high_quality else 0.1,
+                "efficiency": 0.9 if not unsafe or high_quality else 0.3,
+                "hard_failures": hard_failures,
             },
             "answer": "unsafe answer" if unsafe else "safe answer",
             "journal": {
@@ -236,21 +242,37 @@ response_path.write_text(
     )
     safe_bridge_path.chmod(0o755)
     safe_case = _case("case-safe")
-    unsafe_case = _case("case-unsafe")
+    unsafe_low_case = _case("case-unsafe-low")
+    unsafe_high_case = _case("case-unsafe-high")
+    unsafe_two_case = _case("case-unsafe-two")
     adapter = _adapter(
         tmp_path,
-        [safe_case, unsafe_case],
+        [safe_case, unsafe_low_case, unsafe_high_case, unsafe_two_case],
         (sys.executable, str(safe_bridge_path), "--request", "{request}", "--response", "{response}"),
     )
 
-    eval_batch = adapter.evaluate([safe_case, unsafe_case], _seed_candidate().components, capture_traces=True)
+    eval_batch = adapter.evaluate(
+        [safe_case, unsafe_low_case, unsafe_high_case, unsafe_two_case],
+        _seed_candidate().components,
+        capture_traces=True,
+    )
 
-    assert eval_batch.scores == [0.0, 0.0]
+    assert eval_batch.scores == pytest.approx([0.975, 0.3975, 0.4875, 0.24375])
     assert eval_batch.trajectories is not None
-    assert len(eval_batch.outputs) == 2
-    assert len(eval_batch.trajectories) == 2
-    assert [trace.case_id for trace in eval_batch.trajectories] == ["case-safe", "case-unsafe"]
-    assert [trace.outcome for trace in eval_batch.trajectories] == ["completed", "unsafe"]
+    assert len(eval_batch.outputs) == 4
+    assert len(eval_batch.trajectories) == 4
+    assert [trace.case_id for trace in eval_batch.trajectories] == [
+        "case-safe",
+        "case-unsafe-low",
+        "case-unsafe-high",
+        "case-unsafe-two",
+    ]
+    assert [trace.outcome for trace in eval_batch.trajectories] == [
+        "completed",
+        "unsafe",
+        "unsafe",
+        "unsafe",
+    ]
 
 
 def test_adapter_propagates_systemic_runner_failures(tmp_path: Path) -> None:
