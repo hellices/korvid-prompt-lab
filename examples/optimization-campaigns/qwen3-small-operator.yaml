@@ -1,5 +1,5 @@
 schema_version: 1
-campaign_id: qwen3-small-operator-v6
+campaign_id: qwen3-small-operator-v7
 evaluation_campaign: aks-small-operator-qualification
 initial_candidate: examples/candidates/shipped-small.yaml
 train_case_ids:
