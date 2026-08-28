@@ -20,32 +20,32 @@
 
 ### Task 1: Baseline Candidate
 
-- [ ] Add tests for current small/full profile materialization, metadata, stable
+- [x] Add tests for current small/full profile materialization, metadata, stable
   fingerprint, output collision, and exact YAML.
-- [ ] Implement `korvid-baseline --profile --output`.
-- [ ] Verify against the installed Korvid wheel and commit.
+- [x] Implement `korvid-baseline --profile --output`.
+- [x] Verify against the installed Korvid wheel and commit.
 
 ### Task 2: Campaign Backend and Runner
 
-- [ ] Add `KorvidReadonlyServing` schema tests and parsing.
-- [ ] Add runner RED tests for exact scenario/question, private files, CLI/env,
+- [x] Add `KorvidReadonlyServing` schema tests and parsing.
+- [x] Add runner RED tests for exact scenario/question, private files, CLI/env,
   timeout, cleanup, concurrency, and exit classification.
-- [ ] Implement one-case execution and JSON normalization to `BridgeResult`.
-- [ ] Run runner/scoring tests and commit.
+- [x] Implement one-case execution and JSON normalization to `BridgeResult`.
+- [x] Run runner/scoring tests and commit.
 
 ### Task 3: GEPA Integration
 
-- [ ] Generalize adapter/optimizer runner typing to the shared runner protocol.
-- [ ] Add reflection trace fields for read-only diagnosis/evidence/citation
+- [x] Generalize adapter/optimizer runner typing to the shared runner protocol.
+- [x] Add reflection trace fields for read-only diagnosis/evidence/citation
   feedback without exposing raw cluster data.
-- [ ] Prove a deterministic fake Korvid CLI candidate can beat the baseline.
-- [ ] Commit after adapter/optimize tests.
+- [x] Prove a deterministic fake Korvid CLI candidate can beat the baseline.
+- [x] Commit after adapter/optimize tests.
 
 ### Task 4: Examples and Documentation
 
-- [ ] Add a read-only small-profile campaign with disjoint train/validation
+- [x] Add a read-only small-profile campaign with disjoint train/validation
   scenario IDs.
-- [ ] Document baseline, evaluate, and optimize commands.
+- [x] Document baseline, evaluate, and optimize commands.
 - [ ] Run full tests, Ruff, mypy, lock/diff checks, independent review, and
   merge.
 

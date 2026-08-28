@@ -1,0 +1,31 @@
+schema_version: 1
+campaign_id: korvid-readonly-small
+repetitions: 1
+models: [qwen3:0.6b]
+cases:
+  # Train split (used with `--train-case-id`): two scenario ids/questions
+  # copied verbatim from the installed korvid[agent] wheel's bundled evals.
+  - case_id: oom-killed
+    template_id: korvid-readonly-train
+    prompt: Why does the worker pod in namespace jobs keep dying?
+    models: [qwen3:0.6b]
+  - case_id: crashloop-app-panic
+    template_id: korvid-readonly-train
+    prompt: checkout-1 in namespace shop keeps restarting. What is wrong with it?
+    models: [qwen3:0.6b]
+  # Validation split (used with `--validation-case-id`): disjoint scenario ids
+  # from the train split above, also copied verbatim from the same wheel.
+  - case_id: image-pull-typo
+    template_id: korvid-readonly-validation
+    prompt: Pod web-1 in namespace front is stuck in ImagePullBackOff. What is the cause?
+    models: [qwen3:0.6b]
+  - case_id: healthy-deployment
+    template_id: korvid-readonly-validation
+    prompt: Is the checkout deployment in namespace shop healthy right now?
+    models: [qwen3:0.6b]
+serving:
+  backend: korvid_readonly
+  provider: ollama
+  base_url: env:KORVID_READONLY_BASE_URL
+  profile: small
+  timeout_seconds: 120

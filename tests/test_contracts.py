@@ -591,3 +591,54 @@ serving:
 
     with pytest.raises(ValueError, match="serving.timeout_seconds"):
         load_campaign(path)
+
+
+def test_readonly_small_example_matches_installed_bundled_scenarios(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The checked-in example never vendors scenario text: it hand-copies exact
+
+    case ids and authored questions from whichever Korvid wheel is installed.
+    This test re-derives that same catalog from the installed wheel so a
+    Korvid dependency bump that silently reworded a scenario fails this test
+    visibly instead of corrupting the example campaign's identity silently.
+    """
+    from korvid.evals.scenario import bundled_scenarios_dir, load_scenario
+
+    monkeypatch.setenv("KORVID_READONLY_BASE_URL", "http://127.0.0.1:11434")
+    campaign = load_campaign(ROOT / "examples/campaigns/korvid-readonly-small.yaml")
+
+    assert isinstance(campaign.serving, KorvidReadonlyServing)
+    assert campaign.serving.backend == "korvid_readonly"
+    assert campaign.serving.provider == "ollama"
+    assert campaign.serving.profile == "small"
+
+    bundled_questions = {
+        scenario.id: scenario.question
+        for scenario in (
+            load_scenario(path) for path in bundled_scenarios_dir().glob("*.yaml")
+        )
+    }
+    assert bundled_questions, "installed Korvid wheel exposed no bundled scenarios"
+
+    assert len(campaign.cases) >= 4
+    case_ids = [case.case_id for case in campaign.cases]
+    assert len(set(case_ids)) == len(case_ids), "example campaign cases must be unique"
+
+    for case in campaign.cases:
+        assert case.case_id in bundled_questions, (
+            f"{case.case_id!r} is not a scenario shipped by the installed Korvid "
+            "wheel; update examples/campaigns/korvid-readonly-small.yaml to match "
+            "the currently installed korvid[agent] distribution"
+        )
+        assert case.prompt == bundled_questions[case.case_id], (
+            f"{case.case_id!r}'s authored question changed in the installed "
+            "Korvid wheel; update examples/campaigns/korvid-readonly-small.yaml's "
+            "prompt to match verbatim rather than silently drifting from it"
+        )
+
+    train_case_ids = {"oom-killed", "crashloop-app-panic"}
+    validation_case_ids = {"image-pull-typo", "healthy-deployment"}
+    assert train_case_ids <= set(case_ids)
+    assert validation_case_ids <= set(case_ids)
+    assert train_case_ids.isdisjoint(validation_case_ids)
