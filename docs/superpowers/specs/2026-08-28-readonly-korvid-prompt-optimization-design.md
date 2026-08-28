@@ -94,4 +94,3 @@ control plane.
 - A fake CLI contract suite covers every outcome.
 - A real installed-wheel scripted smoke test covers profile and fixture APIs.
 - A live AKS canary demonstrates a non-flat candidate comparison.
-
