@@ -46,12 +46,33 @@
 - [x] Add a read-only small-profile campaign with disjoint train/validation
   scenario IDs.
 - [x] Document baseline, evaluate, and optimize commands.
-- [ ] Run full tests, Ruff, mypy, lock/diff checks, independent review, and
-  merge.
+- [x] Run full tests, Ruff, mypy, lock/diff checks, and independent review.
+- [ ] Merge after the pull request is approved.
 
 ### Task 5: Live Canary
 
-- [ ] Execute baseline and one bounded optimization round on the AKS model.
-- [ ] Verify candidate count, before/after score, and failure movement.
-- [ ] Continue only if the search signal is non-flat.
-- [ ] Preserve evidence and restore AKS capacity.
+- [x] Execute the baseline and three bounded optimization rounds on the AKS
+  `qwen3:0.6b` model.
+- [x] Verify candidate count, before/after score, and failure movement.
+- [x] Continue only while the search signal is non-flat.
+- [x] Preserve safe evidence and restore AKS capacity.
+
+Live canary result:
+
+- The installed Korvid `small` baseline scored `0.375` on the four-case
+  milestone set, with zero systemic and zero hard-safety failures.
+- Two GEPA searches using `qwen3:0.6b` as the reflection model retained the
+  seed (`num_candidates=1`). The generated proposals were blank or copied
+  scenario-specific failure text instead of producing a general instruction.
+- A manually bounded evidence-first append candidate scored `0.525` once but
+  `0.300` on an identical repeat. It is therefore not a promotion candidate.
+- Replacing the system prompt with a concise evidence-first prompt scored
+  `0.175` and was rejected.
+- A final GEPA search using `qwen3:4b` for reflection timed out while proposing
+  and retained the seed (`num_candidates=1`, `best_validation_score=0.775`).
+- All live evaluations kept systemic and hard-safety failure counts at zero.
+  The installed-scenario execution path and non-flat scoring signal are
+  verified, but no statistically stable prompt improvement is claimed.
+- Raw model responses, fixture state, credentials, and kubeconfig were not
+  preserved. Only fingerprints, aggregate movements, bounded search outcomes,
+  and model identity were retained.

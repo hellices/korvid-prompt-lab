@@ -290,11 +290,20 @@ preempt Korvid mid-iteration, before it could ever write the `run.error`
 above, turning a genuine model failure into a systemic one. The runner
 instead derives `KORVID_EVAL_TIMEOUT_SECONDS` from the effective
 `timeout_seconds` (honoring a `KorvidReadonlyRunner(timeout_seconds=...)`
-override over the campaign's own value): a bounded share is reserved for the
-CLI's own non-HTTP overhead, and the remainder is divided across the
-installed profile's `max_iterations` — read from the installed wheel via
-`korvid.agent.profiles.build_profile`, never hard-coded here — keeping the
-per-request value strictly below the outer budget.
+override over the campaign's own value): it first reserves the installed CLI's
+four sequential serving probes at their installed 20-second worst case, then a
+bounded share for non-HTTP process overhead. The remainder is divided across
+the installed profile's `max_iterations` — read from the installed wheel via
+`korvid.agent.profiles.build_profile`, never hard-coded here. A whole-process
+budget that cannot fit the serving probes and process overhead is rejected
+instead of silently turning a legitimate model timeout into a systemic
+subprocess timeout.
+
+The CLI's full JSON is read only from the same private temporary pack as the
+prompt overrides and scenario. It is deleted after strict profile, prompt
+fingerprint, tool-arm, model, scenario, and run validation. Evaluation and GEPA
+artifacts retain only normalized scores, counts, labels, and usage; the raw
+model answer is not included in read-only reflection records.
 
 The following walkthrough is a **runnable path**, not optimized journey
 evidence: it demonstrates the wiring end to end against a local model and

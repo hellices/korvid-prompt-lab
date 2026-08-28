@@ -20,6 +20,7 @@ class SafeExecutionTrace:
     model: str
     execution_mode: str
     final_answer: str
+    answer_redacted: bool
     checkpoint_names: tuple[str, ...]
     tool_call_count: int
     outcome: str
@@ -164,6 +165,9 @@ class KorvidGEPAAdapter:
             model=case.models[0],
             execution_mode=result.execution_mode,
             final_answer=result.answer,
+            answer_redacted=isinstance(
+                self.runner.campaign.serving, KorvidReadonlyServing
+            ),
             checkpoint_names=checkpoint_names,
             tool_call_count=_count_tool_calls(reported_tool_calls),
             outcome="unsafe" if unsafe else result.status,
@@ -198,20 +202,22 @@ class KorvidGEPAAdapter:
         }
 
     def _trace_to_record(self, trace: SafeExecutionTrace) -> Mapping[str, Any]:
+        generated_outputs = {
+            "checkpoint_names": list(trace.checkpoint_names),
+            "tool_call_count": trace.tool_call_count,
+            "outcome": trace.outcome,
+            "execution_mode": trace.execution_mode,
+            **_readonly_output_fields(trace),
+        }
+        if not trace.answer_redacted:
+            generated_outputs["answer"] = trace.final_answer
         return {
             "Inputs": {
                 "case_id": trace.case_id,
                 "template_id": trace.template_id,
                 "model": trace.model,
             },
-            "Generated Outputs": {
-                "answer": trace.final_answer,
-                "checkpoint_names": list(trace.checkpoint_names),
-                "tool_call_count": trace.tool_call_count,
-                "outcome": trace.outcome,
-                "execution_mode": trace.execution_mode,
-                **_readonly_output_fields(trace),
-            },
+            "Generated Outputs": generated_outputs,
             "Feedback": _build_feedback(trace),
             "score": trace.score,
         }

@@ -17,6 +17,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+from korvid.agent.profiles import PromptOverrides, build_profile
+from korvid.evals.__main__ import prompt_fingerprint
+from korvid.evals.runner import _eval_tools
+
 
 def _first_scenario_id(scenarios_dir: Path) -> str:
     for path in sorted(scenarios_dir.glob("*.yaml")):
@@ -264,12 +268,40 @@ def main() -> int:
     else:
         scenarios_payload = [scenario_entry]
 
+    overrides = PromptOverrides(
+        system=args.system_prompt_file.read_text(encoding="utf-8"),
+        append=(
+            args.prompt_append_file.read_text(encoding="utf-8")
+            if args.prompt_append_file is not None
+            else None
+        ),
+    )
+    profile = build_profile(
+        args.profile,
+        readonly=False,
+        resize_supported=True,
+        overrides=overrides,
+    )
+    offered_tools = _eval_tools(profile)
+    meta: dict[str, Any] = {
+        "profile": args.profile,
+        "prompts": prompt_fingerprint(profile, tools=offered_tools),
+        "tools": {"omitted": [], "count": len(offered_tools)},
+        "serving": {"model": os.environ["KORVID_EVAL_MODEL"]},
+    }
+    if mode == "missing-meta":
+        meta.pop("profile")
+    elif mode == "wrong-profile":
+        meta["profile"] = "full" if args.profile == "small" else "small"
+    elif mode == "wrong-prompt-fingerprint":
+        meta["prompts"] = {"source": "override", "sha256": "0" * 64}
+    elif mode == "wrong-model":
+        meta["serving"] = {"model": "different-model"}
+    if mode == "malformed-scenario-summary":
+        scenario_entry["successes"] = "1"
+
     payload = {
-        "meta": {
-            "profile": args.profile,
-            "prompts": {"source": "override", "sha256": "deadbeef"},
-            "tools": {"omitted": [], "count": 10},
-        },
+        "meta": meta,
         "scenarios": scenarios_payload,
     }
     args.json.write_text(json.dumps(payload), encoding="utf-8")

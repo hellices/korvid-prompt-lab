@@ -69,7 +69,7 @@ def _readonly_runner(cases: Sequence[EvalCase]) -> KorvidReadonlyRunner:
             provider="openai-compat",
             base_url="http://127.0.0.1:41001/v1",
             profile="small",
-            timeout_seconds=5.0,
+            timeout_seconds=120.0,
         ),
     )
     return KorvidReadonlyRunner(campaign)
@@ -130,3 +130,8 @@ def test_readonly_backed_gepa_search_finds_a_tuned_candidate_that_beats_the_ship
 
     persisted = load_candidate(artifacts.best_candidate_path)
     assert persisted.components == artifacts.best_candidate.components
+    assert not list((tmp_path / "artifacts").rglob("korvid-eval-output.json"))
+    for path in (tmp_path / "artifacts").rglob("*.json"):
+        assert "diagnosis complete with cited evidence" not in path.read_text(
+            encoding="utf-8"
+        )

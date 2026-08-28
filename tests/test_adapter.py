@@ -115,7 +115,7 @@ def _readonly_runner() -> KorvidReadonlyRunner:
             provider="openai-compat",
             base_url="http://127.0.0.1:41001/v1",
             profile="small",
-            timeout_seconds=5.0,
+            timeout_seconds=120.0,
         ),
     )
     return KorvidReadonlyRunner(campaign)
@@ -437,6 +437,7 @@ def test_readonly_trace_exposes_bounded_diagnosis_and_evidence_feedback(
 
     record = adapter._trace_to_record(trace)
     outputs = record["Generated Outputs"]
+    assert "answer" not in outputs
     assert outputs["diagnosis_success"] is True
     assert outputs["evidence_fetched"] is True
     assert outputs["citation_coverage"] == 1.0
@@ -540,6 +541,8 @@ def test_process_backed_trace_never_gains_readonly_reflection_fields(tmp_path: P
 
     assert eval_batch.trajectories is not None
     trace = eval_batch.trajectories[0]
+    record = adapter._trace_to_record(trace)
+    assert record["Generated Outputs"]["answer"] == trace.final_answer
     assert trace.diagnosis_success is None
     assert trace.evidence_fetched is None
     assert trace.missing_mention_count is None

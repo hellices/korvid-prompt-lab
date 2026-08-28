@@ -161,7 +161,7 @@ def _korvid_readonly_campaign_payload(
             "provider": "openai-compat",
             "base_url": f"env:{base_url_env}",
             "profile": "small",
-            "timeout_seconds": 30,
+            "timeout_seconds": 120,
         },
     }
 

@@ -29,7 +29,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from korvid.agent.profiles import build_profile
+from korvid.agent.profiles import PromptOverrides, build_profile
+from korvid.evals.__main__ import PROBE_TIMEOUT_SECONDS, prompt_fingerprint
+from korvid.evals.runner import _eval_tools
 from korvid.evals.scenario import Scenario, bundled_scenarios_dir, load_scenario
 
 from .bridge_worker import EXECUTION_MODE_LIVE, PROTOCOL_VERSION
@@ -72,6 +74,10 @@ _EVAL_TIMEOUT_OVERHEAD_MAX_SECONDS = 10.0
 #: Lower bound on that reservation, so a short outer budget still keeps a
 #: usable floor of overhead reserved.
 _EVAL_TIMEOUT_OVERHEAD_MIN_SECONDS = 1.0
+# ``korvid.evals`` probes version, show, tags, and ps sequentially before the
+# scored run. Reserve their installed per-request worst case before budgeting
+# model iterations.
+_SERVING_PROBE_WORST_CASE_SECONDS = 4 * PROBE_TIMEOUT_SECONDS
 
 #: Candidate component keys this runner knows how to project onto the
 #: installed CLI's ``--system-prompt-file``/``--prompt-append-file`` flags.
@@ -177,15 +183,6 @@ class KorvidReadonlyRunner:
                 f"runner could not prepare run directory: {run_path}"
             ) from exc
 
-        output_path = run_path / "korvid-eval-output.json"
-        try:
-            if output_path.exists():
-                output_path.unlink()
-        except OSError as exc:
-            raise BridgeArtifactError(
-                f"runner could not clean previous output artifact: {output_path}"
-            ) from exc
-
         try:
             pack_dir = Path(tempfile.mkdtemp(prefix="korvid-readonly-pack-"))
         except OSError as exc:
@@ -194,6 +191,7 @@ class KorvidReadonlyRunner:
             ) from exc
 
         try:
+            output_path = pack_dir / "korvid-eval-output.json"
             command = self._build_command(
                 serving,
                 pack_dir,
@@ -217,7 +215,12 @@ class KorvidReadonlyRunner:
                     "korvid.evals did not create the requested --json output artifact"
                 )
 
-            run_payload = _load_single_run(output_path, case)
+            run_payload = _load_single_run(
+                output_path,
+                case,
+                serving=serving,
+                candidate=candidate,
+            )
 
             if completed.returncode != 0 and not _has_model_failure_error(run_payload):
                 # The installed Korvid CLI exits nonzero for a genuine model
@@ -229,7 +232,12 @@ class KorvidReadonlyRunner:
                 # normalized into a completed/model_failure result.
                 raise BridgeProcessExitError(_process_exit_message(completed))
         finally:
-            shutil.rmtree(pack_dir, ignore_errors=True)
+            try:
+                shutil.rmtree(pack_dir)
+            except OSError as exc:
+                raise BridgeArtifactError(
+                    f"runner could not remove private scenario pack: {pack_dir}"
+                ) from exc
 
         return _to_bridge_result(candidate, run_payload)
 
@@ -373,7 +381,12 @@ def _eval_request_timeout_seconds(timeout_seconds: float, profile: str) -> float
         # divide across iterations.
         timeout_seconds * 0.5,
     )
-    budget = timeout_seconds - overhead
+    budget = timeout_seconds - _SERVING_PROBE_WORST_CASE_SECONDS - overhead
+    if budget <= 0:
+        raise ValueError(
+            "timeout_seconds must exceed the installed Korvid serving probe "
+            f"budget ({_SERVING_PROBE_WORST_CASE_SECONDS:g}s) plus process overhead"
+        )
     return _require_bridge_timeout(
         budget / agent_profile.max_iterations, "derived KORVID_EVAL_TIMEOUT_SECONDS"
     )
@@ -453,7 +466,13 @@ def _locate_bundled_scenario(scenario_id: str) -> tuple[Scenario, Path]:
     return matches[0]
 
 
-def _load_single_run(output_path: Path, case: EvalCase) -> Mapping[str, Any]:
+def _load_single_run(
+    output_path: Path,
+    case: EvalCase,
+    *,
+    serving: KorvidReadonlyServing,
+    candidate: Candidate,
+) -> Mapping[str, Any]:
     try:
         text = output_path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -474,7 +493,15 @@ def _load_single_run(output_path: Path, case: EvalCase) -> Mapping[str, Any]:
 
     try:
         mapping = _require_mapping(payload, "korvid.evals output")
-        _ensure_keys(mapping, {"meta", "scenarios"}, "korvid.evals output")
+        _require_exact_keys(
+            mapping, frozenset({"meta", "scenarios"}), "korvid.evals output"
+        )
+        _validate_run_metadata(
+            mapping.get("meta"),
+            serving=serving,
+            candidate=candidate,
+            model=case.models[0],
+        )
         scenarios = mapping.get("scenarios")
         if not isinstance(scenarios, list):
             raise ValueError("korvid.evals output scenarios must be a list")  # noqa: TRY004 - preserve validation API
@@ -496,6 +523,11 @@ def _load_single_run(output_path: Path, case: EvalCase) -> Mapping[str, Any]:
         scenario_id = _require_string(
             scenario_entry.get("scenario"), "scenario result scenario"
         )
+        _require_string(
+            scenario_entry.get("root_cause"), "scenario result root_cause"
+        )
+        _require_summary_count(scenario_entry, "successes")
+        _require_summary_count(scenario_entry, "evidence_hits")
     except ValueError as exc:
         raise BridgeMalformedOutputError(str(exc)) from exc
 
@@ -518,6 +550,77 @@ def _load_single_run(output_path: Path, case: EvalCase) -> Mapping[str, Any]:
         return _require_mapping(runs[0], "korvid.evals run result")
     except ValueError as exc:
         raise BridgeMalformedOutputError(str(exc)) from exc
+
+
+def _validate_run_metadata(
+    value: Any,
+    *,
+    serving: KorvidReadonlyServing,
+    candidate: Candidate,
+    model: str,
+) -> None:
+    meta = _require_mapping(value, "korvid.evals output meta")
+    _require_exact_keys(
+        meta,
+        frozenset({"profile", "prompts", "tools", "serving"}),
+        "korvid.evals output meta",
+    )
+
+    reported_profile = _require_string(
+        meta.get("profile"), "korvid.evals output meta.profile"
+    )
+    if reported_profile != serving.profile:
+        raise BridgeIdentityMismatchError(
+            "korvid.evals output profile does not match the requested profile"
+        )
+
+    profile = build_profile(
+        serving.profile,
+        readonly=False,
+        resize_supported=True,
+        overrides=PromptOverrides(
+            system=candidate.components["system"],
+            append=candidate.components.get("append"),
+        ),
+    )
+    offered_tools = _eval_tools(profile)
+    expected_prompts = prompt_fingerprint(profile, tools=offered_tools)
+    reported_prompts = _require_mapping(
+        meta.get("prompts"), "korvid.evals output meta.prompts"
+    )
+    if dict(reported_prompts) != expected_prompts:
+        raise BridgeIdentityMismatchError(
+            "korvid.evals output prompts do not match the requested candidate"
+        )
+
+    reported_tools = _require_mapping(
+        meta.get("tools"), "korvid.evals output meta.tools"
+    )
+    expected_tools = {"omitted": [], "count": len(offered_tools)}
+    if dict(reported_tools) != expected_tools:
+        raise BridgeIdentityMismatchError(
+            "korvid.evals output tools do not match the requested tool arm"
+        )
+
+    serving_meta = _require_mapping(
+        meta.get("serving"), "korvid.evals output meta.serving"
+    )
+    reported_model = _require_string(
+        serving_meta.get("model"), "korvid.evals output meta.serving.model"
+    )
+    if reported_model != model:
+        raise BridgeIdentityMismatchError(
+            "korvid.evals output model does not match the requested model"
+        )
+
+
+def _require_summary_count(mapping: Mapping[str, Any], field_name: str) -> int:
+    value = mapping.get(field_name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"korvid.evals scenario result {field_name} must be a non-negative integer"
+        )
+    return value
 
 
 def _require_int(mapping: Mapping[str, Any], field_name: str) -> int:
