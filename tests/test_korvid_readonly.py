@@ -10,6 +10,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from korvid.agent.profiles import build_profile as installed_build_profile
+
+from korvid_prompt_lab import korvid_readonly
 from korvid_prompt_lab.contracts import (
     Campaign,
     Candidate,
@@ -226,7 +229,13 @@ def test_runner_writes_private_system_and_append_files_and_invokes_the_cli(
     assert "--json" in argv
     assert record["env"]["KORVID_EVAL_BASE_URL"] == "http://127.0.0.1:41001/v1"
     assert record["env"]["KORVID_EVAL_MODEL"] == "mock-small"
-    assert record["env"]["KORVID_EVAL_TIMEOUT_SECONDS"] == "5.0"
+    # KORVID_EVAL_TIMEOUT_SECONDS is a per-HTTP-request read timeout inside the
+    # installed CLI, not the outer process budget: it must be strictly below
+    # the runner's own subprocess.run(timeout=...) budget (5.0 here), derived
+    # from it and the "small" profile's installed max_iterations.
+    assert record["env"]["KORVID_EVAL_TIMEOUT_SECONDS"] == repr(
+        korvid_readonly._eval_request_timeout_seconds(5.0, "small")
+    )
     # Inherited credentials pass through; the runner never sets this itself.
     assert record["env"]["KORVID_EVAL_API_KEY"] == "super-secret-token"
 
@@ -244,6 +253,91 @@ def test_runner_omits_append_flag_when_candidate_has_no_append_component(
     record = json.loads(record_path.read_text(encoding="utf-8"))
     assert record["prompt_append"] is None
     assert "--prompt-append-file" not in record["argv"]
+
+
+# ---------------------------------------------------------------------------
+# KORVID_EVAL_TIMEOUT_SECONDS derivation (per-request vs. outer process budget)
+# ---------------------------------------------------------------------------
+
+
+def test_eval_request_timeout_is_strictly_below_the_outer_budget() -> None:
+    """``KORVID_EVAL_TIMEOUT_SECONDS`` is a per-HTTP-request read timeout,
+
+    while the outer ``subprocess.run(timeout=...)`` budget is the whole
+    process's wall clock. Setting the two equal lets the outer kill preempt
+    Korvid mid-iteration, before it can ever write ``run.error`` -- so the
+    derived per-request value must always be strictly less than the outer
+    budget it is derived from.
+    """
+    for outer in (0.05, 0.2, 5.0, 120.0):
+        for profile in ("small", "full"):
+            derived = korvid_readonly._eval_request_timeout_seconds(outer, profile)
+            assert 0.0 < derived < outer
+
+
+def test_eval_request_timeout_uses_the_installed_profile_max_iterations() -> None:
+    """The per-request budget is the outer budget (minus a bounded process
+
+    overhead reservation) divided across the installed profile's own
+    ``max_iterations`` -- never a value hard-coded in this repository. The
+    installed "full" profile allows more iterations than "small", so for the
+    same outer budget it must be handed a smaller per-request timeout.
+    """
+    outer = 120.0
+    small_iterations = installed_build_profile(
+        "small", readonly=True, resize_supported=False
+    ).max_iterations
+    full_iterations = installed_build_profile(
+        "full", readonly=True, resize_supported=False
+    ).max_iterations
+    assert full_iterations > small_iterations
+
+    small_derived = korvid_readonly._eval_request_timeout_seconds(outer, "small")
+    full_derived = korvid_readonly._eval_request_timeout_seconds(outer, "full")
+
+    assert full_derived < small_derived
+
+
+def test_environment_carries_the_derived_eval_timeout_not_the_raw_outer_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_command(monkeypatch)
+    record_path = tmp_path / "record.json"
+    monkeypatch.setenv("FAKE_KORVID_EVALS_RECORD", str(record_path))
+    case = _case()
+
+    _runner(case, timeout_seconds=120.0).run(_candidate(), case, tmp_path / "run")
+
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    expected = korvid_readonly._eval_request_timeout_seconds(120.0, "small")
+    assert record["env"]["KORVID_EVAL_TIMEOUT_SECONDS"] == repr(expected)
+    assert float(record["env"]["KORVID_EVAL_TIMEOUT_SECONDS"]) < 120.0
+
+
+def test_environment_derives_from_the_runner_override_not_the_serving_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``KorvidReadonlyRunner(timeout_seconds=X)`` overrides the campaign
+
+    serving timeout as the effective outer budget (``self.timeout_seconds``);
+    the derived per-request value handed to Korvid must follow that override,
+    never fall back to the serving config's own ``timeout_seconds``.
+    """
+    _fake_command(monkeypatch)
+    record_path = tmp_path / "record.json"
+    monkeypatch.setenv("FAKE_KORVID_EVALS_RECORD", str(record_path))
+    case = _case()
+    campaign = _campaign(case, timeout_seconds=5.0)
+
+    KorvidReadonlyRunner(campaign, timeout_seconds=120.0).run(
+        _candidate(), case, tmp_path / "run"
+    )
+
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    expected = korvid_readonly._eval_request_timeout_seconds(120.0, "small")
+    unexpected = korvid_readonly._eval_request_timeout_seconds(5.0, "small")
+    assert expected != unexpected
+    assert record["env"]["KORVID_EVAL_TIMEOUT_SECONDS"] == repr(expected)
 
 
 def test_runner_uses_the_ollama_native_root_when_the_provider_is_ollama(

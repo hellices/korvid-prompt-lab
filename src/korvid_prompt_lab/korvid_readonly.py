@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from korvid.agent.profiles import build_profile
 from korvid.evals.scenario import Scenario, bundled_scenarios_dir, load_scenario
 
 from .bridge_worker import EXECUTION_MODE_LIVE, PROTOCOL_VERSION
@@ -58,6 +59,19 @@ from .scoring import BridgeResult, OperationGrade
 #: CLI. Production code always uses the interpreter running this process so
 #: the same installed wheel that built the baseline also serves it.
 _KORVID_EVALS_COMMAND: tuple[str, ...] = (sys.executable, "-m", "korvid.evals")
+
+#: Share of the outer subprocess.run(timeout=...) budget reserved for
+#: korvid.evals' own non-HTTP overhead (interpreter startup, importing the
+#: installed wheel, writing the requested --json artifact, ...) before the
+#: remainder is divided across the installed profile's max_iterations. See
+#: :func:`_eval_request_timeout_seconds`.
+_EVAL_TIMEOUT_OVERHEAD_FRACTION = 0.1
+#: Upper bound on that reservation, so a long outer budget does not donate an
+#: unreasonably large share to process overhead.
+_EVAL_TIMEOUT_OVERHEAD_MAX_SECONDS = 10.0
+#: Lower bound on that reservation, so a short outer budget still keeps a
+#: usable floor of overhead reserved.
+_EVAL_TIMEOUT_OVERHEAD_MIN_SECONDS = 1.0
 
 #: Candidate component keys this runner knows how to project onto the
 #: installed CLI's ``--system-prompt-file``/``--prompt-append-file`` flags.
@@ -264,11 +278,25 @@ class KorvidReadonlyRunner:
         # for are set explicitly; anything else (e.g. KORVID_EVAL_API_KEY)
         # flows through from the inherited environment untouched, so
         # credentials are never read from or written into campaign config.
+        outer_timeout = self.timeout_seconds
+        # Guaranteed non-None by __post_init__, which always resolves it from
+        # either the constructor override or serving.timeout_seconds before
+        # validating it with _require_bridge_timeout.
+        assert outer_timeout is not None
         return {
             **os.environ,
             "KORVID_EVAL_BASE_URL": _effective_base_url(serving),
             "KORVID_EVAL_MODEL": case.models[0],
-            "KORVID_EVAL_TIMEOUT_SECONDS": repr(serving.timeout_seconds),
+            # This runner's own subprocess.run(timeout=...) budget is
+            # self.timeout_seconds (the effective outer budget, honoring a
+            # constructor override over serving.timeout_seconds); the
+            # per-HTTP-request value handed to Korvid must be derived from
+            # that same effective budget, never from serving.timeout_seconds
+            # directly, so a runner-level override is never silently ignored
+            # here. See _eval_request_timeout_seconds.
+            "KORVID_EVAL_TIMEOUT_SECONDS": repr(
+                _eval_request_timeout_seconds(outer_timeout, serving.profile)
+            ),
         }
 
     def _invoke(
@@ -300,6 +328,55 @@ class KorvidReadonlyRunner:
         # with a populated ``error`` was also written (a legitimate model
         # failure per the installed Korvid CLI's own contract).
         return completed
+
+
+def _eval_request_timeout_seconds(timeout_seconds: float, profile: str) -> float:
+    """Derive the per-HTTP-request timeout handed to the installed Korvid CLI
+
+    as ``KORVID_EVAL_TIMEOUT_SECONDS``.
+
+    ``KORVID_EVAL_TIMEOUT_SECONDS`` bounds one HTTP request inside Korvid's
+    own agent loop, while *timeout_seconds* is this runner's *whole-process*
+    wall-clock budget (:func:`subprocess.run`'s own ``timeout``). The
+    installed profile's agent loop can issue up to its own ``max_iterations``
+    sequential requests before finishing -- successfully, or with a genuine
+    model failure it reports via a populated ``run.error`` -- so setting the
+    two timeouts equal lets the outer subprocess kill preempt Korvid
+    mid-iteration, before it can ever write that JSON. That turns a per-case
+    model failure into a systemic process error instead of the model_failure
+    status it should be.
+
+    A bounded share of *timeout_seconds* is reserved for the CLI's own
+    non-HTTP overhead (interpreter startup, importing the installed wheel,
+    writing the requested ``--json`` artifact, ...); the remainder is divided
+    across the installed profile's ``max_iterations`` -- read from the
+    installed Korvid wheel via ``korvid.agent.profiles.build_profile`` (the
+    same API :mod:`korvid_prompt_lab.baseline` already uses), never
+    hard-coded in this repository -- so the derived value stays strictly
+    below *timeout_seconds* regardless of profile or timeout configuration.
+    """
+    try:
+        agent_profile = build_profile(profile, readonly=True, resize_supported=False)
+    except ValueError as exc:
+        raise ValueError(
+            f"installed Korvid rejected profile {profile!r}: {exc}"
+        ) from exc
+
+    overhead = min(
+        max(
+            timeout_seconds * _EVAL_TIMEOUT_OVERHEAD_FRACTION,
+            _EVAL_TIMEOUT_OVERHEAD_MIN_SECONDS,
+        ),
+        _EVAL_TIMEOUT_OVERHEAD_MAX_SECONDS,
+        # Never reserve more than half the budget: a very short outer
+        # timeout must still leave a usable, strictly-positive remainder to
+        # divide across iterations.
+        timeout_seconds * 0.5,
+    )
+    budget = timeout_seconds - overhead
+    return _require_bridge_timeout(
+        budget / agent_profile.max_iterations, "derived KORVID_EVAL_TIMEOUT_SECONDS"
+    )
 
 
 def _process_exit_message(completed: subprocess.CompletedProcess[bytes]) -> str:

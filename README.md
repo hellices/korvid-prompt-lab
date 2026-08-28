@@ -273,7 +273,28 @@ endpoint is hard-coded into a checked-in campaign. Only a candidate's `system`
 and optional `append` components are supported — they map to
 `--system-prompt-file`/`--prompt-append-file` — and the runner fails closed on
 any other component, on a malformed or missing `korvid.evals` JSON result, on
-a scenario-identity mismatch, on a timeout, or on a non-zero exit.
+a scenario-identity mismatch, or on a timeout — with one exception: the
+installed Korvid CLI's own contract for a genuine model failure is a
+non-zero exit paired with an otherwise-valid, exactly-one-run result whose
+`error` is populated, and the runner reports that as `status: model_failure`
+rather than failing closed. Any other non-zero exit (a success-looking
+result, malformed JSON, an identity mismatch, ...) still fails closed as a
+systemic process error regardless of exit code.
+
+`timeout_seconds` is this runner's own whole-process budget — the
+`subprocess.run(timeout=...)` this runner enforces around the whole
+`korvid.evals` invocation — not the per-HTTP-request timeout Korvid's own
+agent loop uses internally. Handing Korvid that same value as
+`KORVID_EVAL_TIMEOUT_SECONDS` would let this runner's outer process kill
+preempt Korvid mid-iteration, before it could ever write the `run.error`
+above, turning a genuine model failure into a systemic one. The runner
+instead derives `KORVID_EVAL_TIMEOUT_SECONDS` from the effective
+`timeout_seconds` (honoring a `KorvidReadonlyRunner(timeout_seconds=...)`
+override over the campaign's own value): a bounded share is reserved for the
+CLI's own non-HTTP overhead, and the remainder is divided across the
+installed profile's `max_iterations` — read from the installed wheel via
+`korvid.agent.profiles.build_profile`, never hard-coded here — keeping the
+per-request value strictly below the outer budget.
 
 The following walkthrough is a **runnable path**, not optimized journey
 evidence: it demonstrates the wiring end to end against a local model and
