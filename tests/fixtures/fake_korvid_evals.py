@@ -227,7 +227,7 @@ def main() -> int:
         return 0
     if mode == "malformed-json":
         args.json.write_text("{not json", encoding="utf-8")
-        return 0
+        return _exit_code(default=0)
 
     scenario_id = _first_scenario_id(args.scenarios)
     if mode == "identity-mismatch":
@@ -273,7 +273,25 @@ def main() -> int:
         "scenarios": scenarios_payload,
     }
     args.json.write_text(json.dumps(payload), encoding="utf-8")
-    return 0
+    if mode == "model-failure":
+        # Mirrors the real installed Korvid 0.3 CLI: a genuine model failure
+        # still writes valid exactly-one-scenario/exactly-one-run JSON with
+        # ``run.error`` populated, but the process itself exits nonzero.
+        return 1
+    return _exit_code(default=0)
+
+
+def _exit_code(*, default: int) -> int:
+    """The process exit code to return, overridable by tests independent of
+
+    ``FAKE_KORVID_EVALS_MODE`` so a test can combine an arbitrary output shape
+    (success, malformed, identity-mismatched, ...) with a nonzero exit code
+    without needing a dedicated fixture mode for every combination.
+    """
+    override = os.environ.get("FAKE_KORVID_EVALS_EXIT_CODE")
+    if override is None:
+        return default
+    return int(override)
 
 
 if __name__ == "__main__":

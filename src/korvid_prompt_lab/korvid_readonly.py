@@ -189,14 +189,31 @@ class KorvidReadonlyRunner:
                 output_path,
             )
             env = self._build_environment(serving, case)
-            self._invoke(command, env)
+            completed = self._invoke(command, env)
 
             if not output_path.exists():
+                # A real invocation failure (crash, unreachable provider, ...)
+                # never produces the requested artifact; a nonzero exit here
+                # is unambiguous and must stay a process-exit error rather
+                # than the generic missing-output error below, which is
+                # reserved for a zero exit that still forgot to write output.
+                if completed.returncode != 0:
+                    raise BridgeProcessExitError(_process_exit_message(completed))
                 raise BridgeMissingOutputError(
                     "korvid.evals did not create the requested --json output artifact"
                 )
 
             run_payload = _load_single_run(output_path, case)
+
+            if completed.returncode != 0 and not _has_model_failure_error(run_payload):
+                # The installed Korvid CLI exits nonzero for a genuine model
+                # failure too, but *only* alongside valid JSON whose run
+                # carries a non-blank ``error``. Any other nonzero exit
+                # (a successful-looking run, corrupted process output that
+                # still happened to parse, ...) is a real contract violation
+                # and must fail closed as a process error, never be
+                # normalized into a completed/model_failure result.
+                raise BridgeProcessExitError(_process_exit_message(completed))
         finally:
             shutil.rmtree(pack_dir, ignore_errors=True)
 
@@ -254,7 +271,9 @@ class KorvidReadonlyRunner:
             "KORVID_EVAL_TIMEOUT_SECONDS": repr(serving.timeout_seconds),
         }
 
-    def _invoke(self, command: tuple[str, ...], env: dict[str, str]) -> None:
+    def _invoke(
+        self, command: tuple[str, ...], env: dict[str, str]
+    ) -> subprocess.CompletedProcess[bytes]:
         try:
             completed = subprocess.run(
                 command,
@@ -276,12 +295,33 @@ class KorvidReadonlyRunner:
                 f"korvid.evals timed out after {self.timeout_seconds} seconds"
             ) from exc
 
-        if completed.returncode != 0:
-            detail = _decode_process_output(completed.stderr) or _decode_process_output(
-                completed.stdout
-            )
-            detail = detail or f"exit code {completed.returncode}"
-            raise BridgeProcessExitError(f"korvid.evals exited non-zero: {detail}")
+        # Deliberately not raised here: a nonzero exit is only classifiable
+        # once the caller has looked at whether valid, exactly-one-run JSON
+        # with a populated ``error`` was also written (a legitimate model
+        # failure per the installed Korvid CLI's own contract).
+        return completed
+
+
+def _process_exit_message(completed: subprocess.CompletedProcess[bytes]) -> str:
+    detail = _decode_process_output(completed.stderr) or _decode_process_output(
+        completed.stdout
+    )
+    detail = detail or f"exit code {completed.returncode}"
+    return f"korvid.evals exited non-zero: {detail}"
+
+
+def _has_model_failure_error(run_payload: Mapping[str, Any]) -> bool:
+    """Whether *run_payload* carries the shape the installed Korvid CLI uses
+
+    for a genuine model failure: a non-blank ``error`` string. Deliberately
+    lenient (only peeks at ``error``, not the full run-field contract) so the
+    caller can route to the existing, stricter validation in
+    :func:`_to_bridge_result` either way; this only decides whether a nonzero
+    exit is *allowed* to reach that validation instead of failing closed as a
+    process error first.
+    """
+    error = run_payload.get("error")
+    return isinstance(error, str) and bool(error.strip())
 
 
 def _effective_base_url(serving: KorvidReadonlyServing) -> str:

@@ -624,9 +624,16 @@ def test_runner_treats_a_blocked_write_attempt_as_a_hard_failure(
     assert result.grade.hard_failures == ("write_attempted",)
 
 
-def test_runner_maps_run_error_to_model_failure_status_with_no_grade(
+def test_runner_maps_run_error_to_model_failure_status_despite_nonzero_exit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """Regression test for the real installed Korvid 0.3 contract: the CLI
+
+    writes valid exactly-one-scenario/exactly-one-run JSON with ``run.error``
+    populated *and* exits 1 for a genuine model failure. The runner must still
+    read that JSON and normalize it to ``status="model_failure"`` instead of
+    raising ``BridgeProcessExitError`` before ever looking at the output.
+    """
     _fake_command(monkeypatch)
     monkeypatch.setenv("FAKE_KORVID_EVALS_MODE", "model-failure")
     case = _case()
@@ -636,3 +643,55 @@ def test_runner_maps_run_error_to_model_failure_status_with_no_grade(
     assert result.status == "model_failure"
     assert result.grade is None
     assert result.error == "provider returned no tokens"
+
+
+def test_runner_raises_process_exit_error_when_success_json_has_nonzero_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A nonzero exit alongside a *successful* (``error: null``) run result is
+
+    a genuine contract violation, not a model failure: something crashed
+    after the JSON was written and the process must still fail closed with
+    ``BridgeProcessExitError`` rather than being reinterpreted as a normal
+    completed run.
+    """
+    _fake_command(monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_MODE", "completed")
+    monkeypatch.setenv("FAKE_KORVID_EVALS_EXIT_CODE", "1")
+    case = _case()
+
+    with pytest.raises(BridgeProcessExitError):
+        _runner(case).run(_candidate(), case, tmp_path / "run")
+
+
+def test_runner_raises_malformed_output_error_when_malformed_json_has_nonzero_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Malformed output alongside a nonzero exit must remain a systemic,
+
+    fail-closed malformed-output error: it must never be reinterpreted as a
+    model failure just because the exit code happens to be nonzero too.
+    """
+    _fake_command(monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_MODE", "malformed-json")
+    monkeypatch.setenv("FAKE_KORVID_EVALS_EXIT_CODE", "1")
+    case = _case()
+
+    with pytest.raises(BridgeMalformedOutputError):
+        _runner(case).run(_candidate(), case, tmp_path / "run")
+
+
+def test_runner_raises_identity_mismatch_error_when_identity_mismatch_has_nonzero_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A scenario identity mismatch alongside a nonzero exit must remain a
+
+    fail-closed identity error, not be reinterpreted as a model failure.
+    """
+    _fake_command(monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_MODE", "identity-mismatch")
+    monkeypatch.setenv("FAKE_KORVID_EVALS_EXIT_CODE", "1")
+    case = _case()
+
+    with pytest.raises(BridgeIdentityMismatchError):
+        _runner(case).run(_candidate(), case, tmp_path / "run")
