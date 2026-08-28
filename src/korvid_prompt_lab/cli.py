@@ -16,6 +16,7 @@ from .aks import (
     AKSPreflightTransientError,
 )
 from .artifacts import write_json_artifact
+from .baseline import PROFILE_NAMES, build_baseline_candidate, write_baseline_candidate
 from .bridge_worker import EXECUTION_MODE_LIVE
 from .config import load_campaign, load_candidate
 from .contracts import AKSPortForwardServing, Campaign, Candidate, EvalCase
@@ -181,6 +182,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     publish_parser.set_defaults(func=command_publish)
+
+    baseline_parser = subparsers.add_parser(
+        "korvid-baseline",
+        help="Materialize the installed Korvid profile's shipped system prompt as a seed candidate.",
+    )
+    baseline_parser.add_argument(
+        "--profile",
+        choices=PROFILE_NAMES,
+        required=True,
+        help="Installed Korvid agent profile to materialize (small or full).",
+    )
+    baseline_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Path to write the immutable baseline candidate YAML to; must not already exist.",
+    )
+    baseline_parser.set_defaults(func=command_korvid_baseline)
 
     return parser
 
@@ -405,6 +424,21 @@ def command_publish(args: argparse.Namespace) -> int:
 
     print(
         f"published version={decision.bundle.version} kind={decision.bundle.bundle_kind} effective_score={decision.effective_score:.3f} registry={args.registry_root}"
+    )
+    return 0
+
+
+def command_korvid_baseline(args: argparse.Namespace) -> int:
+    try:
+        candidate = build_baseline_candidate(args.profile)
+        write_baseline_candidate(candidate, args.output)
+    except (OSError, ValueError, FileExistsError) as exc:
+        print(f"korvid-baseline failed: {exc}", file=_stderr())
+        return 2
+
+    print(
+        f"wrote baseline candidate={candidate.candidate_id} fingerprint={candidate.fingerprint} "
+        f"profile={args.profile} output={args.output}"
     )
     return 0
 
