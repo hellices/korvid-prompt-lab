@@ -19,6 +19,23 @@ CLI entrypoint:
 uv run --python 3.12 korvid-prompt-lab --help
 ```
 
+## Korvid read-only evals
+
+Prompt Lab installs the released `korvid[agent]>=0.3` wheel. Run Korvid's
+shipped read-only scenario and conversational journey evals directly from that
+environment:
+
+```bash
+uv run --python 3.12 python -m korvid.evals --help
+uv run --python 3.12 python -m korvid.evals.journeys_cli --help
+```
+
+These read-only evals follow the installed Korvid package version; they do not
+require a Korvid source checkout or commit-SHA pin. Write/approval operation
+journeys are different: they intentionally remain in Korvid's test suite
+because they exercise the real Textual confirmation dialog and fresh user
+keystrokes.
+
 ## CLI commands
 
 ### Validate
