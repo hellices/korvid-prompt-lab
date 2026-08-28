@@ -14,6 +14,7 @@ from korvid_prompt_lab.contracts import (
     DEFAULT_BRIDGE_TIMEOUT_SECONDS,
     AKSPortForwardServing,
     Candidate,
+    KorvidReadonlyServing,
     ProcessServing,
 )
 
@@ -486,4 +487,107 @@ serving:
     )
 
     with pytest.raises(ValueError, match=r"\{request\}"):
+        load_campaign(path)
+
+
+def _korvid_readonly_campaign_yaml(serving_lines: str) -> str:
+    return (
+        """
+schema_version: 1
+campaign_id: korvid-readonly-campaign
+repetitions: 1
+models: [qwen3-4b]
+cases:
+  - case_id: oom-killed
+    template_id: template-a
+    prompt: "The database pod keeps restarting. Why?"
+    models: [qwen3-4b]
+serving:
+  backend: korvid_readonly
+  provider: ollama
+  base_url: env:KORVID_READONLY_BASE_URL
+  profile: small
+  timeout_seconds: 90
+"""
+        + serving_lines
+    ).strip() + "\n"
+
+
+def test_load_campaign_parses_korvid_readonly_serving(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("KORVID_READONLY_BASE_URL", "http://127.0.0.1:11434")
+    path = tmp_path / "campaign.yaml"
+    path.write_text(_korvid_readonly_campaign_yaml(""), encoding="utf-8")
+
+    campaign = load_campaign(path)
+
+    assert isinstance(campaign.serving, KorvidReadonlyServing)
+    assert campaign.serving.backend == "korvid_readonly"
+    assert campaign.serving.provider == "ollama"
+    assert campaign.serving.base_url == "http://127.0.0.1:11434"
+    assert campaign.serving.profile == "small"
+    assert campaign.serving.timeout_seconds == pytest.approx(90.0)
+    assert not hasattr(campaign.serving, "__dict__")
+
+
+def test_load_campaign_rejects_korvid_readonly_missing_base_url_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("KORVID_READONLY_BASE_URL", raising=False)
+    path = tmp_path / "campaign.yaml"
+    path.write_text(_korvid_readonly_campaign_yaml(""), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="serving.base_url"):
+        load_campaign(path)
+
+
+@pytest.mark.parametrize(
+    ("field_overrides", "message"),
+    [
+        ("  provider: grpc\n", "provider"),
+        ("  profile: medium\n", "profile"),
+        ("  timeout_seconds: 0\n", "timeout_seconds"),
+        ("  timeout_seconds: -5\n", "timeout_seconds"),
+        ("  unexpected: true\n", "unknown"),
+    ],
+)
+def test_load_campaign_rejects_invalid_korvid_readonly_serving(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, field_overrides: str, message: str
+) -> None:
+    monkeypatch.setenv("KORVID_READONLY_BASE_URL", "http://127.0.0.1:11434")
+    path = tmp_path / "campaign.yaml"
+    path.write_text(_korvid_readonly_campaign_yaml(field_overrides), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_campaign(path)
+
+
+def test_load_campaign_rejects_openai_compat_provider_with_missing_fields(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("KORVID_READONLY_BASE_URL", "http://127.0.0.1:8000/v1")
+    path = tmp_path / "campaign.yaml"
+    path.write_text(
+        (
+            """
+schema_version: 1
+campaign_id: korvid-readonly-campaign
+repetitions: 1
+models: [qwen3-4b]
+cases:
+  - case_id: oom-killed
+    template_id: template-a
+    prompt: "The database pod keeps restarting. Why?"
+    models: [qwen3-4b]
+serving:
+  backend: korvid_readonly
+  provider: openai-compat
+  base_url: env:KORVID_READONLY_BASE_URL
+  profile: full
+"""
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="serving.timeout_seconds"):
         load_campaign(path)

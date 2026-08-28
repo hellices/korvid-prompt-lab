@@ -12,6 +12,7 @@ from .contracts import (
     Campaign,
     Candidate,
     EvalCase,
+    KorvidReadonlyServing,
     ProcessServing,
     _ensure_keys,
     _require_bridge_timeout,
@@ -20,6 +21,13 @@ from .contracts import (
     _require_unique_string_items,
     _resolve_env_string,
 )
+
+#: Closed vocabulary for `serving.provider` on the `korvid_readonly` backend.
+KORVID_READONLY_PROVIDERS = frozenset({"ollama", "openai-compat"})
+
+#: Closed vocabulary for `serving.profile` on the `korvid_readonly` backend,
+#: matching the installed `korvid.evals` CLI's `--profile` choices.
+KORVID_READONLY_PROFILES = frozenset({"small", "full"})
 
 
 def _load_yaml(path: Path | str) -> Any:
@@ -82,6 +90,28 @@ def _parse_aks_serving(mapping: Mapping[str, Any]) -> AKSPortForwardServing:
     )
 
 
+def _parse_korvid_readonly_serving(mapping: Mapping[str, Any]) -> KorvidReadonlyServing:
+    _ensure_keys(
+        mapping,
+        {"backend", "provider", "base_url", "profile", "timeout_seconds"},
+        "serving.korvid_readonly",
+    )
+    provider = _require_string(mapping.get("provider"), "serving.provider")
+    if provider not in KORVID_READONLY_PROVIDERS:
+        raise ValueError("serving.provider must be ollama or openai-compat")
+    profile = _require_string(mapping.get("profile"), "serving.profile")
+    if profile not in KORVID_READONLY_PROFILES:
+        raise ValueError("serving.profile must be small or full")
+    timeout_seconds = _require_bridge_timeout(mapping.get("timeout_seconds"), "serving.timeout_seconds")
+    return KorvidReadonlyServing(
+        backend="korvid_readonly",
+        provider=provider,
+        base_url=_resolve_env_string(mapping.get("base_url"), "serving.base_url"),
+        profile=profile,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 def load_campaign(path: Path | str) -> Campaign:
     data = _require_mapping(_load_yaml(path), "campaign")
     _ensure_keys(
@@ -127,13 +157,15 @@ def load_campaign(path: Path | str) -> Campaign:
 
     serving_mapping = _require_mapping(data.get("serving"), "serving")
     backend = _require_string(serving_mapping.get("backend"), "serving.backend")
-    serving: ProcessServing | AKSPortForwardServing
+    serving: ProcessServing | AKSPortForwardServing | KorvidReadonlyServing
     if backend == "process":
         serving = _parse_process_serving(serving_mapping)
     elif backend == "aks_port_forward":
         serving = _parse_aks_serving(serving_mapping)
+    elif backend == "korvid_readonly":
+        serving = _parse_korvid_readonly_serving(serving_mapping)
     else:
-        raise ValueError("serving backend must be process or aks_port_forward")
+        raise ValueError("serving backend must be process, aks_port_forward, or korvid_readonly")
 
     return Campaign(
         schema_version=1,
