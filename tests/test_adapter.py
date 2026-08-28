@@ -13,7 +13,14 @@ from gepa import GEPAResult
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from korvid_prompt_lab.adapter import KorvidGEPAAdapter
-from korvid_prompt_lab.contracts import Campaign, Candidate, EvalCase, ProcessServing
+from korvid_prompt_lab.contracts import (
+    Campaign,
+    Candidate,
+    EvalCase,
+    KorvidReadonlyServing,
+    ProcessServing,
+)
+from korvid_prompt_lab.korvid_readonly import KorvidReadonlyRunner
 from korvid_prompt_lab.runner import (
     BridgeExecutionModeError,
     BridgeStatusError,
@@ -24,6 +31,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests" / "fixtures"))
 
 from fake_korvid_bridge import TUNED_MARKER
+
+FAKE_EVALS = ROOT / "tests" / "fixtures" / "fake_korvid_evals.py"
+#: A real scenario shipped with the installed Korvid wheel, used so the read-only
+#: adapter tests exercise the genuine bundled fixture rather than a hand-rolled one.
+REAL_SCENARIO_ID = "oom-killed"
+REAL_SCENARIO_QUESTION = "Why does the worker pod in namespace jobs keep dying?"
 
 
 def _seed_candidate() -> Candidate:
@@ -75,6 +88,47 @@ def _adapter(tmp_path: Path, cases: list[EvalCase], command: tuple[str, ...] | N
     seed_candidate = _seed_candidate()
     return KorvidGEPAAdapter(
         runner=_runner(cases, command),
+        artifact_root=tmp_path / "runs",
+        candidate_id=seed_candidate.candidate_id,
+        candidate_metadata=seed_candidate.metadata,
+    )
+
+
+def _readonly_case() -> EvalCase:
+    return EvalCase(
+        case_id=REAL_SCENARIO_ID,
+        template_id="template-1",
+        prompt=REAL_SCENARIO_QUESTION,
+        models=("mock-small",),
+    )
+
+
+def _readonly_runner() -> KorvidReadonlyRunner:
+    campaign = Campaign(
+        schema_version=1,
+        campaign_id="campaign-readonly",
+        repetitions=1,
+        models=("mock-small",),
+        cases=(_readonly_case(),),
+        serving=KorvidReadonlyServing(
+            backend="korvid_readonly",
+            provider="openai-compat",
+            base_url="http://127.0.0.1:41001/v1",
+            profile="small",
+            timeout_seconds=5.0,
+        ),
+    )
+    return KorvidReadonlyRunner(campaign)
+
+
+def _readonly_adapter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> KorvidGEPAAdapter:
+    monkeypatch.setattr(
+        "korvid_prompt_lab.korvid_readonly._KORVID_EVALS_COMMAND",
+        (sys.executable, str(FAKE_EVALS)),
+    )
+    seed_candidate = _seed_candidate()
+    return KorvidGEPAAdapter(
+        runner=_readonly_runner(),
         artifact_root=tmp_path / "runs",
         candidate_id=seed_candidate.candidate_id,
         candidate_metadata=seed_candidate.metadata,
@@ -351,3 +405,163 @@ def test_adapter_allows_a_wholly_scripted_optimization(tmp_path: Path) -> None:
     adapter.evaluate([scripted], _seed_candidate().components, capture_traces=True)
 
     assert adapter.execution_modes == ("scripted",)
+
+
+# ---------------------------------------------------------------------------
+# Read-only-specific reflection feedback (korvid_readonly evidence only)
+# ---------------------------------------------------------------------------
+
+
+def test_readonly_trace_exposes_bounded_diagnosis_and_evidence_feedback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = _readonly_adapter(tmp_path, monkeypatch)
+    case = _readonly_case()
+
+    eval_batch = adapter.evaluate([case], _seed_candidate().components, capture_traces=True)
+
+    assert eval_batch.trajectories is not None
+    trace = eval_batch.trajectories[0]
+    assert trace.diagnosis_success is True
+    assert trace.evidence_fetched is True
+    assert trace.missing_mention_count == 0
+    assert trace.missing_evidence_count == 0
+    assert trace.malformed_tool_call_count == 0
+    assert trace.citation_coverage == 1.0
+    assert trace.citation_precision == 1.0
+
+    feedback = _build_feedback_for(adapter, trace)
+    assert "Diagnosis: success." in feedback
+    assert "Evidence: fetched." in feedback
+    assert "Citation coverage: 1.00, precision: 1.00." in feedback
+
+    record = adapter._trace_to_record(trace)
+    outputs = record["Generated Outputs"]
+    assert outputs["diagnosis_success"] is True
+    assert outputs["evidence_fetched"] is True
+    assert outputs["citation_coverage"] == 1.0
+    assert outputs["citation_precision"] == 1.0
+
+
+def test_readonly_trace_reports_failed_diagnosis_and_missing_mentions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = _readonly_adapter(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_MODE", "diagnosis-failed")
+    case = _readonly_case()
+
+    eval_batch = adapter.evaluate([case], _seed_candidate().components, capture_traces=True)
+
+    assert eval_batch.trajectories is not None
+    trace = eval_batch.trajectories[0]
+    assert trace.diagnosis_success is False
+    assert trace.missing_mention_count == 1
+
+    feedback = _build_feedback_for(adapter, trace)
+    assert "Diagnosis: failure." in feedback
+    assert "Missing mentions: 1." in feedback
+
+
+def test_readonly_trace_reports_missing_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = _readonly_adapter(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_MODE", "evidence-missing")
+    case = _readonly_case()
+
+    eval_batch = adapter.evaluate([case], _seed_candidate().components, capture_traces=True)
+
+    assert eval_batch.trajectories is not None
+    trace = eval_batch.trajectories[0]
+    assert trace.evidence_fetched is False
+    assert trace.missing_evidence_count == 1
+
+    feedback = _build_feedback_for(adapter, trace)
+    assert "Evidence: missing." in feedback
+    assert "Missing evidence items: 1." in feedback
+
+
+def test_readonly_trace_reports_malformed_tool_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = _readonly_adapter(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_MODE", "malformed-tool-calls")
+    case = _readonly_case()
+
+    eval_batch = adapter.evaluate([case], _seed_candidate().components, capture_traces=True)
+
+    assert eval_batch.trajectories is not None
+    trace = eval_batch.trajectories[0]
+    assert trace.malformed_tool_call_count == 2
+
+    feedback = _build_feedback_for(adapter, trace)
+    assert "Malformed tool calls: 2." in feedback
+
+
+def test_readonly_trace_hides_zero_malformed_tool_calls_from_feedback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = _readonly_adapter(tmp_path, monkeypatch)
+    case = _readonly_case()
+
+    eval_batch = adapter.evaluate([case], _seed_candidate().components, capture_traces=True)
+
+    assert eval_batch.trajectories is not None
+    trace = eval_batch.trajectories[0]
+    assert trace.malformed_tool_call_count == 0
+    feedback = _build_feedback_for(adapter, trace)
+    assert "Malformed tool calls" not in feedback
+
+
+def test_readonly_trace_model_failure_leaves_diagnosis_fields_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = _readonly_adapter(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_MODE", "model-failure")
+    case = _readonly_case()
+
+    eval_batch = adapter.evaluate([case], _seed_candidate().components, capture_traces=True)
+
+    assert eval_batch.trajectories is not None
+    trace = eval_batch.trajectories[0]
+    assert trace.diagnosis_success is None
+    assert trace.evidence_fetched is None
+
+    record = adapter._trace_to_record(trace)
+    assert "diagnosis_success" not in record["Generated Outputs"]
+    assert "evidence_fetched" not in record["Generated Outputs"]
+
+
+def test_process_backed_trace_never_gains_readonly_reflection_fields(tmp_path: Path) -> None:
+    completed = _case("case[completed]")
+    adapter = _adapter(tmp_path, [completed])
+
+    eval_batch = adapter.evaluate([completed], _seed_candidate().components, capture_traces=True)
+
+    assert eval_batch.trajectories is not None
+    trace = eval_batch.trajectories[0]
+    assert trace.diagnosis_success is None
+    assert trace.evidence_fetched is None
+    assert trace.missing_mention_count is None
+    assert trace.missing_evidence_count is None
+    assert trace.malformed_tool_call_count is None
+    assert trace.citation_coverage is None
+    assert trace.citation_precision is None
+
+    record = adapter._trace_to_record(trace)
+    for key in (
+        "diagnosis_success",
+        "evidence_fetched",
+        "missing_mention_count",
+        "missing_evidence_count",
+        "malformed_tool_call_count",
+        "citation_coverage",
+        "citation_precision",
+    ):
+        assert key not in record["Generated Outputs"]
+
+
+def _build_feedback_for(adapter: KorvidGEPAAdapter, trace: Any) -> str:
+    from korvid_prompt_lab.adapter import _build_feedback
+
+    return _build_feedback(trace)

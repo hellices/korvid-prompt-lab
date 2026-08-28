@@ -8,7 +8,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
 from .artifacts import write_json_artifact
@@ -124,6 +124,36 @@ class BridgeStatusError(BridgeSystemError):
 
 class BridgeExecutionModeError(BridgeSystemError):
     """Raised when the bridge evidence was not produced the way the campaign requires."""
+
+
+@runtime_checkable
+class KorvidRunner(Protocol):
+    """The shape the adapter, optimizer, and CLI depend on for any evidence source.
+
+    :class:`KorvidProcessRunner` (write/approval, via the bridge subprocess) and
+    :class:`~korvid_prompt_lab.korvid_readonly.KorvidReadonlyRunner` (read-only,
+    via the installed ``korvid.evals`` CLI) both satisfy this structurally, with
+    no inheritance or import of this module required from the read-only runner.
+    Callers must select a concrete runner by ``campaign.serving.backend`` before
+    depending on anything backend-specific; afterwards only this shared shape
+    may be relied upon.
+    """
+
+    @property
+    def campaign(self) -> Campaign:
+        # Read-only: both concrete runners are frozen dataclasses, so the
+        # Protocol must declare `campaign` as a getter, not a settable field.
+        ...
+
+    def run(
+        self,
+        candidate: Candidate,
+        case: EvalCase,
+        run_dir: Path | str,
+        *,
+        repetition: int = 1,
+        seed: int = 0,
+    ) -> BridgeResult: ...
 
 
 @dataclass(frozen=True, slots=True)

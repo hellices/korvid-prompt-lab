@@ -126,7 +126,81 @@ def _default_run(mode: str) -> dict[str, Any]:
     elif mode == "model-failure":
         run["error"] = "provider returned no tokens"
         run["answer"] = ""
+    elif mode == "malformed-tool-calls":
+        run["malformed_tool_calls"] = 2
     return run
+
+
+#: Substring a candidate's "system" (optionally plus "append") component must
+#: contain for `FAKE_KORVID_EVALS_MODE=prompt-driven` to grade it as tuned.
+#: Mirrors `tests/fixtures/fake_korvid_bridge.py`'s TUNED_MARKER convention so
+#: GEPA integration tests read the same way across both execution modes.
+TUNED_MARKER = "korvid-tuned"
+
+
+def _prompt_driven_run(tuned: bool) -> dict[str, Any]:
+    """A large, deterministic quality gap so real (non-mocked) GEPA search
+    reliably prefers a tuned candidate over an untuned one, without any
+    network call or reflection LM."""
+    if tuned:
+        return {
+            "grade": {
+                "diagnosis_success": True,
+                "evidence_fetched": True,
+                "missing_mentions": [],
+                "forbidden_mentions": [],
+                "missing_evidence": [],
+            },
+            "citations": {
+                "cited": ["ref-1"],
+                "unsupported": [],
+                "uncited_evidence": [],
+                "coverage": 1.0,
+                "precision": 1.0,
+            },
+            "answer": "diagnosis complete with cited evidence",
+            "iterations": 2,
+            "tool_calls": 4,
+            "resolvable_tool_calls": 4,
+            "on_target_tool_calls": 4,
+            "malformed_tool_calls": 0,
+            "write_attempts": 0,
+            "safety_violations": 0,
+            "input_tokens": 120,
+            "output_tokens": 60,
+            "tokens_estimated": False,
+            "wall_time_s": 1.2,
+            "error": None,
+        }
+    return {
+        "grade": {
+            "diagnosis_success": False,
+            "evidence_fetched": False,
+            "missing_mentions": [["oom"]],
+            "forbidden_mentions": [],
+            "missing_evidence": [[{"tool": "get_events", "contains": "OOM", "args": {}}]],
+        },
+        "citations": {
+            "cited": [],
+            "unsupported": [],
+            "uncited_evidence": ["ref-1"],
+            "coverage": 0.0,
+            "precision": 0.0,
+        },
+        "answer": "unable to confirm the root cause",
+        "iterations": 2,
+        "tool_calls": 4,
+        "resolvable_tool_calls": 4,
+        "on_target_tool_calls": 1,
+        "malformed_tool_calls": 1,
+        "write_attempts": 0,
+        "safety_violations": 0,
+        "input_tokens": 120,
+        "output_tokens": 60,
+        "tokens_estimated": False,
+        "wall_time_s": 1.4,
+        "error": None,
+    }
 
 
 def main() -> int:
@@ -159,7 +233,13 @@ def main() -> int:
     if mode == "identity-mismatch":
         scenario_id = f"{scenario_id}-wrong"
 
-    run = _default_run(mode)
+    if mode == "prompt-driven":
+        combined = args.system_prompt_file.read_text(encoding="utf-8")
+        if args.prompt_append_file is not None:
+            combined += args.prompt_append_file.read_text(encoding="utf-8")
+        run = _prompt_driven_run(TUNED_MARKER in combined)
+    else:
+        run = _default_run(mode)
     scenario_entry: dict[str, Any] = {
         "scenario": scenario_id,
         "root_cause": "oom_killed",
