@@ -12,6 +12,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from korvid.agent.profiles import build_profile as installed_build_profile
+from korvid.evals.__main__ import exit_code as installed_exit_code
+from korvid.evals.scenario import Scenario
 
 from korvid_prompt_lab import korvid_readonly
 from korvid_prompt_lab.contracts import (
@@ -680,6 +682,44 @@ def test_runner_rejects_unattested_run_configuration_and_summary(
         _runner(case).run(_candidate(), case, tmp_path / "run")
 
 
+@pytest.mark.parametrize("field", ["successes", "evidence_hits"])
+def test_runner_rejects_impossible_one_run_summary_counts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, field: str
+) -> None:
+    _fake_command(monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_SUMMARY_FIELD", field)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_SUMMARY_VALUE", "2")
+    case = _case()
+
+    with pytest.raises(BridgeMalformedOutputError, match=field):
+        _runner(case).run(_candidate(), case, tmp_path / "run")
+
+
+def test_bundled_scenario_catalog_is_parsed_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = getattr(korvid_readonly, "_bundled_scenario_catalog", None)
+    if catalog is not None:
+        catalog.cache_clear()
+    calls = 0
+    real_load_scenario = korvid_readonly.load_scenario
+
+    def recording_load_scenario(path: Path) -> Scenario:
+        nonlocal calls
+        calls += 1
+        return real_load_scenario(path)
+
+    monkeypatch.setattr(korvid_readonly, "load_scenario", recording_load_scenario)
+
+    korvid_readonly._locate_bundled_scenario(REAL_SCENARIO_ID)
+    first_pass_calls = calls
+    korvid_readonly._locate_bundled_scenario(REAL_SCENARIO_ID)
+
+    assert first_pass_calls > 0
+    assert calls == first_pass_calls
+    korvid_readonly._bundled_scenario_catalog.cache_clear()
+
+
 def test_runner_rejects_prompt_components_with_outer_whitespace(
     tmp_path: Path,
 ) -> None:
@@ -997,6 +1037,23 @@ def test_runner_raises_process_exit_error_when_success_json_has_nonzero_exit(
 
     with pytest.raises(BridgeProcessExitError):
         _runner(case).run(_candidate(), case, tmp_path / "run")
+
+
+def test_installed_korvid_exit_contract_only_flags_run_errors(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    successful_low_grade = SimpleNamespace(
+        scenario_id="low-grade",
+        runs=[SimpleNamespace(error=None)],
+    )
+    model_failure = SimpleNamespace(
+        scenario_id="model-failure",
+        runs=[SimpleNamespace(error="provider failed")],
+    )
+
+    assert installed_exit_code(cast(Any, [successful_low_grade])) == 0
+    assert installed_exit_code(cast(Any, [model_failure])) == 1
+    assert "provider failed" in capsys.readouterr().err
 
 
 def test_runner_raises_malformed_output_error_when_malformed_json_has_nonzero_exit(

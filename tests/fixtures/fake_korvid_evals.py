@@ -310,6 +310,11 @@ def main() -> int:
         meta["serving"] = {"model": "different-model"}
     if mode == "malformed-scenario-summary":
         scenario_entry["successes"] = "1"
+    summary_field = os.environ.get("FAKE_KORVID_EVALS_SUMMARY_FIELD")
+    if summary_field is not None:
+        scenario_entry[summary_field] = json.loads(
+            os.environ["FAKE_KORVID_EVALS_SUMMARY_VALUE"]
+        )
 
     payload = {
         "meta": meta,

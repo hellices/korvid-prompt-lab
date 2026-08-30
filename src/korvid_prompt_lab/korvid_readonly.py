@@ -27,6 +27,7 @@ import sys
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +84,9 @@ _SERVING_PROBE_CONNECT_TIMEOUT_SECONDS = 10.0
 _SERVING_PROBE_WORST_CASE_SECONDS = 4 * (
     _SERVING_PROBE_CONNECT_TIMEOUT_SECONDS + PROBE_TIMEOUT_SECONDS
 )
+# Mirrors the installed ``korvid.evals.runner._drive_turn`` execution arm.
+_EVALS_PROFILE_READONLY = False
+_EVALS_RESIZE_SUPPORTED = True
 
 #: Candidate component keys this runner knows how to project onto the
 #: installed CLI's ``--system-prompt-file``/``--prompt-append-file`` flags.
@@ -412,7 +416,9 @@ def _eval_request_timeout_seconds(timeout_seconds: float, profile: str) -> float
     """
     try:
         agent_profile = build_profile(
-            profile, readonly=False, resize_supported=True
+            profile,
+            readonly=_EVALS_PROFILE_READONLY,
+            resize_supported=_EVALS_RESIZE_SUPPORTED,
         )
     except ValueError as exc:
         raise ValueError(
@@ -498,21 +504,28 @@ def _locate_bundled_scenario(scenario_id: str) -> tuple[Scenario, Path]:
     copy or a source checkout) so the selected fixture is always exactly
     what the currently installed Korvid distribution ships.
     """
+    catalog = _bundled_scenario_catalog()
+    try:
+        return catalog[scenario_id]
+    except KeyError as exc:
+        raise ValueError(f"korvid bundled scenario not found: {scenario_id!r}") from exc
+
+
+@lru_cache(maxsize=1)
+def _bundled_scenario_catalog() -> Mapping[str, tuple[Scenario, Path]]:
     directory = bundled_scenarios_dir()
     if not directory.is_dir():
         raise ValueError(f"korvid bundled scenarios directory not found: {directory}")
 
-    matches: list[tuple[Scenario, Path]] = []
+    catalog: dict[str, tuple[Scenario, Path]] = {}
     for path in sorted(directory.glob("*.yaml")):
         scenario = load_scenario(path)
-        if scenario.id == scenario_id:
-            matches.append((scenario, path))
-
-    if not matches:
-        raise ValueError(f"korvid bundled scenario not found: {scenario_id!r}")
-    if len(matches) > 1:
-        raise ValueError(f"korvid bundled scenario id is not unique: {scenario_id!r}")
-    return matches[0]
+        if scenario.id in catalog:
+            raise ValueError(
+                f"korvid bundled scenario id is not unique: {scenario.id!r}"
+            )
+        catalog[scenario.id] = (scenario, path)
+    return catalog
 
 
 def _load_single_run(
@@ -577,8 +590,8 @@ def _load_single_run(
         _require_string(
             scenario_entry.get("root_cause"), "scenario result root_cause"
         )
-        _require_summary_count(scenario_entry, "successes")
-        _require_summary_count(scenario_entry, "evidence_hits")
+        _require_single_run_summary_count(scenario_entry, "successes")
+        _require_single_run_summary_count(scenario_entry, "evidence_hits")
     except ValueError as exc:
         raise BridgeMalformedOutputError(str(exc)) from exc
 
@@ -628,8 +641,8 @@ def _validate_run_metadata(
 
     profile = build_profile(
         serving.profile,
-        readonly=False,
-        resize_supported=True,
+        readonly=_EVALS_PROFILE_READONLY,
+        resize_supported=_EVALS_RESIZE_SUPPORTED,
         overrides=PromptOverrides(
             system=system_prompt,
             append=append_prompt,
@@ -666,11 +679,13 @@ def _validate_run_metadata(
         )
 
 
-def _require_summary_count(mapping: Mapping[str, Any], field_name: str) -> int:
+def _require_single_run_summary_count(
+    mapping: Mapping[str, Any], field_name: str
+) -> int:
     value = mapping.get(field_name)
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, int) or value not in {0, 1}:
         raise ValueError(
-            f"korvid.evals scenario result {field_name} must be a non-negative integer"
+            f"korvid.evals one-run scenario result {field_name} must be 0 or 1"
         )
     return value
 
