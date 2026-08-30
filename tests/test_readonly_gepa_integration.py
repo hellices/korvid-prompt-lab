@@ -69,7 +69,7 @@ def _readonly_runner(cases: Sequence[EvalCase]) -> KorvidReadonlyRunner:
             provider="openai-compat",
             base_url="http://127.0.0.1:41001/v1",
             profile="small",
-            timeout_seconds=120.0,
+            timeout_seconds=160.0,
         ),
     )
     return KorvidReadonlyRunner(campaign)
@@ -135,3 +135,7 @@ def test_readonly_backed_gepa_search_finds_a_tuned_candidate_that_beats_the_ship
         assert "diagnosis complete with cited evidence" not in path.read_text(
             encoding="utf-8"
         )
+    raw_answer = b"diagnosis complete with cited evidence"
+    for path in (tmp_path / "artifacts").rglob("*"):
+        if path.is_file():
+            assert raw_answer not in path.read_bytes()

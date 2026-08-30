@@ -540,6 +540,21 @@ def test_load_campaign_rejects_korvid_readonly_missing_base_url_env(
         load_campaign(path)
 
 
+def test_load_campaign_rejects_literal_korvid_readonly_base_url(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "campaign.yaml"
+    path.write_text(
+        _korvid_readonly_campaign_yaml("").replace(
+            "env:KORVID_READONLY_BASE_URL", "http://127.0.0.1:11434"
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"serving\.base_url.*env:"):
+        load_campaign(path)
+
+
 @pytest.mark.parametrize(
     ("field_overrides", "message"),
     [

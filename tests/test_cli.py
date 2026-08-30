@@ -18,6 +18,7 @@ from korvid_prompt_lab.aks import (
     AKSPreflightTransientError,
 )
 from korvid_prompt_lab.cli import main
+from korvid_prompt_lab.rounds import build_round_report
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -161,7 +162,7 @@ def _korvid_readonly_campaign_payload(
             "provider": "openai-compat",
             "base_url": f"env:{base_url_env}",
             "profile": "small",
-            "timeout_seconds": 120,
+            "timeout_seconds": 160,
         },
     }
 
@@ -2668,6 +2669,12 @@ def test_command_evaluate_selects_the_readonly_runner_for_korvid_readonly_campai
     assert exit_code == 0, stderr
     assert len(readonly_created) == 1
     assert not process_created
+    artifacts = tmp_path / "artifacts"
+    responses = sorted((artifacts / "runs").glob("*/response.json"))
+    assert len(responses) == 2
+    assert all(json.loads(path.read_text(encoding="utf-8"))["answer"] == "" for path in responses)
+    report = build_round_report(artifacts)
+    assert report.candidate_id == "readonly-candidate"
 
 
 def test_command_evaluate_still_selects_the_process_runner_for_process_campaigns(

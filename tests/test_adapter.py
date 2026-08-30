@@ -115,7 +115,7 @@ def _readonly_runner() -> KorvidReadonlyRunner:
             provider="openai-compat",
             base_url="http://127.0.0.1:41001/v1",
             profile="small",
-            timeout_seconds=120.0,
+            timeout_seconds=160.0,
         ),
     )
     return KorvidReadonlyRunner(campaign)
@@ -420,8 +420,11 @@ def test_readonly_trace_exposes_bounded_diagnosis_and_evidence_feedback(
 
     eval_batch = adapter.evaluate([case], _seed_candidate().components, capture_traces=True)
 
+    assert eval_batch.outputs[0].answer == ""
+    assert eval_batch.outputs[0].error is None
     assert eval_batch.trajectories is not None
     trace = eval_batch.trajectories[0]
+    assert trace.final_answer == ""
     assert trace.diagnosis_success is True
     assert trace.evidence_fetched is True
     assert trace.missing_mention_count == 0

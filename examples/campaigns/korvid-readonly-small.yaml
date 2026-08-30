@@ -28,4 +28,4 @@ serving:
   provider: ollama
   base_url: env:KORVID_READONLY_BASE_URL
   profile: small
-  timeout_seconds: 120
+  timeout_seconds: 160

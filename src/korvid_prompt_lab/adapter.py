@@ -110,11 +110,16 @@ class KorvidGEPAAdapter:
             result = self.runner.run(resolved_candidate, case, run_dir)
             self._record_execution_mode(result)
             scored = score_result(result)
-            outputs.append(result)
+            safe_result = self._safe_optimizer_output(result)
+            outputs.append(safe_result)
             search_score = _search_score(scored)
             scores.append(search_score)
             if capture_traces:
-                traces.append(self._build_trace(case, result, score=search_score, unsafe=scored.unsafe))
+                traces.append(
+                    self._build_trace(
+                        case, safe_result, score=search_score, unsafe=scored.unsafe
+                    )
+                )
 
         return EvaluationBatch(
             outputs=outputs,
@@ -139,6 +144,21 @@ class KorvidGEPAAdapter:
                 raise ValueError(f"unknown candidate component: {component_name}")
             reflective_dataset[component_name] = [self._trace_to_record(trace) for trace in eval_batch.trajectories]
         return reflective_dataset
+
+    def _safe_optimizer_output(self, result: BridgeResult) -> BridgeResult:
+        if not isinstance(self.runner.campaign.serving, KorvidReadonlyServing):
+            return result
+        return BridgeResult(
+            protocol_version=result.protocol_version,
+            status=result.status,
+            execution_mode=result.execution_mode,
+            candidate_fingerprint=result.candidate_fingerprint,
+            grade=result.grade,
+            answer="",
+            journal=result.journal,
+            usage=result.usage,
+            error="model_failure" if result.error is not None else None,
+        )
 
     def _materialize_candidate(self, candidate: Mapping[str, str]) -> Candidate:
         return Candidate.from_mapping(

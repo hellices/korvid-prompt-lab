@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from importlib.metadata import PackageNotFoundError
@@ -168,6 +169,47 @@ def test_write_baseline_candidate_writes_exact_yaml(tmp_path: Path) -> None:
 
     assert written_path == output
     assert output.read_text(encoding="utf-8") == render_baseline_yaml(candidate)
+
+
+def test_write_baseline_candidate_is_not_visible_before_fsync(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    output = tmp_path / "baseline.yaml"
+    candidate = build_baseline_candidate("small")
+    real_fsync = os.fsync
+
+    def assert_destination_is_private(fd: int) -> None:
+        assert not output.exists()
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", assert_destination_is_private)
+
+    write_baseline_candidate(candidate, output)
+
+    assert output.read_text(encoding="utf-8") == render_baseline_yaml(candidate)
+    assert list(tmp_path.iterdir()) == [output]
+
+
+def test_write_baseline_cleanup_failure_does_not_mask_write_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    output = tmp_path / "baseline.yaml"
+    candidate = build_baseline_candidate("small")
+
+    monkeypatch.setattr(
+        os, "fsync", lambda _fd: (_ for _ in ()).throw(OSError("fsync failed"))
+    )
+    monkeypatch.setattr(
+        Path,
+        "unlink",
+        lambda _path, **_kwargs: (_ for _ in ()).throw(OSError("cleanup failed")),
+    )
+
+    with pytest.raises(OSError, match="fsync failed") as excinfo:
+        write_baseline_candidate(candidate, output)
+
+    assert any("cleanup failed" in note for note in excinfo.value.__notes__)
+    assert not output.exists()
 
 
 def test_cli_korvid_baseline_writes_small_profile_candidate(tmp_path: Path) -> None:

@@ -262,7 +262,7 @@ serving:
   provider: ollama
   base_url: env:KORVID_READONLY_BASE_URL
   profile: small
-  timeout_seconds: 120
+  timeout_seconds: 160
 ```
 
 `provider` is `ollama` (a native ollama root URL, `/v1` is appended
@@ -275,11 +275,11 @@ and optional `append` components are supported — they map to
 any other component, on a malformed or missing `korvid.evals` JSON result, on
 a scenario-identity mismatch, or on a timeout — with one exception: the
 installed Korvid CLI's own contract for a genuine model failure is a
-non-zero exit paired with an otherwise-valid, exactly-one-run result whose
-`error` is populated, and the runner reports that as `status: model_failure`
-rather than failing closed. Any other non-zero exit (a success-looking
-result, malformed JSON, an identity mismatch, ...) still fails closed as a
-systemic process error regardless of exit code.
+documented exit code `1` paired with an otherwise-valid, exactly-one-run result
+whose `error` is populated, and the runner reports that as
+`status: model_failure` rather than failing closed. Any other non-zero exit
+(including a signal, a success-looking result, malformed JSON, or an identity
+mismatch) still fails closed as a systemic process error.
 
 `timeout_seconds` is this runner's own whole-process budget — the
 `subprocess.run(timeout=...)` this runner enforces around the whole
@@ -291,19 +291,27 @@ above, turning a genuine model failure into a systemic one. The runner
 instead derives `KORVID_EVAL_TIMEOUT_SECONDS` from the effective
 `timeout_seconds` (honoring a `KorvidReadonlyRunner(timeout_seconds=...)`
 override over the campaign's own value): it first reserves the installed CLI's
-four sequential serving probes at their installed 20-second worst case, then a
-bounded share for non-HTTP process overhead. The remainder is divided across
-the installed profile's `max_iterations` — read from the installed wheel via
+four sequential serving probes, including each probe's installed 10-second
+connect phase and 20-second response phase, then a bounded share for non-HTTP
+process overhead. The remainder is divided across the installed profile's
+`max_iterations` — read from the installed wheel via
 `korvid.agent.profiles.build_profile`, never hard-coded here. A whole-process
-budget that cannot fit the serving probes and process overhead is rejected
+budget that cannot fit the serving probe phases and process overhead is rejected
 instead of silently turning a legitimate model timeout into a systemic
 subprocess timeout.
 
 The CLI's full JSON is read only from the same private temporary pack as the
 prompt overrides and scenario. It is deleted after strict profile, prompt
 fingerprint, tool-arm, model, scenario, and run validation. Evaluation and GEPA
-artifacts retain only normalized scores, counts, labels, and usage; the raw
-model answer is not included in read-only reflection records.
+artifacts retain only normalized scores, counts, labels, and usage. Each run
+also writes a normalized `response.json` for the existing comparison pipeline;
+its answer is blank and model errors are reduced to the `model_failure` label.
+The raw model answer is not included in read-only reflection records.
+
+Campaign repetitions are separate one-run CLI invocations. The installed
+Korvid 0.3 CLI has no random-seed input, so Prompt Lab records the requested
+repetition and seed in normalized evidence for auditability but does not claim
+that the backend applies deterministic seeding.
 
 The following walkthrough is a **runnable path**, not optimized journey
 evidence: it demonstrates the wiring end to end against a local model and

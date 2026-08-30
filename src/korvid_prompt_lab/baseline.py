@@ -17,6 +17,8 @@ what any other caller of ``build_profile`` for the same profile name would see.
 from __future__ import annotations
 
 import os
+import sys
+import tempfile
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _distribution_version
 from pathlib import Path
@@ -116,15 +118,27 @@ def write_baseline_candidate(candidate: Candidate, output_path: Path | str) -> P
     output_path.parent.mkdir(parents=True, exist_ok=True)
     content = render_baseline_yaml(candidate)
 
-    fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    fd, temp_name = tempfile.mkstemp(
+        dir=output_path.parent, prefix=f".{output_path.name}.", suffix=".tmp"
+    )
+    temp_path = Path(temp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-    except BaseException:
-        if output_path.exists():
-            output_path.unlink()
-        raise
+        temp_path.chmod(0o644)
+        os.link(temp_path, output_path)
+    finally:
+        primary_error = sys.exception()
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError as exc:
+            if primary_error is not None:
+                primary_error.add_note(
+                    f"could not remove temporary baseline file {temp_path}: {exc}"
+                )
+            else:
+                raise
 
     return output_path

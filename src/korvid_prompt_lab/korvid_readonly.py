@@ -19,6 +19,7 @@ once the run finishes (success or failure).
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -34,6 +35,7 @@ from korvid.evals.__main__ import PROBE_TIMEOUT_SECONDS, prompt_fingerprint
 from korvid.evals.runner import _eval_tools
 from korvid.evals.scenario import Scenario, bundled_scenarios_dir, load_scenario
 
+from .artifacts import write_json_artifact
 from .bridge_worker import EXECUTION_MODE_LIVE, PROTOCOL_VERSION
 from .contracts import (
     Campaign,
@@ -75,9 +77,12 @@ _EVAL_TIMEOUT_OVERHEAD_MAX_SECONDS = 10.0
 #: usable floor of overhead reserved.
 _EVAL_TIMEOUT_OVERHEAD_MIN_SECONDS = 1.0
 # ``korvid.evals`` probes version, show, tags, and ps sequentially before the
-# scored run. Reserve their installed per-request worst case before budgeting
-# model iterations.
-_SERVING_PROBE_WORST_CASE_SECONDS = 4 * PROBE_TIMEOUT_SECONDS
+# scored run. Its installed HTTPX client permits a 10-second connect phase
+# before the configured probe read timeout, so reserve both phases.
+_SERVING_PROBE_CONNECT_TIMEOUT_SECONDS = 10.0
+_SERVING_PROBE_WORST_CASE_SECONDS = 4 * (
+    _SERVING_PROBE_CONNECT_TIMEOUT_SECONDS + PROBE_TIMEOUT_SECONDS
+)
 
 #: Candidate component keys this runner knows how to project onto the
 #: installed CLI's ``--system-prompt-file``/``--prompt-append-file`` flags.
@@ -166,8 +171,11 @@ class KorvidReadonlyRunner:
             raise ValueError("KorvidReadonlyRunner requires exactly one model per case")
 
         _require_supported_components(candidate)
-        system_prompt = candidate.components["system"]
-        append_prompt = candidate.components.get("append")
+        system_prompt = candidate.components["system"].strip()
+        raw_append_prompt = candidate.components.get("append")
+        append_prompt = (
+            raw_append_prompt.strip() if raw_append_prompt is not None else None
+        )
 
         scenario, scenario_path = _locate_bundled_scenario(case.case_id)
         if scenario.question != case.prompt:
@@ -176,8 +184,10 @@ class KorvidReadonlyRunner:
             )
 
         run_path = Path(run_dir)
+        response_path = run_path / "response.json"
         try:
             run_path.mkdir(parents=True, exist_ok=True)
+            response_path.unlink(missing_ok=True)
         except OSError as exc:
             raise BridgeArtifactError(
                 f"runner could not prepare run directory: {run_path}"
@@ -214,15 +224,22 @@ class KorvidReadonlyRunner:
                 raise BridgeMissingOutputError(
                     "korvid.evals did not create the requested --json output artifact"
                 )
+            if completed.returncode not in {0, 1}:
+                raise BridgeProcessExitError(_process_exit_message(completed))
 
             run_payload = _load_single_run(
                 output_path,
                 case,
                 serving=serving,
-                candidate=candidate,
+                system_prompt=system_prompt,
+                append_prompt=append_prompt,
             )
 
-            if completed.returncode != 0 and not _has_model_failure_error(run_payload):
+            has_model_failure = _has_model_failure_error(run_payload)
+            if not (
+                (completed.returncode == 0 and not has_model_failure)
+                or (completed.returncode == 1 and has_model_failure)
+            ):
                 # The installed Korvid CLI exits nonzero for a genuine model
                 # failure too, but *only* alongside valid JSON whose run
                 # carries a non-blank ``error``. Any other nonzero exit
@@ -232,14 +249,32 @@ class KorvidReadonlyRunner:
                 # normalized into a completed/model_failure result.
                 raise BridgeProcessExitError(_process_exit_message(completed))
         finally:
+            primary_error = sys.exception()
             try:
                 shutil.rmtree(pack_dir)
             except OSError as exc:
-                raise BridgeArtifactError(
-                    f"runner could not remove private scenario pack: {pack_dir}"
-                ) from exc
+                message = f"runner could not remove private scenario pack: {pack_dir}"
+                if primary_error is not None:
+                    primary_error.add_note(f"{message}: {exc}")
+                else:
+                    raise BridgeArtifactError(message) from exc
 
-        return _to_bridge_result(candidate, run_payload)
+        result = _to_bridge_result(candidate, run_payload)
+        try:
+            write_json_artifact(
+                response_path,
+                _safe_response_payload(
+                    result,
+                    case=case,
+                    repetition=repetition,
+                    seed=seed,
+                ),
+            )
+        except OSError as exc:
+            raise BridgeArtifactError(
+                f"runner could not write normalized response artifact: {response_path}"
+            ) from exc
+        return result
 
     def _build_command(
         self,
@@ -471,7 +506,8 @@ def _load_single_run(
     case: EvalCase,
     *,
     serving: KorvidReadonlyServing,
-    candidate: Candidate,
+    system_prompt: str,
+    append_prompt: str | None,
 ) -> Mapping[str, Any]:
     try:
         text = output_path.read_text(encoding="utf-8")
@@ -499,7 +535,8 @@ def _load_single_run(
         _validate_run_metadata(
             mapping.get("meta"),
             serving=serving,
-            candidate=candidate,
+            system_prompt=system_prompt,
+            append_prompt=append_prompt,
             model=case.models[0],
         )
         scenarios = mapping.get("scenarios")
@@ -556,7 +593,8 @@ def _validate_run_metadata(
     value: Any,
     *,
     serving: KorvidReadonlyServing,
-    candidate: Candidate,
+    system_prompt: str,
+    append_prompt: str | None,
     model: str,
 ) -> None:
     meta = _require_mapping(value, "korvid.evals output meta")
@@ -579,8 +617,8 @@ def _validate_run_metadata(
         readonly=False,
         resize_supported=True,
         overrides=PromptOverrides(
-            system=candidate.components["system"],
-            append=candidate.components.get("append"),
+            system=system_prompt,
+            append=append_prompt,
         ),
     )
     offered_tools = _eval_tools(profile)
@@ -670,9 +708,9 @@ def _to_bridge_result(candidate: Candidate, run: Mapping[str, Any]) -> BridgeRes
                 "korvid.evals run result tokens_estimated must be a boolean"
             )
 
-        wall_time_s = run.get("wall_time_s")
-        if isinstance(wall_time_s, bool) or not isinstance(wall_time_s, (int, float)):
-            raise ValueError("korvid.evals run result wall_time_s must be numeric")  # noqa: TRY004 - preserve validation API
+        wall_time_s = _require_nonnegative_finite_number(
+            run.get("wall_time_s"), "korvid.evals run result wall_time_s"
+        )
 
         grade_mapping = _require_mapping(
             run.get("grade"), "korvid.evals run result grade"
@@ -703,13 +741,17 @@ def _to_bridge_result(candidate: Candidate, run: Mapping[str, Any]) -> BridgeRes
             citations_mapping, _CITATION_FIELDS, "korvid.evals run result citations"
         )
         coverage = citations_mapping.get("coverage")
-        if isinstance(coverage, bool) or not isinstance(coverage, (int, float)):
-            raise ValueError("citations.coverage must be numeric")  # noqa: TRY004 - preserve validation API
+        coverage_value = _require_unit_interval_number(
+            coverage, "citations.coverage"
+        )
         precision = citations_mapping.get("precision")
-        if precision is not None and (
-            isinstance(precision, bool) or not isinstance(precision, (int, float))
-        ):
-            raise ValueError("citations.precision must be numeric or null")
+        precision_value = (
+            None
+            if precision is None
+            else _require_unit_interval_number(
+                precision, "citations.precision"
+            )
+        )
 
         hard_failures: list[str] = []
         if write_attempts > 0:
@@ -726,8 +768,8 @@ def _to_bridge_result(candidate: Candidate, run: Mapping[str, Any]) -> BridgeRes
             "tool_calls": tool_calls,
             "on_target_tool_calls": on_target_tool_calls,
             "malformed_tool_calls": malformed_tool_calls,
-            "citation_coverage": float(coverage),
-            "citation_precision": float(precision) if precision is not None else None,
+            "citation_coverage": coverage_value,
+            "citation_precision": precision_value,
             "hard_failure_labels": list(hard_failures),
         }
         usage: dict[str, Any] = {
@@ -774,3 +816,78 @@ def _to_bridge_result(candidate: Candidate, run: Mapping[str, Any]) -> BridgeRes
         )
     except ValueError as exc:
         raise BridgeMalformedOutputError(str(exc)) from exc
+
+
+def _require_unit_interval_number(value: Any, context: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0.0 <= value <= 1.0
+    ):
+        raise ValueError(f"{context} must be finite and in [0, 1]")
+    return float(value)
+
+
+def _require_nonnegative_finite_number(value: Any, context: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0.0
+    ):
+        raise ValueError(f"{context} must be a finite non-negative number")
+    return float(value)
+
+
+def _safe_response_payload(
+    result: BridgeResult,
+    *,
+    case: EvalCase,
+    repetition: int,
+    seed: int,
+) -> dict[str, Any]:
+    grade = result.grade
+    if grade is None:
+        journal: dict[str, Any] = {"checkpoints": [], "checkpoint_counts": {}}
+        usage: dict[str, Any] = {}
+        grade_payload = None
+    else:
+        journal = {
+            "journey_id": case.case_id,
+            "checkpoints": [],
+            "missing_checkpoints": [],
+            "checkpoint_counts": {},
+            "journal_event_count": 0,
+            "audit_record_count": 0,
+            "hard_failure_count": len(grade.hard_failures),
+        }
+        usage = {
+            "tool_calls": result.journal["tool_calls"],
+            "iterations": result.usage["iterations"],
+            "wall_time_seconds": result.usage["wall_time_s"],
+        }
+        grade_payload = {
+            "completion": grade.completion,
+            "verification": grade.verification,
+            "efficiency": grade.efficiency,
+            "hard_failures": list(grade.hard_failures),
+        }
+    return {
+        "protocol_version": result.protocol_version,
+        "status": result.status,
+        "execution_mode": result.execution_mode,
+        "candidate_fingerprint": result.candidate_fingerprint,
+        "request_identity": {
+            "case_id": case.case_id,
+            "template_id": case.template_id,
+            "model": case.models[0],
+            "repetition": repetition,
+            "seed": seed,
+        },
+        "grade": grade_payload,
+        "answer": "",
+        "journal": journal,
+        "usage": usage,
+        "error": "model_failure" if result.error is not None else None,
+    }

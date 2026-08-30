@@ -51,9 +51,9 @@ def _record_invocation(args: argparse.Namespace) -> None:
                 "KORVID_EVAL_API_KEY",
             )
         },
-        "system_prompt": args.system_prompt_file.read_text(encoding="utf-8"),
+        "system_prompt": args.system_prompt_file.read_text(encoding="utf-8").strip(),
         "prompt_append": (
-            args.prompt_append_file.read_text(encoding="utf-8")
+            args.prompt_append_file.read_text(encoding="utf-8").strip()
             if args.prompt_append_file is not None
             else None
         ),
@@ -132,6 +132,14 @@ def _default_run(mode: str) -> dict[str, Any]:
         run["answer"] = ""
     elif mode == "malformed-tool-calls":
         run["malformed_tool_calls"] = 2
+    elif mode == "invalid-citation-coverage":
+        run["citations"]["coverage"] = 1.5
+    elif mode == "invalid-citation-precision":
+        run["citations"]["precision"] = float("nan")
+    elif mode == "negative-wall-time":
+        run["wall_time_s"] = -1.0
+    elif mode == "nonfinite-wall-time":
+        run["wall_time_s"] = float("nan")
     return run
 
 
@@ -269,9 +277,9 @@ def main() -> int:
         scenarios_payload = [scenario_entry]
 
     overrides = PromptOverrides(
-        system=args.system_prompt_file.read_text(encoding="utf-8"),
+        system=args.system_prompt_file.read_text(encoding="utf-8").strip(),
         append=(
-            args.prompt_append_file.read_text(encoding="utf-8")
+            args.prompt_append_file.read_text(encoding="utf-8").strip()
             if args.prompt_append_file is not None
             else None
         ),
@@ -309,7 +317,7 @@ def main() -> int:
         # Mirrors the real installed Korvid 0.3 CLI: a genuine model failure
         # still writes valid exactly-one-scenario/exactly-one-run JSON with
         # ``run.error`` populated, but the process itself exits nonzero.
-        return 1
+        return _exit_code(default=1)
     return _exit_code(default=0)
 
 

@@ -39,6 +39,13 @@ def _resolve_string_items(value: Any, context: str) -> tuple[str, ...]:
     return tuple(_resolve_env_string(item, context) for item in items)
 
 
+def _resolve_required_env_string(value: Any, context: str) -> str:
+    reference = _require_string(value, context)
+    if not reference.startswith("env:"):
+        raise ValueError(f"{context} must be an env: reference")
+    return _resolve_env_string(reference, context)
+
+
 def load_candidate(path: Path | str) -> Candidate:
     return Candidate.from_mapping(_load_yaml(path))
 
@@ -106,7 +113,9 @@ def _parse_korvid_readonly_serving(mapping: Mapping[str, Any]) -> KorvidReadonly
     return KorvidReadonlyServing(
         backend="korvid_readonly",
         provider=provider,
-        base_url=_resolve_env_string(mapping.get("base_url"), "serving.base_url"),
+        base_url=_resolve_required_env_string(
+            mapping.get("base_url"), "serving.base_url"
+        ),
         profile=profile,
         timeout_seconds=timeout_seconds,
     )

@@ -21,6 +21,7 @@ from korvid_prompt_lab.contracts import (
 )
 from korvid_prompt_lab.korvid_readonly import KorvidReadonlyRunner
 from korvid_prompt_lab.runner import (
+    BridgeArtifactError,
     BridgeIdentityMismatchError,
     BridgeInvocationError,
     BridgeMalformedOutputError,
@@ -64,7 +65,7 @@ def _case(
 
 
 def _campaign(
-    case: EvalCase, *, repetitions: int = 1, timeout_seconds: float = 120.0
+    case: EvalCase, *, repetitions: int = 1, timeout_seconds: float = 160.0
 ) -> Campaign:
     return Campaign(
         schema_version=1,
@@ -83,7 +84,7 @@ def _campaign(
 
 
 def _runner(
-    case: EvalCase, *, timeout_seconds: float = 120.0, campaign_repetitions: int = 1
+    case: EvalCase, *, timeout_seconds: float = 160.0, campaign_repetitions: int = 1
 ) -> KorvidReadonlyRunner:
     return KorvidReadonlyRunner(
         _campaign(
@@ -230,10 +231,10 @@ def test_runner_writes_private_system_and_append_files_and_invokes_the_cli(
     assert record["env"]["KORVID_EVAL_MODEL"] == "mock-small"
     # KORVID_EVAL_TIMEOUT_SECONDS is a per-HTTP-request read timeout inside the
     # installed CLI, not the outer process budget: it must be strictly below
-    # the runner's own subprocess.run(timeout=...) budget (120.0 here), derived
+    # the runner's own subprocess.run(timeout=...) budget (160.0 here), derived
     # from it and the "small" profile's installed max_iterations.
     assert record["env"]["KORVID_EVAL_TIMEOUT_SECONDS"] == repr(
-        korvid_readonly._eval_request_timeout_seconds(120.0, "small")
+        korvid_readonly._eval_request_timeout_seconds(160.0, "small")
     )
     # Inherited credentials pass through; the runner never sets this itself.
     assert record["env"]["KORVID_EVAL_API_KEY"] == "super-secret-token"
@@ -268,7 +269,7 @@ def test_eval_request_timeout_is_strictly_below_the_outer_budget() -> None:
     derived per-request value must always be strictly less than the outer
     budget it is derived from.
     """
-    for outer in (120.0, 180.0):
+    for outer in (160.0, 180.0):
         for profile in ("small", "full"):
             derived = korvid_readonly._eval_request_timeout_seconds(outer, profile)
             assert 0.0 < derived < outer
@@ -282,7 +283,7 @@ def test_eval_request_timeout_uses_the_installed_profile_max_iterations() -> Non
     installed "full" profile allows more iterations than "small", so for the
     same outer budget it must be handed a smaller per-request timeout.
     """
-    outer = 120.0
+    outer = 160.0
     small_iterations = installed_build_profile(
         "small", readonly=True, resize_supported=False
     ).max_iterations
@@ -298,19 +299,19 @@ def test_eval_request_timeout_uses_the_installed_profile_max_iterations() -> Non
 
 
 def test_eval_request_timeout_reserves_the_installed_cli_probe_budget() -> None:
-    outer = 120.0
+    outer = 160.0
     iterations = installed_build_profile(
         "small", readonly=True, resize_supported=False
     ).max_iterations
 
     derived = korvid_readonly._eval_request_timeout_seconds(outer, "small")
 
-    assert derived == pytest.approx((outer - 80.0 - 10.0) / iterations)
+    assert derived == pytest.approx((outer - 120.0 - 10.0) / iterations)
 
 
 def test_eval_request_timeout_rejects_outer_budget_that_cannot_fit_the_probe() -> None:
     with pytest.raises(ValueError, match="serving probe"):
-        korvid_readonly._eval_request_timeout_seconds(80.0, "small")
+        korvid_readonly._eval_request_timeout_seconds(120.0, "small")
 
 
 def test_environment_carries_the_derived_eval_timeout_not_the_raw_outer_budget(
@@ -321,10 +322,10 @@ def test_environment_carries_the_derived_eval_timeout_not_the_raw_outer_budget(
     monkeypatch.setenv("FAKE_KORVID_EVALS_RECORD", str(record_path))
     case = _case()
 
-    _runner(case, timeout_seconds=120.0).run(_candidate(), case, tmp_path / "run")
+    _runner(case, timeout_seconds=160.0).run(_candidate(), case, tmp_path / "run")
 
     record = json.loads(record_path.read_text(encoding="utf-8"))
-    expected = korvid_readonly._eval_request_timeout_seconds(120.0, "small")
+    expected = korvid_readonly._eval_request_timeout_seconds(160.0, "small")
     assert record["env"]["KORVID_EVAL_TIMEOUT_SECONDS"] == repr(expected)
     assert float(record["env"]["KORVID_EVAL_TIMEOUT_SECONDS"]) < 120.0
 
@@ -342,15 +343,15 @@ def test_environment_derives_from_the_runner_override_not_the_serving_timeout(
     record_path = tmp_path / "record.json"
     monkeypatch.setenv("FAKE_KORVID_EVALS_RECORD", str(record_path))
     case = _case()
-    campaign = _campaign(case, timeout_seconds=100.0)
+    campaign = _campaign(case, timeout_seconds=140.0)
 
-    KorvidReadonlyRunner(campaign, timeout_seconds=120.0).run(
+    KorvidReadonlyRunner(campaign, timeout_seconds=160.0).run(
         _candidate(), case, tmp_path / "run"
     )
 
     record = json.loads(record_path.read_text(encoding="utf-8"))
-    expected = korvid_readonly._eval_request_timeout_seconds(120.0, "small")
-    unexpected = korvid_readonly._eval_request_timeout_seconds(100.0, "small")
+    expected = korvid_readonly._eval_request_timeout_seconds(160.0, "small")
+    unexpected = korvid_readonly._eval_request_timeout_seconds(140.0, "small")
     assert expected != unexpected
     assert record["env"]["KORVID_EVAL_TIMEOUT_SECONDS"] == repr(expected)
 
@@ -373,7 +374,7 @@ def test_runner_uses_the_ollama_native_root_when_the_provider_is_ollama(
             provider="ollama",
             base_url="http://127.0.0.1:11434",
             profile="full",
-            timeout_seconds=120.0,
+            timeout_seconds=160.0,
         ),
     )
 
@@ -510,6 +511,30 @@ def test_runner_raises_process_exit_error_on_nonzero_exit(
         _runner(case).run(_candidate(), case, tmp_path / "run")
 
 
+def test_runner_rejects_nonstandard_exit_even_with_model_failure_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_command(monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_MODE", "model-failure")
+    monkeypatch.setenv("FAKE_KORVID_EVALS_EXIT_CODE", "9")
+    case = _case()
+
+    with pytest.raises(BridgeProcessExitError, match="exit code 9"):
+        _runner(case).run(_candidate(), case, tmp_path / "run")
+
+
+def test_runner_rejects_zero_exit_with_model_failure_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_command(monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_MODE", "model-failure")
+    monkeypatch.setenv("FAKE_KORVID_EVALS_EXIT_CODE", "0")
+    case = _case()
+
+    with pytest.raises(BridgeProcessExitError, match="exit code 0"):
+        _runner(case).run(_candidate(), case, tmp_path / "run")
+
+
 def test_runner_raises_missing_output_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -529,6 +554,39 @@ def test_runner_raises_malformed_output_error_on_invalid_json(
     case = _case()
 
     with pytest.raises(BridgeMalformedOutputError):
+        _runner(case).run(_candidate(), case, tmp_path / "run")
+
+
+def test_cleanup_failure_does_not_mask_primary_runner_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_command(monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_MODE", "malformed-json")
+    monkeypatch.setattr(
+        korvid_readonly.shutil,
+        "rmtree",
+        lambda _path: (_ for _ in ()).throw(OSError("cleanup failed")),
+    )
+    case = _case()
+
+    with pytest.raises(BridgeMalformedOutputError) as excinfo:
+        _runner(case).run(_candidate(), case, tmp_path / "run")
+
+    assert any("cleanup failed" in note for note in excinfo.value.__notes__)
+
+
+def test_cleanup_failure_is_reported_after_an_otherwise_successful_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_command(monkeypatch)
+    monkeypatch.setattr(
+        korvid_readonly.shutil,
+        "rmtree",
+        lambda _path: (_ for _ in ()).throw(OSError("cleanup failed")),
+    )
+    case = _case()
+
+    with pytest.raises(BridgeArtifactError, match="private scenario pack"):
         _runner(case).run(_candidate(), case, tmp_path / "run")
 
 
@@ -600,6 +658,65 @@ def test_runner_rejects_unattested_run_configuration_and_summary(
     with pytest.raises(
         (BridgeMalformedOutputError, BridgeIdentityMismatchError), match=message
     ):
+        _runner(case).run(_candidate(), case, tmp_path / "run")
+
+
+def test_runner_matches_installed_prompt_file_whitespace_normalization(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_command(monkeypatch)
+    record_path = tmp_path / "record.json"
+    monkeypatch.setenv("FAKE_KORVID_EVALS_RECORD", str(record_path))
+    case = _case()
+    candidate = Candidate.from_mapping(
+        {
+            "schema_version": 1,
+            "candidate_id": "whitespace-candidate",
+            "components": {
+                "system": "\n  Diagnose read-only failures.  \n",
+                "append": "\n Cite evidence. \n",
+            },
+        }
+    )
+
+    result = _runner(case).run(candidate, case, tmp_path / "run")
+
+    assert result.status == "completed"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record["system_prompt"] == "Diagnose read-only failures."
+    assert record["prompt_append"] == "Cite evidence."
+
+
+@pytest.mark.parametrize(
+    ("mode", "metric"),
+    [
+        ("invalid-citation-coverage", "coverage"),
+        ("invalid-citation-precision", "precision"),
+    ],
+)
+def test_runner_rejects_out_of_range_or_nonfinite_citation_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mode: str,
+    metric: str,
+) -> None:
+    _fake_command(monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_MODE", mode)
+    case = _case()
+
+    with pytest.raises(BridgeMalformedOutputError, match=metric):
+        _runner(case).run(_candidate(), case, tmp_path / "run")
+
+
+@pytest.mark.parametrize("mode", ["negative-wall-time", "nonfinite-wall-time"])
+def test_runner_rejects_invalid_wall_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
+) -> None:
+    _fake_command(monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_MODE", mode)
+    case = _case()
+
+    with pytest.raises(BridgeMalformedOutputError, match="wall_time_s"):
         _runner(case).run(_candidate(), case, tmp_path / "run")
 
 
@@ -778,6 +895,11 @@ def test_runner_maps_run_error_to_model_failure_status_despite_nonzero_exit(
     assert result.status == "model_failure"
     assert result.grade is None
     assert result.error == "provider returned no tokens"
+    persisted = json.loads(
+        (tmp_path / "run" / "response.json").read_text(encoding="utf-8")
+    )
+    assert persisted["answer"] == ""
+    assert persisted["error"] == "model_failure"
 
 
 def test_runner_raises_process_exit_error_when_success_json_has_nonzero_exit(
@@ -813,6 +935,18 @@ def test_runner_raises_malformed_output_error_when_malformed_json_has_nonzero_ex
     case = _case()
 
     with pytest.raises(BridgeMalformedOutputError):
+        _runner(case).run(_candidate(), case, tmp_path / "run")
+
+
+def test_runner_prioritizes_nonstandard_exit_over_malformed_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_command(monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_MODE", "malformed-json")
+    monkeypatch.setenv("FAKE_KORVID_EVALS_EXIT_CODE", "9")
+    case = _case()
+
+    with pytest.raises(BridgeProcessExitError, match="exit code 9"):
         _runner(case).run(_candidate(), case, tmp_path / "run")
 
 
