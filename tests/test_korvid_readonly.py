@@ -4,6 +4,7 @@ import json
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -285,10 +286,10 @@ def test_eval_request_timeout_uses_the_installed_profile_max_iterations() -> Non
     """
     outer = 160.0
     small_iterations = installed_build_profile(
-        "small", readonly=True, resize_supported=False
+        "small", readonly=False, resize_supported=True
     ).max_iterations
     full_iterations = installed_build_profile(
-        "full", readonly=True, resize_supported=False
+        "full", readonly=False, resize_supported=True
     ).max_iterations
     assert full_iterations > small_iterations
 
@@ -301,12 +302,30 @@ def test_eval_request_timeout_uses_the_installed_profile_max_iterations() -> Non
 def test_eval_request_timeout_reserves_the_installed_cli_probe_budget() -> None:
     outer = 160.0
     iterations = installed_build_profile(
-        "small", readonly=True, resize_supported=False
+        "small", readonly=False, resize_supported=True
     ).max_iterations
 
     derived = korvid_readonly._eval_request_timeout_seconds(outer, "small")
 
     assert derived == pytest.approx((outer - 120.0 - 10.0) / iterations)
+
+
+def test_eval_request_timeout_uses_the_actual_installed_cli_profile_arm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, bool, bool]] = []
+
+    def recording_build_profile(
+        profile: str, *, readonly: bool, resize_supported: bool
+    ) -> SimpleNamespace:
+        calls.append((profile, readonly, resize_supported))
+        return SimpleNamespace(max_iterations=6)
+
+    monkeypatch.setattr(korvid_readonly, "build_profile", recording_build_profile)
+
+    korvid_readonly._eval_request_timeout_seconds(160.0, "small")
+
+    assert calls == [("small", False, True)]
 
 
 def test_eval_request_timeout_rejects_outer_budget_that_cannot_fit_the_probe() -> None:
@@ -752,6 +771,18 @@ def test_runner_rejects_on_target_tool_calls_above_total(
         _runner(case).run(_candidate(), case, tmp_path / "run")
 
 
+def test_runner_rejects_malformed_tool_calls_above_total(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_command(monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_FIELD", "malformed_tool_calls")
+    monkeypatch.setenv("FAKE_KORVID_EVALS_FIELD_VALUE", "5")
+    case = _case()
+
+    with pytest.raises(BridgeMalformedOutputError, match="malformed_tool_calls"):
+        _runner(case).run(_candidate(), case, tmp_path / "run")
+
+
 # ---------------------------------------------------------------------------
 # Repetition / seed bookkeeping (matches KorvidProcessRunner's contract)
 # ---------------------------------------------------------------------------
@@ -932,6 +963,7 @@ def test_runner_maps_run_error_to_model_failure_status_despite_nonzero_exit(
     )
     assert persisted["answer"] == ""
     assert persisted["error"] == "model_failure"
+    assert persisted["request_identity"]["seed_applied"] is False
 
 
 @pytest.mark.parametrize("field", ["write_attempts", "safety_violations"])

@@ -507,7 +507,7 @@ serving:
   provider: ollama
   base_url: env:KORVID_READONLY_BASE_URL
   profile: small
-  timeout_seconds: 90
+  timeout_seconds: 160
 """
         + serving_lines
     ).strip() + "\n"
@@ -525,7 +525,7 @@ def test_load_campaign_parses_korvid_readonly_serving(monkeypatch: pytest.Monkey
     assert campaign.serving.provider == "ollama"
     assert campaign.serving.base_url == "http://127.0.0.1:11434"
     assert campaign.serving.profile == "small"
-    assert campaign.serving.timeout_seconds == pytest.approx(90.0)
+    assert campaign.serving.timeout_seconds == pytest.approx(160.0)
     assert not hasattr(campaign.serving, "__dict__")
 
 
@@ -552,6 +552,22 @@ def test_load_campaign_rejects_literal_korvid_readonly_base_url(
     )
 
     with pytest.raises(ValueError, match=r"serving\.base_url.*env:"):
+        load_campaign(path)
+
+
+def test_load_campaign_rejects_korvid_readonly_timeout_below_runtime_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("KORVID_READONLY_BASE_URL", "http://127.0.0.1:11434")
+    path = tmp_path / "campaign.yaml"
+    path.write_text(
+        _korvid_readonly_campaign_yaml("").replace(
+            "timeout_seconds: 160", "timeout_seconds: 120"
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="serving probe"):
         load_campaign(path)
 
 

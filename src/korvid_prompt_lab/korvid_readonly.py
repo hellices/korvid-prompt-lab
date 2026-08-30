@@ -411,7 +411,9 @@ def _eval_request_timeout_seconds(timeout_seconds: float, profile: str) -> float
     below *timeout_seconds* regardless of profile or timeout configuration.
     """
     try:
-        agent_profile = build_profile(profile, readonly=True, resize_supported=False)
+        agent_profile = build_profile(
+            profile, readonly=False, resize_supported=True
+        )
     except ValueError as exc:
         raise ValueError(
             f"installed Korvid rejected profile {profile!r}: {exc}"
@@ -720,6 +722,8 @@ def _to_bridge_result(candidate: Candidate, run: Mapping[str, Any]) -> BridgeRes
             )
         if on_target_tool_calls > tool_calls:
             raise ValueError("on_target_tool_calls must not exceed tool_calls")
+        if malformed_tool_calls > tool_calls:
+            raise ValueError("malformed_tool_calls must not exceed tool_calls")
 
         tokens_estimated = run.get("tokens_estimated")
         if not isinstance(tokens_estimated, bool):
@@ -907,6 +911,7 @@ def _safe_response_payload(
             "model": case.models[0],
             "repetition": repetition,
             "seed": seed,
+            "seed_applied": False,
         },
         "grade": grade_payload,
         "answer": "",

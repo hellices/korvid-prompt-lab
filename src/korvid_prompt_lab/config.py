@@ -110,6 +110,9 @@ def _parse_korvid_readonly_serving(mapping: Mapping[str, Any]) -> KorvidReadonly
     if profile not in KORVID_READONLY_PROFILES:
         raise ValueError("serving.profile must be small or full")
     timeout_seconds = _require_bridge_timeout(mapping.get("timeout_seconds"), "serving.timeout_seconds")
+    from .korvid_readonly import _eval_request_timeout_seconds
+
+    _eval_request_timeout_seconds(timeout_seconds, profile)
     return KorvidReadonlyServing(
         backend="korvid_readonly",
         provider=provider,

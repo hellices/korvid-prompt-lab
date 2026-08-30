@@ -66,7 +66,14 @@ _EVALUATION_SUMMARY_ALLOWED_KEYS = {
     "reproduction_command",
 }
 _CASE_SETS_ALLOWED_KEYS = {"train", "validation", "milestone"}
-_REQUEST_IDENTITY_ALLOWED_KEYS = {"case_id", "template_id", "model", "repetition", "seed"}
+_REQUEST_IDENTITY_ALLOWED_KEYS = {
+    "case_id",
+    "template_id",
+    "model",
+    "repetition",
+    "seed",
+    "seed_applied",
+}
 _GRADE_ALLOWED_KEYS = {"completion", "verification", "efficiency", "hard_failures"}
 _COMPLETED_JOURNAL_ALLOWED_KEYS = {
     "journey_id",
@@ -721,6 +728,11 @@ def _parse_response(path: Path) -> _ParsedResponse:
         model = _require_response_string(identity, "model")
         repetition = _require_response_int(identity, "repetition")
         seed = _require_response_int(identity, "seed")
+        seed_applied = identity.get("seed_applied")
+        if seed_applied is not None and not isinstance(seed_applied, bool):
+            raise BridgeMalformedOutputError(
+                "request_identity.seed_applied must be a boolean"
+            )
         _require_response_text(payload, "answer")
         journal = _parse_journal(payload, status)
         usage = _parse_usage(payload, status)
@@ -754,6 +766,11 @@ def _parse_response(path: Path) -> _ParsedResponse:
                 "model": model,
                 "repetition": repetition,
                 "seed": seed,
+                **(
+                    {"seed_applied": seed_applied}
+                    if seed_applied is not None
+                    else {}
+                ),
             },
             "grade": None
             if completion is None
