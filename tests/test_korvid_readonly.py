@@ -661,12 +661,9 @@ def test_runner_rejects_unattested_run_configuration_and_summary(
         _runner(case).run(_candidate(), case, tmp_path / "run")
 
 
-def test_runner_matches_installed_prompt_file_whitespace_normalization(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_runner_rejects_prompt_components_with_outer_whitespace(
+    tmp_path: Path,
 ) -> None:
-    _fake_command(monkeypatch)
-    record_path = tmp_path / "record.json"
-    monkeypatch.setenv("FAKE_KORVID_EVALS_RECORD", str(record_path))
     case = _case()
     candidate = Candidate.from_mapping(
         {
@@ -679,12 +676,8 @@ def test_runner_matches_installed_prompt_file_whitespace_normalization(
         }
     )
 
-    result = _runner(case).run(candidate, case, tmp_path / "run")
-
-    assert result.status == "completed"
-    record = json.loads(record_path.read_text(encoding="utf-8"))
-    assert record["system_prompt"] == "Diagnose read-only failures."
-    assert record["prompt_append"] == "Cite evidence."
+    with pytest.raises(ValueError, match="canonical outer whitespace"):
+        _runner(case).run(candidate, case, tmp_path / "run")
 
 
 @pytest.mark.parametrize(
@@ -717,6 +710,45 @@ def test_runner_rejects_invalid_wall_time(
     case = _case()
 
     with pytest.raises(BridgeMalformedOutputError, match="wall_time_s"):
+        _runner(case).run(_candidate(), case, tmp_path / "run")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("resolvable_tool_calls", "invalid"),
+        ("tool_calls", -1),
+        ("on_target_tool_calls", -1),
+        ("malformed_tool_calls", -1),
+        ("iterations", -1),
+        ("input_tokens", -1),
+        ("output_tokens", -1),
+    ],
+)
+def test_runner_rejects_invalid_nonnegative_counts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    _fake_command(monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_FIELD", field)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_FIELD_VALUE", json.dumps(value))
+    case = _case()
+
+    with pytest.raises(BridgeMalformedOutputError, match=field):
+        _runner(case).run(_candidate(), case, tmp_path / "run")
+
+
+def test_runner_rejects_on_target_tool_calls_above_total(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_command(monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_FIELD", "on_target_tool_calls")
+    monkeypatch.setenv("FAKE_KORVID_EVALS_FIELD_VALUE", "5")
+    case = _case()
+
+    with pytest.raises(BridgeMalformedOutputError, match="on_target_tool_calls"):
         _runner(case).run(_candidate(), case, tmp_path / "run")
 
 
@@ -900,6 +932,20 @@ def test_runner_maps_run_error_to_model_failure_status_despite_nonzero_exit(
     )
     assert persisted["answer"] == ""
     assert persisted["error"] == "model_failure"
+
+
+@pytest.mark.parametrize("field", ["write_attempts", "safety_violations"])
+def test_runner_rejects_model_failure_that_also_reports_safety_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, field: str
+) -> None:
+    _fake_command(monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_MODE", "model-failure")
+    monkeypatch.setenv("FAKE_KORVID_EVALS_FIELD", field)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_FIELD_VALUE", "1")
+    case = _case()
+
+    with pytest.raises(BridgeMalformedOutputError, match="safety failure"):
+        _runner(case).run(_candidate(), case, tmp_path / "run")
 
 
 def test_runner_raises_process_exit_error_when_success_json_has_nonzero_exit(

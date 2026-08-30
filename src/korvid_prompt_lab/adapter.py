@@ -211,9 +211,11 @@ class KorvidGEPAAdapter:
             return {}
         journal = result.journal
         grade = result.grade
+        if grade is None:
+            return {}
         return {
-            "diagnosis_success": grade.completion == 1.0 if grade is not None else None,
-            "evidence_fetched": grade.verification == 1.0 if grade is not None else None,
+            "diagnosis_success": grade.completion == 1.0,
+            "evidence_fetched": grade.verification == 1.0,
             "missing_mention_count": _coerce_optional_int(journal.get("missing_mentions")),
             "missing_evidence_count": _coerce_optional_int(journal.get("missing_evidence")),
             "malformed_tool_call_count": _coerce_optional_int(journal.get("malformed_tool_calls")),

@@ -252,6 +252,9 @@ def main() -> int:
         run = _prompt_driven_run(TUNED_MARKER in combined)
     else:
         run = _default_run(mode)
+    field_override = os.environ.get("FAKE_KORVID_EVALS_FIELD")
+    if field_override is not None:
+        run[field_override] = json.loads(os.environ["FAKE_KORVID_EVALS_FIELD_VALUE"])
     scenario_entry: dict[str, Any] = {
         "scenario": scenario_id,
         "root_cause": "oom_killed",

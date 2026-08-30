@@ -460,10 +460,37 @@ def test_readonly_trace_reports_failed_diagnosis_and_missing_mentions(
     trace = eval_batch.trajectories[0]
     assert trace.diagnosis_success is False
     assert trace.missing_mention_count == 1
-
     feedback = _build_feedback_for(adapter, trace)
     assert "Diagnosis: failure." in feedback
     assert "Missing mentions: 1." in feedback
+
+
+def test_readonly_model_failure_omits_ungraded_quality_feedback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = _readonly_adapter(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_MODE", "model-failure")
+    case = _readonly_case()
+
+    eval_batch = adapter.evaluate(
+        [case], _seed_candidate().components, capture_traces=True
+    )
+
+    assert eval_batch.trajectories is not None
+    trace = eval_batch.trajectories[0]
+    record = adapter._trace_to_record(trace)
+    outputs = record["Generated Outputs"]
+    for field in (
+        "diagnosis_success",
+        "evidence_fetched",
+        "missing_mention_count",
+        "missing_evidence_count",
+        "malformed_tool_call_count",
+        "citation_coverage",
+        "citation_precision",
+    ):
+        assert field not in outputs
+    assert "Citation coverage" not in record["Feedback"]
 
 
 def test_readonly_trace_reports_missing_evidence(

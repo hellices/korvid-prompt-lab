@@ -171,10 +171,22 @@ class KorvidReadonlyRunner:
             raise ValueError("KorvidReadonlyRunner requires exactly one model per case")
 
         _require_supported_components(candidate)
-        system_prompt = candidate.components["system"].strip()
+        system_component = candidate.components["system"]
+        if system_component != system_component.strip():
+            raise ValueError(
+                "korvid_readonly system component must use canonical outer whitespace"
+            )
+        system_prompt = system_component
         raw_append_prompt = candidate.components.get("append")
+        if (
+            raw_append_prompt is not None
+            and raw_append_prompt != raw_append_prompt.strip()
+        ):
+            raise ValueError(
+                "korvid_readonly append component must use canonical outer whitespace"
+            )
         append_prompt = (
-            raw_append_prompt.strip() if raw_append_prompt is not None else None
+            raw_append_prompt if raw_append_prompt is not None else None
         )
 
         scenario, scenario_path = _locate_bundled_scenario(case.case_id)
@@ -694,6 +706,7 @@ def _to_bridge_result(candidate: Candidate, run: Mapping[str, Any]) -> BridgeRes
             raise ValueError("korvid.evals run result answer must be a string")  # noqa: TRY004 - preserve validation API
 
         tool_calls = _require_int(run, "tool_calls")
+        resolvable_tool_calls = _require_int(run, "resolvable_tool_calls")
         on_target_tool_calls = _require_int(run, "on_target_tool_calls")
         malformed_tool_calls = _require_int(run, "malformed_tool_calls")
         write_attempts = _require_int(run, "write_attempts")
@@ -701,6 +714,12 @@ def _to_bridge_result(candidate: Candidate, run: Mapping[str, Any]) -> BridgeRes
         iterations = _require_int(run, "iterations")
         input_tokens = _require_int(run, "input_tokens")
         output_tokens = _require_int(run, "output_tokens")
+        if resolvable_tool_calls > tool_calls:
+            raise ValueError(
+                "resolvable_tool_calls must not exceed tool_calls"
+            )
+        if on_target_tool_calls > tool_calls:
+            raise ValueError("on_target_tool_calls must not exceed tool_calls")
 
         tokens_estimated = run.get("tokens_estimated")
         if not isinstance(tokens_estimated, bool):
@@ -781,6 +800,10 @@ def _to_bridge_result(candidate: Candidate, run: Mapping[str, Any]) -> BridgeRes
         }
 
         if error is not None:
+            if hard_failures:
+                raise ValueError(
+                    "model failure result must not also report a safety failure"
+                )
             return BridgeResult(
                 protocol_version=PROTOCOL_VERSION,
                 status="model_failure",
