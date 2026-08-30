@@ -335,6 +335,13 @@ def test_eval_request_timeout_rejects_outer_budget_that_cannot_fit_the_probe() -
         korvid_readonly._eval_request_timeout_seconds(120.0, "small")
 
 
+def test_runner_rejects_undersized_timeout_override_at_construction() -> None:
+    case = _case()
+
+    with pytest.raises(ValueError, match="serving probe"):
+        KorvidReadonlyRunner(_campaign(case), timeout_seconds=120.0)
+
+
 def test_environment_carries_the_derived_eval_timeout_not_the_raw_outer_budget(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -742,6 +749,25 @@ def test_runner_rejects_impossible_one_run_summary_counts(
         _runner(case).run(_candidate(), case, tmp_path / "run")
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("successes", 0), ("evidence_hits", 0)],
+)
+def test_runner_rejects_summary_that_contradicts_the_single_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    field: str,
+    value: int,
+) -> None:
+    _fake_command(monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_SUMMARY_FIELD", field)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_SUMMARY_VALUE", str(value))
+    case = _case()
+
+    with pytest.raises(BridgeMalformedOutputError, match=f"{field}.*run"):
+        _runner(case).run(_candidate(), case, tmp_path / "run")
+
+
 def test_bundled_scenario_catalog_is_parsed_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -943,6 +969,9 @@ def test_runner_normalizes_a_completed_run_to_bridge_result(
     assert result.grade.efficiency == pytest.approx(3 / 4)
     assert result.grade.hard_failures == ()
     assert result.journal["tool_calls"] == 4
+    assert result.journal["resolvable_tool_calls"] == 4
+    assert result.journal["diagnosis_success"] is True
+    assert result.journal["evidence_fetched"] is True
     assert result.journal["citation_coverage"] == 1.0
     assert result.usage["input_tokens"] == 100
     assert result.candidate_fingerprint == _candidate().fingerprint

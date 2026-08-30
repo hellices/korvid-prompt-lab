@@ -854,7 +854,7 @@ def test_process_and_readonly_runners_satisfy_the_shared_korvid_runner_protocol(
             provider="openai-compat",
             base_url="http://127.0.0.1:41001/v1",
             profile="small",
-            timeout_seconds=5.0,
+            timeout_seconds=160.0,
         ),
     )
     readonly_runner = KorvidReadonlyRunner(readonly_campaign)

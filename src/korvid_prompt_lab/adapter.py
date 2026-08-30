@@ -38,6 +38,7 @@ class SafeExecutionTrace:
     evidence_fetched: bool | None = None
     missing_mention_count: int | None = None
     missing_evidence_count: int | None = None
+    resolvable_tool_call_count: int | None = None
     malformed_tool_call_count: int | None = None
     citation_coverage: float | None = None
     citation_precision: float | None = None
@@ -214,10 +215,13 @@ class KorvidGEPAAdapter:
         if grade is None:
             return {}
         return {
-            "diagnosis_success": grade.completion == 1.0,
-            "evidence_fetched": grade.verification == 1.0,
+            "diagnosis_success": journal.get("diagnosis_success"),
+            "evidence_fetched": journal.get("evidence_fetched"),
             "missing_mention_count": _coerce_optional_int(journal.get("missing_mentions")),
             "missing_evidence_count": _coerce_optional_int(journal.get("missing_evidence")),
+            "resolvable_tool_call_count": _coerce_optional_int(
+                journal.get("resolvable_tool_calls")
+            ),
             "malformed_tool_call_count": _coerce_optional_int(journal.get("malformed_tool_calls")),
             "citation_coverage": _coerce_optional_float(journal.get("citation_coverage")),
             "citation_precision": _coerce_optional_float(journal.get("citation_precision")),
@@ -255,6 +259,8 @@ def _readonly_output_fields(trace: SafeExecutionTrace) -> dict[str, Any]:
         fields["missing_mention_count"] = trace.missing_mention_count
     if trace.missing_evidence_count is not None:
         fields["missing_evidence_count"] = trace.missing_evidence_count
+    if trace.resolvable_tool_call_count is not None:
+        fields["resolvable_tool_call_count"] = trace.resolvable_tool_call_count
     if trace.malformed_tool_call_count is not None:
         fields["malformed_tool_call_count"] = trace.malformed_tool_call_count
     if trace.citation_coverage is not None:
@@ -274,6 +280,11 @@ def _build_feedback(trace: SafeExecutionTrace) -> str:
         parts.append(f"Missing mentions: {trace.missing_mention_count}.")
     if trace.missing_evidence_count:
         parts.append(f"Missing evidence items: {trace.missing_evidence_count}.")
+    if trace.resolvable_tool_call_count is not None:
+        parts.append(
+            f"Resolvable tool calls: {trace.resolvable_tool_call_count} "
+            f"of {trace.tool_call_count}."
+        )
     if trace.malformed_tool_call_count:
         parts.append(f"Malformed tool calls: {trace.malformed_tool_call_count}.")
     if trace.citation_coverage is not None:

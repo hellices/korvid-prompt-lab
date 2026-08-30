@@ -427,6 +427,7 @@ def test_readonly_trace_exposes_bounded_diagnosis_and_evidence_feedback(
     assert trace.final_answer == ""
     assert trace.diagnosis_success is True
     assert trace.evidence_fetched is True
+    assert trace.resolvable_tool_call_count == 4
     assert trace.missing_mention_count == 0
     assert trace.missing_evidence_count == 0
     assert trace.malformed_tool_call_count == 0

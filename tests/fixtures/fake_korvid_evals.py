@@ -130,6 +130,7 @@ def _default_run(mode: str) -> dict[str, Any]:
     elif mode == "model-failure":
         run["error"] = "provider returned no tokens"
         run["answer"] = ""
+        run["grade"]["diagnosis_success"] = False
     elif mode == "malformed-tool-calls":
         run["malformed_tool_calls"] = 2
     elif mode == "invalid-citation-coverage":
@@ -261,12 +262,8 @@ def main() -> int:
     scenario_entry: dict[str, Any] = {
         "scenario": scenario_id,
         "root_cause": "oom_killed",
-        "successes": 1
-        if run["error"] is None and run["grade"]["diagnosis_success"]
-        else 0,
-        "evidence_hits": 1
-        if run["error"] is None and run["grade"]["evidence_fetched"]
-        else 0,
+        "successes": int(run["grade"]["diagnosis_success"]),
+        "evidence_hits": int(run["grade"]["evidence_fetched"]),
         "runs": [run],
     }
 

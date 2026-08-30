@@ -150,7 +150,10 @@ class KorvidReadonlyRunner:
             # Runtime policy belongs to the campaign's serving config, never
             # to a candidate or the optimizer.
             object.__setattr__(self, "timeout_seconds", serving.timeout_seconds)
-        _require_bridge_timeout(self.timeout_seconds, "timeout_seconds")
+        effective_timeout = _require_bridge_timeout(
+            self.timeout_seconds, "timeout_seconds"
+        )
+        _eval_request_timeout_seconds(effective_timeout, serving.profile)
 
     def run(
         self,
@@ -618,8 +621,10 @@ def _load_single_run(
         _require_string(
             scenario_entry.get("root_cause"), "scenario result root_cause"
         )
-        _require_single_run_summary_count(scenario_entry, "successes")
-        _require_single_run_summary_count(scenario_entry, "evidence_hits")
+        successes = _require_single_run_summary_count(scenario_entry, "successes")
+        evidence_hits = _require_single_run_summary_count(
+            scenario_entry, "evidence_hits"
+        )
     except ValueError as exc:
         raise BridgeMalformedOutputError(str(exc)) from exc
 
@@ -639,7 +644,23 @@ def _load_single_run(
         )
 
     try:
-        return _require_mapping(runs[0], "korvid.evals run result")
+        run = _require_mapping(runs[0], "korvid.evals run result")
+        grade = _require_mapping(run.get("grade"), "korvid.evals run result grade")
+        diagnosis_success = grade.get("diagnosis_success")
+        evidence_fetched = grade.get("evidence_fetched")
+        if not isinstance(diagnosis_success, bool) or not isinstance(
+            evidence_fetched, bool
+        ):
+            raise ValueError(  # noqa: TRY004 - preserve validation API
+                "korvid.evals run grade summary fields must be boolean"
+            )
+        expected_successes = int(diagnosis_success)
+        expected_evidence_hits = int(evidence_fetched)
+        if successes != expected_successes:
+            raise ValueError("scenario successes does not match the single run")
+        if evidence_hits != expected_evidence_hits:
+            raise ValueError("scenario evidence_hits does not match the single run")
+        return run
     except ValueError as exc:
         raise BridgeMalformedOutputError(str(exc)) from exc
 
@@ -832,8 +853,11 @@ def _to_bridge_result(candidate: Candidate, run: Mapping[str, Any]) -> BridgeRes
             "forbidden_mentions": len(forbidden_mentions),
             "missing_evidence": len(missing_evidence),
             "tool_calls": tool_calls,
+            "resolvable_tool_calls": resolvable_tool_calls,
             "on_target_tool_calls": on_target_tool_calls,
             "malformed_tool_calls": malformed_tool_calls,
+            "diagnosis_success": diagnosis_success,
+            "evidence_fetched": evidence_fetched,
             "citation_coverage": coverage_value,
             "citation_precision": precision_value,
             "hard_failure_labels": list(hard_failures),
