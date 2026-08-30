@@ -221,6 +221,7 @@ def test_loads_single_transition_live_canary(monkeypatch: pytest.MonkeyPatch) ->
                 pass_at_3=0.0,
                 pass_at_5=0.0,
             ),
+            search_improved=True,
         ),
         datetime(2026, 8, 26, 0, 5, tzinfo=UTC),
     )

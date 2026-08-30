@@ -5,6 +5,7 @@ import math
 import os
 import re
 import shlex
+import stat
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -15,8 +16,7 @@ import yaml  # type: ignore[import-untyped]
 
 from .artifacts import write_json_artifact
 from .bridge_worker import EXECUTION_MODE_LIVE, EXECUTION_MODES, PROTOCOL_VERSION
-from .config import load_candidate
-from .contracts import _ensure_keys, _require_mapping, _require_string
+from .contracts import Candidate, _ensure_keys, _require_mapping, _require_string
 from .publish import _require_live_execution_modes
 from .runner import (
     BridgeMalformedOutputError,
@@ -35,6 +35,7 @@ _RESPONSE_ALLOWED_KEYS = {
     "execution_mode",
     "candidate_fingerprint",
     "request_identity",
+    "evidence_source",
     "grade",
     "answer",
     "journal",
@@ -75,6 +76,11 @@ _REQUEST_IDENTITY_ALLOWED_KEYS = {
     "seed_applied",
 }
 _GRADE_ALLOWED_KEYS = {"completion", "verification", "efficiency", "hard_failures"}
+_EVIDENCE_SOURCE_ALLOWED_KEYS = {
+    "kind",
+    "korvid_version",
+    "scenario_sha256",
+}
 _COMPLETED_JOURNAL_ALLOWED_KEYS = {
     "journey_id",
     "checkpoints",
@@ -140,6 +146,7 @@ _FORBIDDEN_ARTIFACT_TOKENS = (
     ".env",
 )
 _FORBIDDEN_ARTIFACT_NAMES = {"request.json"}
+_MAX_STRUCTURED_ARTIFACT_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +182,8 @@ class RoundReport:
     runs: tuple[CaseRunSummary, ...]
     artifact_refs: tuple[str, ...]
     reproduction_command: tuple[str, ...]
+    evidence_sources: tuple[tuple[str, str, int, str, str, str], ...] = ()
+    response_payloads: tuple[tuple[str, Mapping[str, Any]], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,14 +200,36 @@ class _ParsedResponse:
     efficiency: float | None
     hard_failures: tuple[str, ...]
     elapsed_seconds: float | None
+    evidence_source: tuple[str, str, str] | None
     payload: Mapping[str, Any]
 
 
-def build_round_report(artifact_root: Path | str) -> RoundReport:
+def build_round_report(
+    artifact_root: Path | str,
+    *,
+    _expected_root_identity: tuple[int, int] | None = None,
+    _normalized_evaluation_summary: Mapping[str, Any] | None = None,
+) -> RoundReport:
     artifact_root_path = _resolve_existing_directory(artifact_root, "artifact_root")
-    evaluation_summary = _load_json_mapping(_resolve_source_path(artifact_root_path, artifact_root_path / "evaluation-summary.json"))
-    summary = _normalize_evaluation_summary(evaluation_summary)
-    runs = _load_run_summaries(artifact_root_path, summary)
+    root_identity = (
+        _artifact_root_identity(artifact_root_path)
+        if _expected_root_identity is None
+        else _expected_root_identity
+    )
+    summary = (
+        dict(_normalized_evaluation_summary)
+        if _normalized_evaluation_summary is not None
+        else _normalize_evaluation_summary(
+            _load_json_mapping(
+                artifact_root_path / "evaluation-summary.json",
+                root=artifact_root_path,
+                expected_root_identity=root_identity,
+            )
+        )
+    )
+    runs = _load_run_summaries(
+        artifact_root_path, summary, expected_root_identity=root_identity
+    )
 
     status_counts = Counter(run.status for run in runs)
     hard_failure_counts = Counter(failure for run in runs for failure in run.hard_failures)
@@ -214,6 +245,9 @@ def build_round_report(artifact_root: Path | str) -> RoundReport:
         pass_at_5=summary["pass_at_5"],
     )
     ordered_runs = tuple(sorted(runs, key=_run_sort_key))
+    sourced_runs = [run for run in ordered_runs if run.evidence_source is not None]
+    if sourced_runs and len(sourced_runs) != len(ordered_runs):
+        raise ValueError("response evidence_source must be present on every run or none")
     models = tuple(sorted({run.model for run in ordered_runs}))
     model_scores = dict(summary["model_scores"])
     if set(models) != set(model_scores):
@@ -250,6 +284,17 @@ def build_round_report(artifact_root: Path | str) -> RoundReport:
         ),
         artifact_refs=_safe_artifact_refs(summary["artifact_refs"]),
         reproduction_command=tuple(summary["reproduction_command"]),
+        evidence_sources=tuple(
+            (
+                run.case_id,
+                run.model,
+                run.repetition,
+                *run.evidence_source,
+            )
+            for run in sourced_runs
+            if run.evidence_source is not None
+        ),
+        response_payloads=tuple((run.run_id, run.payload) for run in ordered_runs),
     )
 
 
@@ -358,24 +403,43 @@ def write_safe_evidence(
         if before_artifact_root is None
         else _resolve_existing_directory(before_artifact_root, "before_artifact_root")
     )
-    evaluation_summary_path = _resolve_source_path(artifact_root_path, artifact_root_path / "evaluation-summary.json")
-    evaluation_summary = _normalize_evaluation_summary(_load_json_mapping(evaluation_summary_path))
-    optimization_summary = _load_optional_optimization_summary(optimize_artifact_root_path)
+    artifact_root_identity = _artifact_root_identity(artifact_root_path)
+    optimize_root_identity = _artifact_root_identity(optimize_artifact_root_path)
+    before_root_identity = (
+        None
+        if before_artifact_root_path is None
+        else _artifact_root_identity(before_artifact_root_path)
+    )
+    evaluation_summary = _normalize_evaluation_summary(
+        _load_json_mapping(
+            artifact_root_path / "evaluation-summary.json",
+            root=artifact_root_path,
+            expected_root_identity=artifact_root_identity,
+        )
+    )
+    optimization_summary = _load_optional_optimization_summary(
+        optimize_artifact_root_path,
+        expected_root_identity=optimize_root_identity,
+    )
     best_candidate_yaml = _load_optional_best_candidate(
         optimize_artifact_root_path,
         evaluation_summary,
         optimization_summary,
+        expected_root_identity=optimize_root_identity,
     )
     safe_output_path = Path(safe_output).expanduser().resolve(strict=False)
     if safe_output_path.exists():
         raise FileExistsError(f"safe output already exists: {safe_output_path}")
     safe_output_path.mkdir(parents=True, exist_ok=False)
 
-    report = build_round_report(artifact_root_path)
+    report = build_round_report(
+        artifact_root_path,
+        _expected_root_identity=artifact_root_identity,
+        _normalized_evaluation_summary=evaluation_summary,
+    )
 
     safe_response_paths: list[str] = _write_safe_responses(
         report=report,
-        source_root=artifact_root_path,
         safe_output=safe_output_path,
         destination_dir="responses",
     )
@@ -396,7 +460,19 @@ def write_safe_evidence(
             raise ValueError("before_artifact_root requires a best-candidate.yaml")
         seed_fingerprint = optimization_summary["seed_candidate_fingerprint"]
         best_fingerprint = optimization_summary["best_candidate_fingerprint"]
-        before_report = build_round_report(before_artifact_root_path)
+        assert before_root_identity is not None
+        before_evaluation_summary = _normalize_evaluation_summary(
+            _load_json_mapping(
+                before_artifact_root_path / "evaluation-summary.json",
+                root=before_artifact_root_path,
+                expected_root_identity=before_root_identity,
+            )
+        )
+        before_report = build_round_report(
+            before_artifact_root_path,
+            _expected_root_identity=before_root_identity,
+            _normalized_evaluation_summary=before_evaluation_summary,
+        )
         comparison = build_round_comparison(
             before_report,
             report,
@@ -414,7 +490,6 @@ def write_safe_evidence(
             # exactly the safe files that land in the package.
             before_response_paths = _write_safe_responses(
                 report=before_report,
-                source_root=before_artifact_root_path,
                 safe_output=safe_output_path,
                 destination_dir="before-responses",
             )
@@ -423,13 +498,6 @@ def write_safe_evidence(
             # onto the in-package safe files: the before run's raw refs glob every
             # request.json/audit.jsonl and can name kubeconfigs, credentials, or
             # GEPA state, none of which may be published or even referenced here.
-            before_evaluation_summary = _normalize_evaluation_summary(
-                _load_json_mapping(
-                    _resolve_source_path(
-                        before_artifact_root_path, before_artifact_root_path / "evaluation-summary.json"
-                    )
-                )
-            )
             safe_before_summary = _safe_evaluation_summary_payload(before_evaluation_summary)
             safe_before_summary["artifact_refs"] = [
                 "before-evaluation-summary.json",
@@ -478,8 +546,9 @@ def write_safe_evidence(
         "evaluation-summary.json",
         *safe_response_paths,
     )
+    evidence_sources = report.evidence_sources
     summary_payload = {
-        "schema_version": 1,
+        "schema_version": 2 if evidence_sources else 1,
         "campaign_id": report.campaign_id,
         "candidate_id": report.candidate_id,
         "candidate_fingerprint": report.candidate_fingerprint,
@@ -524,6 +593,14 @@ def write_safe_evidence(
         "korvid_revision": korvid_revision,
         "workflow_run_url": workflow_run_url,
         "reproduction_command": list(report.reproduction_command),
+        **(
+            {
+                "evaluation_backend": "korvid_readonly",
+                "evidence_sources": [list(source) for source in evidence_sources],
+            }
+            if evidence_sources
+            else {}
+        ),
     }
     if campaign_action_id is not None:
         summary_payload["campaign_action_id"] = campaign_action_id
@@ -567,24 +644,23 @@ def write_safe_evidence(
 def _write_safe_responses(
     *,
     report: RoundReport,
-    source_root: Path,
     safe_output: Path,
     destination_dir: str,
 ) -> list[str]:
     references: list[str] = []
+    payloads = dict(report.response_payloads)
     for run in report.runs:
-        source_path = _resolve_source_path(
-            source_root,
-            source_root / "runs" / run.run_id / "response.json",
-        )
-        parsed = _parse_response(source_path)
-        if parsed.candidate_fingerprint != report.candidate_fingerprint:
-            raise ValueError("response fingerprint does not match the report fingerprint")
+        try:
+            payload = payloads[run.run_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"validated response payload missing for run {run.run_id}"
+            ) from exc
         destination_path = _resolve_destination_path(
             safe_output,
             safe_output / destination_dir / f"{run.run_id}.json",
         )
-        _write_json(destination_path, parsed.payload)
+        _write_json(destination_path, payload)
         references.append(destination_path.relative_to(safe_output).as_posix())
     return references
 
@@ -657,7 +733,12 @@ def _normalize_evaluation_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _load_run_summaries(artifact_root: Path, summary: Mapping[str, Any]) -> list[_ParsedResponse]:
+def _load_run_summaries(
+    artifact_root: Path,
+    summary: Mapping[str, Any],
+    *,
+    expected_root_identity: tuple[int, int],
+) -> list[_ParsedResponse]:
     runs_root = _resolve_existing_directory(artifact_root / "runs", "artifact_root/runs")
     responses = sorted(runs_root.glob("*/response.json"))
     if not responses:
@@ -673,7 +754,11 @@ def _load_run_summaries(artifact_root: Path, summary: Mapping[str, Any]) -> list
     extras: set[tuple[str, str, int]] = set()
 
     for path in responses:
-        parsed = _parse_response(_resolve_source_path(artifact_root, path))
+        parsed = _parse_response(
+            path,
+            root=artifact_root,
+            expected_root_identity=expected_root_identity,
+        )
         if parsed.candidate_fingerprint != summary["candidate_fingerprint"]:
             raise ValueError("response fingerprint does not match evaluation summary candidate_fingerprint")
         if parsed.execution_mode != EXECUTION_MODE_LIVE:
@@ -705,8 +790,15 @@ def _load_run_summaries(artifact_root: Path, summary: Mapping[str, Any]) -> list
     return list(observed.values())
 
 
-def _parse_response(path: Path) -> _ParsedResponse:
-    payload = _load_json_mapping(path)
+def _parse_response(
+    path: Path,
+    *,
+    root: Path,
+    expected_root_identity: tuple[int, int],
+) -> _ParsedResponse:
+    payload = _load_json_mapping(
+        path, root=root, expected_root_identity=expected_root_identity
+    )
     try:
         _ensure_keys(payload, _RESPONSE_ALLOWED_KEYS, "bridge response")
         protocol_version = _require_response_int(payload, "protocol_version")
@@ -733,6 +825,7 @@ def _parse_response(path: Path) -> _ParsedResponse:
             raise BridgeMalformedOutputError(
                 "request_identity.seed_applied must be a boolean"
             )
+        evidence_source = _parse_evidence_source(payload.get("evidence_source"))
         _require_response_text(payload, "answer")
         journal = _parse_journal(payload, status)
         usage = _parse_usage(payload, status)
@@ -755,6 +848,7 @@ def _parse_response(path: Path) -> _ParsedResponse:
         efficiency=efficiency,
         hard_failures=hard_failures,
         elapsed_seconds=None if elapsed_seconds is None else float(elapsed_seconds),
+        evidence_source=evidence_source,
         payload={
             "protocol_version": protocol_version,
             "status": status,
@@ -772,6 +866,17 @@ def _parse_response(path: Path) -> _ParsedResponse:
                     else {}
                 ),
             },
+            **(
+                {
+                    "evidence_source": {
+                        "kind": evidence_source[0],
+                        "korvid_version": evidence_source[1],
+                        "scenario_sha256": evidence_source[2],
+                    }
+                }
+                if evidence_source is not None
+                else {}
+            ),
             "grade": None
             if completion is None
             else {
@@ -781,11 +886,52 @@ def _parse_response(path: Path) -> _ParsedResponse:
                 "hard_failures": list(hard_failures),
             },
             "answer": "",
-            "journal": journal,
+            "journal": _safe_journal_payload(journal, status),
             "usage": usage,
-            "error": error,
+            "error": "model_failure" if error is not None else None,
         },
     )
+
+
+def _parse_evidence_source(value: Any) -> tuple[str, str, str] | None:
+    if value is None:
+        return None
+    source = _require_response_mapping({"evidence_source": value}, "evidence_source")
+    _ensure_keys(source, _EVIDENCE_SOURCE_ALLOWED_KEYS, "evidence_source")
+    kind = _require_response_string(source, "kind")
+    if kind != "korvid_readonly":
+        raise BridgeMalformedOutputError(
+            "evidence_source.kind must be korvid_readonly"
+        )
+    korvid_version = _require_response_string(source, "korvid_version")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.!+_-]{0,63}", korvid_version) is None:
+        raise BridgeMalformedOutputError(
+            "evidence_source.korvid_version must be a bounded canonical version"
+        )
+    scenario_sha256 = _require_response_string(source, "scenario_sha256")
+    if len(scenario_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in scenario_sha256
+    ):
+        raise BridgeMalformedOutputError(
+            "evidence_source.scenario_sha256 must be a lowercase SHA-256 hex digest"
+        )
+    return kind, korvid_version, scenario_sha256
+
+
+def _safe_journal_payload(
+    journal: Mapping[str, Any], status: str
+) -> dict[str, Any]:
+    if status == "model_failure":
+        return {"checkpoints": [], "checkpoint_counts": {}}
+    return {
+        "journey_id": "",
+        "checkpoints": [],
+        "missing_checkpoints": [],
+        "checkpoint_counts": {},
+        "journal_event_count": journal["journal_event_count"],
+        "audit_record_count": journal["audit_record_count"],
+        "hard_failure_count": journal["hard_failure_count"],
+    }
 
 
 def _parse_grade(payload: Mapping[str, Any], status: str) -> tuple[float | None, float | None, float | None, tuple[str, ...]]:
@@ -896,11 +1042,19 @@ def _safe_evaluation_summary_payload(summary: Mapping[str, Any]) -> dict[str, An
     }
 
 
-def _load_optional_optimization_summary(artifact_root: Path) -> dict[str, Any] | None:
+def _load_optional_optimization_summary(
+    artifact_root: Path,
+    *,
+    expected_root_identity: tuple[int, int],
+) -> dict[str, Any] | None:
     source_path = artifact_root / "optimization-summary.json"
     if not source_path.is_file():
         return None
-    payload = _load_json_mapping(_resolve_source_path(artifact_root, source_path))
+    payload = _load_json_mapping(
+        source_path,
+        root=artifact_root,
+        expected_root_identity=expected_root_identity,
+    )
     return _normalize_optimization_summary(payload)
 
 
@@ -908,11 +1062,19 @@ def _load_optional_best_candidate(
     artifact_root: Path,
     evaluation_summary: Mapping[str, Any],
     optimization_summary: Mapping[str, Any] | None,
+    *,
+    expected_root_identity: tuple[int, int],
 ) -> str | None:
     source_path = artifact_root / "best-candidate.yaml"
     if not source_path.is_file():
         return None
-    candidate = load_candidate(_resolve_source_path(artifact_root, source_path))
+    candidate = Candidate.from_mapping(
+        _load_yaml_mapping(
+            artifact_root,
+            source_path,
+            expected_root_identity=expected_root_identity,
+        )
+    )
     if candidate.candidate_id != evaluation_summary["candidate_id"]:
         raise ValueError("best-candidate candidate_id does not match evaluation summary")
     if candidate.fingerprint != evaluation_summary["candidate_fingerprint"]:
@@ -929,6 +1091,41 @@ def _load_optional_best_candidate(
         "metadata": candidate.metadata,
     }
     return yaml.safe_dump(payload, sort_keys=False, allow_unicode=True)
+
+
+def _load_yaml_mapping(
+    root: Path,
+    path: Path,
+    *,
+    expected_root_identity: tuple[int, int],
+) -> Mapping[str, Any]:
+    source_path = _resolve_source_path(root, path)
+    try:
+        file_fd = _open_artifact_file(
+            root,
+            source_path,
+            expected_root_identity=expected_root_identity,
+        )
+        try:
+            file_stat = os.fstat(file_fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ValueError("best-candidate.yaml must be a regular file")
+            if file_stat.st_size > _MAX_STRUCTURED_ARTIFACT_BYTES:
+                raise ValueError("best-candidate.yaml is too large")
+            with os.fdopen(file_fd, "r", encoding="utf-8") as handle:
+                file_fd = -1
+                text = handle.read(_MAX_STRUCTURED_ARTIFACT_BYTES + 1)
+                if len(text.encode("utf-8")) > _MAX_STRUCTURED_ARTIFACT_BYTES:
+                    raise ValueError("best-candidate.yaml is too large")
+                payload = yaml.safe_load(text)
+        finally:
+            if file_fd >= 0:
+                os.close(file_fd)
+    except FileNotFoundError as exc:
+        raise ValueError("best-candidate.yaml is missing") from exc
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, RecursionError) as exc:
+        raise ValueError(f"best-candidate.yaml is malformed: {exc}") from exc
+    return _require_mapping(payload, "best-candidate.yaml")
 
 
 def _normalize_optimization_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
@@ -1002,6 +1199,45 @@ def _resolve_source_path(root: Path, path: Path) -> Path:
     return resolved
 
 
+def _artifact_root_identity(root: Path) -> tuple[int, int]:
+    root_stat = root.stat()
+    return root_stat.st_dev, root_stat.st_ino
+
+
+def _open_artifact_file(
+    root: Path,
+    path: Path,
+    *,
+    expected_root_identity: tuple[int, int],
+) -> int:
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"source path escapes artifact_root: {path}") from exc
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError(f"invalid artifact path: {path}")
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_fd = os.open(root, directory_flags)
+    try:
+        opened_root = os.fstat(directory_fd)
+        if (opened_root.st_dev, opened_root.st_ino) != expected_root_identity:
+            raise ValueError("artifact root changed during validation")
+        for component in relative.parts[:-1]:
+            next_fd = os.open(
+                component, directory_flags, dir_fd=directory_fd
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        return os.open(
+            relative.parts[-1],
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+    finally:
+        os.close(directory_fd)
+
+
 def _resolve_destination_path(root: Path, path: Path) -> Path:
     resolved = path.expanduser().resolve(strict=False)
     try:
@@ -1011,14 +1247,36 @@ def _resolve_destination_path(root: Path, path: Path) -> Path:
     return resolved
 
 
-def _load_json_mapping(path: Path) -> Mapping[str, Any]:
+def _load_json_mapping(
+    path: Path,
+    *,
+    root: Path,
+    expected_root_identity: tuple[int, int],
+) -> Mapping[str, Any]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        fd = _open_artifact_file(
+            root, path, expected_root_identity=expected_root_identity
+        )
+        try:
+            artifact_stat = os.fstat(fd)
+            if not stat.S_ISREG(artifact_stat.st_mode):
+                raise ValueError(f"JSON artifact is not a regular file: {path}")
+            if artifact_stat.st_size > _MAX_STRUCTURED_ARTIFACT_BYTES:
+                raise ValueError(f"JSON artifact is too large: {path}")
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                fd = -1
+                text = handle.read(_MAX_STRUCTURED_ARTIFACT_BYTES + 1)
+                if len(text.encode("utf-8")) > _MAX_STRUCTURED_ARTIFACT_BYTES:
+                    raise ValueError(f"JSON artifact is too large: {path}")
+                payload = json.loads(text)
+        finally:
+            if fd >= 0:
+                os.close(fd)
     except OSError as exc:
         raise ValueError(f"could not read JSON artifact: {path}") from exc
     except UnicodeDecodeError as exc:
         raise ValueError(f"artifact is not valid UTF-8 JSON: {path}") from exc
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, RecursionError) as exc:
         raise ValueError(f"artifact is not valid JSON: {path}") from exc
     return _require_mapping(payload, path.name)
 

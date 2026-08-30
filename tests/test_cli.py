@@ -2673,8 +2673,14 @@ def test_command_evaluate_selects_the_readonly_runner_for_korvid_readonly_campai
     responses = sorted((artifacts / "runs").glob("*/response.json"))
     assert len(responses) == 2
     assert all(json.loads(path.read_text(encoding="utf-8"))["answer"] == "" for path in responses)
+    for path in responses:
+        source = json.loads(path.read_text(encoding="utf-8"))["evidence_source"]
+        assert source["kind"] == "korvid_readonly"
+        assert source["korvid_version"]
+        assert len(source["scenario_sha256"]) == 64
     report = build_round_report(artifacts)
     assert report.candidate_id == "readonly-candidate"
+    assert len(report.evidence_sources) == 2
 
 
 def test_command_evaluate_still_selects_the_process_runner_for_process_campaigns(

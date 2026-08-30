@@ -99,6 +99,75 @@ def test_comparison_renders_semantic_directions_and_failure_union() -> None:
     assert "| `wrong_target_write` | 3 | 1 | -2 | ✅ improved |" in markdown
 
 
+def test_comparison_rejects_different_installed_evidence_sources() -> None:
+    before = replace(
+        report(
+            fingerprint=SEED,
+            aggregate=0.1,
+            pass_at_3=0.2,
+            pass_at_5=0.3,
+            systemic=0,
+            failures={},
+        ),
+        evidence_sources=(
+            ("case-a", "model-a", 1, "korvid_readonly", "0.3.0", "a" * 64),
+        ),
+    )
+    after = replace(
+        report(
+            fingerprint=BEST,
+            aggregate=0.2,
+            pass_at_3=0.3,
+            pass_at_5=0.4,
+            systemic=0,
+            failures={},
+        ),
+        evidence_sources=(
+            ("case-a", "model-a", 1, "korvid_readonly", "0.4.0", "a" * 64),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="comparison contract mismatch"):
+        build_round_comparison(
+            before,
+            after,
+            seed_fingerprint=SEED,
+            best_fingerprint=BEST,
+        )
+
+
+def test_comparison_payload_uses_v2_for_attested_evidence_sources() -> None:
+    before = replace(
+        report(
+            fingerprint=SEED,
+            aggregate=0.1,
+            pass_at_3=0.2,
+            pass_at_5=0.3,
+            systemic=0,
+            failures={},
+        ),
+        evidence_sources=(
+            ("case-a", "model-a", 1, "korvid_readonly", "0.3.0", "a" * 64),
+        ),
+    )
+    after = replace(before, candidate_fingerprint=BEST, aggregate_score=0.2)
+
+    comparison = build_round_comparison(
+        before,
+        after,
+        seed_fingerprint=SEED,
+        best_fingerprint=BEST,
+    )
+    payload = comparison_payload(comparison)
+
+    assert payload["schema_version"] == 2
+    contract = payload["contract"]
+    assert isinstance(contract, dict)
+    assert contract["evidence_sources"] == [
+        ["case-a", "model-a", 1, "korvid_readonly", "0.3.0", "a" * 64]
+    ]
+
+
 def test_same_fingerprint_is_unchanged_and_requires_same_evidence() -> None:
     before = report(
         fingerprint=SEED,
@@ -124,6 +193,40 @@ def test_same_fingerprint_is_unchanged_and_requires_same_evidence() -> None:
         build_round_comparison(
             before,
             replace(before, aggregate_score=0.2),
+            seed_fingerprint=SEED,
+            best_fingerprint=SEED,
+        )
+
+
+def test_same_fingerprint_rejects_different_per_run_evidence() -> None:
+    before = report(
+        fingerprint=SEED,
+        aggregate=0.5,
+        pass_at_3=0.0,
+        pass_at_5=0.0,
+        systemic=0,
+        failures={},
+    )
+    before_runs = (
+        replace(before.runs[0], case_id="case-a", completion=1.0),
+        replace(
+            before.runs[0],
+            run_id="case-b-model-a-r01",
+            case_id="case-b",
+            completion=0.0,
+        ),
+    )
+    after_runs = (
+        replace(before_runs[0], completion=0.0),
+        replace(before_runs[1], completion=1.0),
+    )
+    before = replace(before, runs=before_runs)
+    after = replace(before, runs=after_runs)
+
+    with pytest.raises(ValueError, match="unchanged candidate evidence"):
+        build_round_comparison(
+            before,
+            after,
             seed_fingerprint=SEED,
             best_fingerprint=SEED,
         )
@@ -394,4 +497,3 @@ def test_publication_bullet_eligible_appears_after_net_in_comparison() -> None:
     net_pos = markdown.index("- Net:")
     pub_pos = markdown.index("- Publication:")
     assert net_pos < pub_pos, "Publication bullet must appear after Net bullet"
-

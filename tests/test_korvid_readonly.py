@@ -578,6 +578,32 @@ def test_runner_raises_malformed_output_error_on_invalid_json(
         _runner(case).run(_candidate(), case, tmp_path / "run")
 
 
+def test_runner_rejects_oversized_korvid_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_command(monkeypatch)
+    monkeypatch.setenv("FAKE_KORVID_EVALS_MODE", "oversized-json")
+    case = _case()
+
+    with pytest.raises(BridgeMalformedOutputError, match="too large"):
+        _runner(case).run(_candidate(), case, tmp_path / "run")
+
+
+def test_runner_translates_json_parser_recursion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_command(monkeypatch)
+    monkeypatch.setattr(
+        korvid_readonly.json,
+        "loads",
+        lambda _text: (_ for _ in ()).throw(RecursionError("too deep")),
+    )
+    case = _case()
+
+    with pytest.raises(BridgeMalformedOutputError, match="valid JSON"):
+        _runner(case).run(_candidate(), case, tmp_path / "run")
+
+
 def test_cleanup_failure_does_not_mask_primary_runner_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -654,6 +680,27 @@ def test_runner_does_not_persist_raw_korvid_output(
     _runner(case).run(_candidate(), case, run_dir)
 
     assert not list(run_dir.rglob("korvid-eval-output.json"))
+
+
+def test_runner_fingerprints_private_scenario_copy_before_invocation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_command(monkeypatch)
+    fingerprinted_paths: list[Path] = []
+    real_sha256_file = korvid_readonly._sha256_file
+
+    def recording_sha256_file(path: Path) -> str:
+        fingerprinted_paths.append(path)
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(korvid_readonly, "_sha256_file", recording_sha256_file)
+    case = _case()
+
+    _runner(case).run(_candidate(), case, tmp_path / "run")
+
+    assert len(fingerprinted_paths) == 1
+    assert fingerprinted_paths[0].parent.name.startswith("korvid-readonly-pack-")
+    assert not fingerprinted_paths[0].exists()
 
 
 @pytest.mark.parametrize(

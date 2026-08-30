@@ -18,10 +18,12 @@ once the run finishes (success or failure).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -37,6 +39,7 @@ from korvid.evals.runner import _eval_tools
 from korvid.evals.scenario import Scenario, bundled_scenarios_dir, load_scenario
 
 from .artifacts import write_json_artifact
+from .baseline import korvid_distribution_version
 from .bridge_worker import EXECUTION_MODE_LIVE, PROTOCOL_VERSION
 from .contracts import (
     Campaign,
@@ -87,6 +90,7 @@ _SERVING_PROBE_WORST_CASE_SECONDS = 4 * (
 # Mirrors the installed ``korvid.evals.runner._drive_turn`` execution arm.
 _EVALS_PROFILE_READONLY = False
 _EVALS_RESIZE_SUPPORTED = True
+_MAX_KORVID_OUTPUT_BYTES = 1024 * 1024
 
 #: Candidate component keys this runner knows how to project onto the
 #: installed CLI's ``--system-prompt-file``/``--prompt-append-file`` flags.
@@ -226,6 +230,9 @@ class KorvidReadonlyRunner:
                 append_prompt,
                 output_path,
             )
+            evidence_source = _evidence_source(
+                pack_dir / scenario_path.name
+            )
             env = self._build_environment(serving, case)
             completed = self._invoke(command, env)
 
@@ -284,6 +291,7 @@ class KorvidReadonlyRunner:
                     case=case,
                     repetition=repetition,
                     seed=seed,
+                    evidence_source=evidence_source,
                 ),
             )
         except OSError as exc:
@@ -537,7 +545,27 @@ def _load_single_run(
     append_prompt: str | None,
 ) -> Mapping[str, Any]:
     try:
-        text = output_path.read_text(encoding="utf-8")
+        fd = os.open(output_path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            output_stat = os.fstat(fd)
+            if not stat.S_ISREG(output_stat.st_mode):
+                raise BridgeMalformedOutputError(
+                    "korvid.evals output must be a regular file"
+                )
+            if output_stat.st_size > _MAX_KORVID_OUTPUT_BYTES:
+                raise BridgeMalformedOutputError(
+                    "korvid.evals output is too large"
+                )
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                fd = -1
+                text = handle.read(_MAX_KORVID_OUTPUT_BYTES + 1)
+                if len(text.encode("utf-8")) > _MAX_KORVID_OUTPUT_BYTES:
+                    raise BridgeMalformedOutputError(
+                        "korvid.evals output is too large"
+                    )
+        finally:
+            if fd >= 0:
+                os.close(fd)
     except OSError as exc:
         raise BridgeArtifactError(
             f"runner could not read korvid.evals output: {output_path}"
@@ -549,7 +577,7 @@ def _load_single_run(
 
     try:
         payload = json.loads(text)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, RecursionError) as exc:
         raise BridgeMalformedOutputError(
             "korvid.evals output is not valid JSON"
         ) from exc
@@ -888,6 +916,7 @@ def _safe_response_payload(
     case: EvalCase,
     repetition: int,
     seed: int,
+    evidence_source: Mapping[str, str],
 ) -> dict[str, Any]:
     grade = result.grade
     if grade is None:
@@ -928,9 +957,27 @@ def _safe_response_payload(
             "seed": seed,
             "seed_applied": False,
         },
+        "evidence_source": dict(evidence_source),
         "grade": grade_payload,
         "answer": "",
         "journal": journal,
         "usage": usage,
         "error": "model_failure" if result.error is not None else None,
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise BridgeArtifactError(
+            f"runner could not fingerprint bundled scenario: {path}"
+        ) from exc
+
+
+def _evidence_source(scenario_path: Path) -> dict[str, str]:
+    return {
+        "kind": "korvid_readonly",
+        "korvid_version": korvid_distribution_version(),
+        "scenario_sha256": _sha256_file(scenario_path),
     }

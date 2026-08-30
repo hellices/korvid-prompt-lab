@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import threading
 from dataclasses import replace
@@ -16,6 +17,7 @@ import yaml  # type: ignore[import-untyped]
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from korvid_prompt_lab import campaign_artifacts
 from korvid_prompt_lab.campaign_artifacts import (
     load_round_outcome,
     render_campaign_summary,
@@ -32,6 +34,7 @@ from korvid_prompt_lab.campaigns import (
     ModelTier,
     OptimizationCampaign,
     SearchStage,
+    max_search_metric_calls,
     state_hash,
 )
 from korvid_prompt_lab.contracts import Candidate
@@ -153,6 +156,7 @@ def _write_search_evidence(
     korvid_revision: str = "def456",
     comparison_outcome: str = "improved",
     comparison_metrics: list[dict[str, object]] | None = None,
+    before_passed: bool = False,
 ) -> None:
     root.mkdir(parents=True, exist_ok=True)
     best_candidate_mapping = best_candidate_mapping or _candidate_mapping(candidate_id)
@@ -203,6 +207,69 @@ def _write_search_evidence(
         "reproduction_command": ["echo", "test"],
     }
     (root / "evaluation-summary.json").write_text(json.dumps(eval_summary))
+    before_eval_summary = {
+        **eval_summary,
+        "candidate_id": "seed-candidate",
+        "candidate_fingerprint": seed_candidate_fingerprint,
+        "aggregate_score": 1.0 if before_passed else 0.4,
+        "model_scores": {
+            model: 1.0 if before_passed else 0.4 for model in models
+        },
+        "pass_at_3": 1.0 if before_passed else 0.0,
+        "pass_at_5": 1.0 if before_passed else 0.0,
+        "artifact_refs": [
+            "before-evaluation-summary.json",
+            *[
+                f"before-responses/case-c-r{repetition:02d}.json"
+                for repetition in range(1, 6)
+            ],
+        ],
+    }
+    (root / "before-evaluation-summary.json").write_text(
+        json.dumps(before_eval_summary)
+    )
+    before_responses = root / "before-responses"
+    before_responses.mkdir()
+    for repetition in range(1, 6):
+        (before_responses / f"case-c-r{repetition:02d}.json").write_text(
+            json.dumps(
+                {
+                    "protocol_version": 1,
+                    "status": "completed",
+                    "execution_mode": "live",
+                    "candidate_fingerprint": seed_candidate_fingerprint,
+                    "request_identity": {
+                        "case_id": "case-c",
+                        "template_id": "case-c-template",
+                        "model": "qwen3:0.6b",
+                        "repetition": repetition,
+                        "seed": repetition - 1,
+                    },
+                    "grade": {
+                        "completion": 1.0 if before_passed else 0.0,
+                        "verification": 1.0,
+                        "efficiency": 1.0,
+                        "hard_failures": [],
+                    },
+                    "answer": "",
+                    "journal": {
+                        "journey_id": "",
+                        "checkpoints": [],
+                        "missing_checkpoints": [],
+                        "checkpoint_counts": {},
+                        "journal_event_count": 0,
+                        "audit_record_count": 0,
+                        "hard_failure_count": 0,
+                    },
+                    "usage": {
+                        "tool_calls": 0,
+                        "iterations": 1,
+                        "wall_time_seconds": 1.0,
+                    },
+                    "error": None,
+                }
+            )
+        )
 
     round_summary = {
         "schema_version": 1,
@@ -236,23 +303,8 @@ def _write_search_evidence(
     }
     (root / "round-summary.json").write_text(json.dumps(round_summary))
 
-    comparison_summary = {
-        "schema_version": 1,
-        "status": "changed",
-        "outcome": comparison_outcome,
-        "seed_candidate_fingerprint": seed_candidate_fingerprint,
-        "best_candidate_fingerprint": resolved_candidate_fingerprint,
-        "contract": {
-            "campaign_id": "test-campaign",
-            "models": list(models),
-            "case_repetitions": sorted(
-                [case_id, models[0], rep]
-                for case_id in evaluated_case_ids
-                for rep in range(1, 6)  # repetitions_per_case=5
-            ),
-            "execution_modes": ["live"],
-        },
-        "metrics": comparison_metrics
+    resolved_comparison_metrics = (
+        comparison_metrics
         if comparison_metrics is not None
         else [
             {
@@ -275,11 +327,55 @@ def _write_search_evidence(
                 "integer": True,
                 "core": True,
             },
-        ],
-        "improved_count": 0,
-        "unchanged_count": 1,
-        "regressed_count": 0,
-        "not_comparable_count": 0,
+        ]
+    )
+    for metric in resolved_comparison_metrics:
+        key = metric["key"]
+        after = metric["after"]
+        if key == "aggregate_score":
+            eval_summary["aggregate_score"] = after
+            eval_summary["model_scores"] = {model: after for model in models}
+            round_summary["aggregate_score"] = after
+            round_summary["model_scores"] = {model: after for model in models}
+        elif key in {
+            "pass_at_3",
+            "pass_at_5",
+            "systemic_failures",
+            "hard_safety_failures",
+        }:
+            eval_summary[key] = after
+            if key != "hard_safety_failures":
+                round_summary[key] = after
+    (root / "evaluation-summary.json").write_text(json.dumps(eval_summary))
+    (root / "round-summary.json").write_text(json.dumps(round_summary))
+    comparison_summary = {
+        "schema_version": 1,
+        "status": "changed",
+        "outcome": comparison_outcome,
+        "seed_candidate_fingerprint": seed_candidate_fingerprint,
+        "best_candidate_fingerprint": resolved_candidate_fingerprint,
+        "contract": {
+            "campaign_id": "test-campaign",
+            "models": list(models),
+            "case_repetitions": sorted(
+                [case_id, models[0], rep]
+                for case_id in evaluated_case_ids
+                for rep in range(1, 6)  # repetitions_per_case=5
+            ),
+            "execution_modes": ["live"],
+        },
+        "metrics": resolved_comparison_metrics,
+        **{
+            f"{result}_count": sum(
+                metric["result"] == result for metric in resolved_comparison_metrics
+            )
+            for result in (
+                "improved",
+                "unchanged",
+                "regressed",
+                "not_comparable",
+            )
+        },
     }
     (root / "comparison-summary.json").write_text(json.dumps(comparison_summary))
 
@@ -317,6 +413,175 @@ def _write_search_evidence(
     (root / "best-candidate.yaml").write_text(yaml.dump(best_candidate_mapping))
 
 
+def _upgrade_round_summary_to_readonly(root: Path) -> None:
+    path = root / "round-summary.json"
+    summary = json.loads(path.read_text())
+    response_refs: list[str] = []
+    responses_dir = root / "responses"
+    responses_dir.mkdir()
+    for repetition in range(1, 6):
+        response_ref = f"responses/case-c-r{repetition:02d}.json"
+        response_refs.append(response_ref)
+        (root / response_ref).write_text(
+            json.dumps(
+                {
+                    "protocol_version": 1,
+                    "status": "completed",
+                    "execution_mode": "live",
+                    "request_identity": {
+                        "case_id": "case-c",
+                        "template_id": "case-c-template",
+                        "model": "qwen3:0.6b",
+                        "repetition": repetition,
+                        "seed": repetition - 1,
+                        "seed_applied": False,
+                    },
+                    "candidate_fingerprint": summary["candidate_fingerprint"],
+                    "evidence_source": {
+                        "kind": "korvid_readonly",
+                        "korvid_version": "0.3.0",
+                        "scenario_sha256": "a" * 64,
+                    },
+                    "grade": {
+                        "completion": 1.0,
+                        "verification": 1.0,
+                        "efficiency": 1.0,
+                        "hard_failures": [],
+                    },
+                    "answer": "",
+                    "journal": {
+                        "journey_id": "",
+                        "checkpoints": [],
+                        "missing_checkpoints": [],
+                        "checkpoint_counts": {},
+                        "journal_event_count": 0,
+                        "audit_record_count": 0,
+                        "hard_failure_count": 0,
+                    },
+                    "usage": {
+                        "tool_calls": 0,
+                        "iterations": 1,
+                        "wall_time_seconds": 1.0,
+                    },
+                    "error": None,
+                }
+            )
+        )
+    summary["schema_version"] = 2
+    summary["aggregate_score"] = 1.0
+    summary["model_scores"] = {"qwen3:0.6b": 1.0}
+    summary["evaluation_backend"] = "korvid_readonly"
+    summary["evidence_sources"] = [
+        ["case-c", "qwen3:0.6b", repetition, "korvid_readonly", "0.3.0", "a" * 64]
+        for repetition in range(1, 6)
+    ]
+    summary["runs"] = [
+        {
+            "run_id": f"case-c-r{repetition:02d}",
+            "case_id": "case-c",
+            "model": "qwen3:0.6b",
+            "repetition": repetition,
+            "status": "completed",
+            "completion": 1.0,
+            "verification": 1.0,
+            "efficiency": 1.0,
+            "elapsed_seconds": 1.0,
+            "hard_failures": [],
+            "execution_mode": "live",
+        }
+        for repetition in range(1, 6)
+    ]
+    summary["status_counts"] = {"completed": 5}
+    summary["promotion_eligible"] = False
+    summary["promotion_blockers"] = ["milestone_failed"]
+    summary["evaluation_artifact_refs"] = [
+        "evaluation-summary.json",
+        *response_refs,
+    ]
+    path.write_text(json.dumps(summary))
+    evaluation_path = root / "evaluation-summary.json"
+    evaluation = json.loads(evaluation_path.read_text())
+    evaluation["aggregate_score"] = 1.0
+    evaluation["model_scores"] = {"qwen3:0.6b": 1.0}
+    evaluation_path.write_text(json.dumps(evaluation))
+    for response_path in sorted((root / "before-responses").glob("*.json")):
+        response = json.loads(response_path.read_text())
+        response["request_identity"]["seed_applied"] = False
+        response["evidence_source"] = {
+            "kind": "korvid_readonly",
+            "korvid_version": "0.3.0",
+            "scenario_sha256": "a" * 64,
+        }
+        response_path.write_text(json.dumps(response))
+
+
+def _upgrade_comparison_to_readonly(root: Path, *, version: str = "0.3.0") -> None:
+    path = root / "comparison-summary.json"
+    summary = json.loads(path.read_text())
+    summary["schema_version"] = 2
+    summary["contract"]["evidence_sources"] = [
+        ["case-c", "qwen3:0.6b", repetition, "korvid_readonly", version, "a" * 64]
+        for repetition in range(1, 6)
+    ]
+    summary["metrics"] = [
+        {
+            "key": "aggregate_score",
+            "label": "Aggregate score",
+            "before": 0.4,
+            "after": 1.0,
+            "delta": 0.6,
+            "result": "improved",
+            "integer": False,
+            "core": True,
+        },
+        {
+            "key": "pass_at_3",
+            "label": "pass@3",
+            "before": 0.0,
+            "after": 1.0,
+            "delta": 1.0,
+            "result": "improved",
+            "integer": False,
+            "core": True,
+        },
+        {
+            "key": "pass_at_5",
+            "label": "pass@5",
+            "before": 0.0,
+            "after": 1.0,
+            "delta": 1.0,
+            "result": "improved",
+            "integer": False,
+            "core": True,
+        },
+        {
+            "key": "hard_safety_failures",
+            "label": "Hard safety failures",
+            "before": 0,
+            "after": 0,
+            "delta": 0,
+            "result": "unchanged",
+            "integer": True,
+            "core": True,
+        },
+        {
+            "key": "systemic_failures",
+            "label": "Systemic failures",
+            "before": 0,
+            "after": 0,
+            "delta": 0,
+            "result": "unchanged",
+            "integer": True,
+            "core": True,
+        },
+    ]
+    summary["improved_count"] = 3
+    summary["unchanged_count"] = 2
+    summary["regressed_count"] = 0
+    summary["not_comparable_count"] = 0
+    path.write_text(json.dumps(summary))
+
+
 # ---------------------------------------------------------------------------
 # Safe Ingestion Tests
 # ---------------------------------------------------------------------------
@@ -334,6 +599,788 @@ class TestLoadRoundOutcome:
         assert outcome.candidate_fingerprint == expected_fingerprint
         assert outcome.aggregate_score == 0.6
         assert outcome.search_improved is True
+
+    def test_rejects_malformed_comparison_evidence_source(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        path = root / "comparison-summary.json"
+        comparison = json.loads(path.read_text())
+        comparison["schema_version"] = 2
+        comparison["contract"]["evidence_sources"] = [
+            [
+                "case-c",
+                "qwen3:0.6b",
+                1,
+                "korvid_readonly",
+                "secret\nversion",
+                "a" * 64,
+            ]
+        ]
+        path.write_text(json.dumps(comparison))
+        _upgrade_round_summary_to_readonly(root)
+        control = replace(_control(), evaluation_backend="korvid_readonly")
+
+        with pytest.raises(ValueError, match="korvid_version"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state()
+            )
+
+    def test_readonly_campaign_rejects_deeply_nested_response(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        _upgrade_round_summary_to_readonly(root)
+        _upgrade_comparison_to_readonly(root)
+        response_path = root / "responses" / "case-c-r01.json"
+        response_path.write_text("[" * 2_000 + "0" + "]" * 2_000)
+        control = replace(_control(), evaluation_backend="korvid_readonly")
+
+        with pytest.raises(ValueError, match="response"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state()
+            )
+
+    def test_rejects_schema_v2_comparison_with_empty_evidence_sources(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        path = root / "comparison-summary.json"
+        comparison = json.loads(path.read_text())
+        comparison["schema_version"] = 2
+        comparison["contract"]["evidence_sources"] = []
+        path.write_text(json.dumps(comparison))
+        _upgrade_round_summary_to_readonly(root)
+        control = replace(_control(), evaluation_backend="korvid_readonly")
+
+        with pytest.raises(ValueError, match="evidence_sources"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state()
+            )
+
+    def test_accepts_legacy_comparison_without_evidence_sources(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        path = root / "comparison-summary.json"
+        comparison = json.loads(path.read_text())
+        path.write_text(json.dumps(comparison))
+
+        outcome = load_round_outcome(
+            root, _search_action(), control=_control(), state=_state()
+        )
+
+        assert outcome.search_improved is True
+
+    def test_readonly_campaign_rejects_provenance_schema_downgrade(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        control = replace(_control(), evaluation_backend="korvid_readonly")
+
+        with pytest.raises(ValueError, match="schema_version must be 2"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state()
+            )
+
+    def test_readonly_search_rejects_comparison_provenance_mismatch(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        _upgrade_round_summary_to_readonly(root)
+        _upgrade_comparison_to_readonly(root, version="0.4.0")
+        control = replace(_control(), evaluation_backend="korvid_readonly")
+
+        with pytest.raises(ValueError, match="provenance.*round-summary"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state()
+            )
+
+    def test_readonly_campaign_rejects_response_provenance_mismatch(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        _upgrade_round_summary_to_readonly(root)
+        _upgrade_comparison_to_readonly(root)
+        response_path = root / "responses" / "case-c-r01.json"
+        response = json.loads(response_path.read_text())
+        response["evidence_source"]["korvid_version"] = "0.4.0"
+        response_path.write_text(json.dumps(response))
+        control = replace(_control(), evaluation_backend="korvid_readonly")
+
+        with pytest.raises(ValueError, match="response.*provenance"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state()
+            )
+
+    def test_readonly_campaign_rejects_response_candidate_mismatch(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        _upgrade_round_summary_to_readonly(root)
+        _upgrade_comparison_to_readonly(root)
+        response_path = root / "responses" / "case-c-r01.json"
+        response = json.loads(response_path.read_text())
+        response["candidate_fingerprint"] = "f" * 64
+        response_path.write_text(json.dumps(response))
+        control = replace(_control(), evaluation_backend="korvid_readonly")
+
+        with pytest.raises(ValueError, match="candidate_fingerprint"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state()
+            )
+
+    def test_readonly_campaign_rejects_unknown_response_fields(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        _upgrade_round_summary_to_readonly(root)
+        _upgrade_comparison_to_readonly(root)
+        response_path = root / "responses" / "case-c-r01.json"
+        response = json.loads(response_path.read_text())
+        response["raw_payload"] = {"token": "must-not-pass"}
+        response_path.write_text(json.dumps(response))
+        control = replace(_control(), evaluation_backend="korvid_readonly")
+
+        with pytest.raises(ValueError, match="unknown key"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state()
+            )
+
+    def test_readonly_campaign_rejects_malformed_projected_values(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        _upgrade_round_summary_to_readonly(root)
+        _upgrade_comparison_to_readonly(root)
+        response_path = root / "responses" / "case-c-r01.json"
+        response = json.loads(response_path.read_text())
+        response["grade"]["completion"] = {"raw": "payload"}
+        response_path.write_text(json.dumps(response))
+        control = replace(_control(), evaluation_backend="korvid_readonly")
+
+        with pytest.raises(ValueError, match="completion"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state()
+            )
+
+    def test_readonly_campaign_rejects_response_grade_mismatch(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        _upgrade_round_summary_to_readonly(root)
+        _upgrade_comparison_to_readonly(root)
+        response_path = root / "responses" / "case-c-r01.json"
+        response = json.loads(response_path.read_text())
+        response["grade"]["completion"] = 0.0
+        response_path.write_text(json.dumps(response))
+        control = replace(_control(), evaluation_backend="korvid_readonly")
+
+        with pytest.raises(ValueError, match="response.*round-summary run"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state()
+            )
+
+    def test_readonly_campaign_recomputes_pass_metrics_from_runs(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        _upgrade_round_summary_to_readonly(root)
+        _upgrade_comparison_to_readonly(root)
+        round_path = root / "round-summary.json"
+        round_summary = json.loads(round_path.read_text())
+        round_summary["pass_at_3"] = 0.0
+        round_summary["pass_at_5"] = 0.0
+        round_path.write_text(json.dumps(round_summary))
+        eval_path = root / "evaluation-summary.json"
+        eval_summary = json.loads(eval_path.read_text())
+        eval_summary["pass_at_3"] = 0.0
+        eval_summary["pass_at_5"] = 0.0
+        eval_path.write_text(json.dumps(eval_summary))
+        comparison_path = root / "comparison-summary.json"
+        comparison = json.loads(comparison_path.read_text())
+        for metric in comparison["metrics"]:
+            if metric["key"] == "pass_at_3":
+                metric.update(after=0.0, delta=-0.8, result="regressed")
+            elif metric["key"] == "pass_at_5":
+                metric.update(after=0.0, delta=-1.0, result="regressed")
+        comparison["outcome"] = "regressed"
+        comparison["improved_count"] = 1
+        comparison["unchanged_count"] = 2
+        comparison["regressed_count"] = 2
+        comparison_path.write_text(json.dumps(comparison))
+        control = replace(_control(), evaluation_backend="korvid_readonly")
+
+        with pytest.raises(ValueError, match="pass_at_3.*runs"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state()
+            )
+
+    def test_readonly_campaign_recomputes_hard_failure_total(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        _upgrade_round_summary_to_readonly(root)
+        _upgrade_comparison_to_readonly(root)
+        eval_path = root / "evaluation-summary.json"
+        eval_summary = json.loads(eval_path.read_text())
+        eval_summary["hard_safety_failures"] = 1
+        eval_path.write_text(json.dumps(eval_summary))
+        comparison_path = root / "comparison-summary.json"
+        comparison = json.loads(comparison_path.read_text())
+        hard_metric = next(
+            metric
+            for metric in comparison["metrics"]
+            if metric["key"] == "hard_safety_failures"
+        )
+        hard_metric.update(after=1, delta=1, result="regressed")
+        comparison["outcome"] = "regressed"
+        comparison["unchanged_count"] = 2
+        comparison["regressed_count"] = 1
+        comparison_path.write_text(json.dumps(comparison))
+        control = replace(_control(), evaluation_backend="korvid_readonly")
+
+        with pytest.raises(ValueError, match="hard_safety_failures.*runs"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state()
+            )
+
+    def test_readonly_campaign_recomputes_evaluation_aggregate(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        _upgrade_round_summary_to_readonly(root)
+        _upgrade_comparison_to_readonly(root)
+        eval_path = root / "evaluation-summary.json"
+        eval_summary = json.loads(eval_path.read_text())
+        eval_summary["aggregate_score"] = 0.5
+        eval_summary["model_scores"] = {"qwen3:0.6b": 0.5}
+        eval_path.write_text(json.dumps(eval_summary))
+        control = replace(_control(), evaluation_backend="korvid_readonly")
+
+        with pytest.raises(ValueError, match="evaluation-summary.aggregate_score.*runs"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state()
+            )
+
+    def test_readonly_campaign_recomputes_model_scores(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        _upgrade_round_summary_to_readonly(root)
+        _upgrade_comparison_to_readonly(root)
+        for filename in ("round-summary.json", "evaluation-summary.json"):
+            path = root / filename
+            summary = json.loads(path.read_text())
+            summary["model_scores"] = {"qwen3:0.6b": 0.5}
+            path.write_text(json.dumps(summary))
+        control = replace(_control(), evaluation_backend="korvid_readonly")
+
+        with pytest.raises(ValueError, match="model_scores.*runs"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state()
+            )
+
+    def test_readonly_campaign_rejects_response_symlink_swap(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        _upgrade_round_summary_to_readonly(root)
+        _upgrade_comparison_to_readonly(root)
+        response_path = root / "responses" / "case-c-r01.json"
+        outside = tmp_path / "outside.json"
+        original_response = response_path.read_bytes()
+        outside.write_bytes(original_response)
+        real_resolve = campaign_artifacts._resolve_safe_path
+        real_read_text = Path.read_text
+        swapped = False
+
+        def swapping_resolve(safe_root: Path, filename: str) -> Path:
+            nonlocal swapped
+            path = real_resolve(safe_root, filename)
+            if filename.startswith("responses/") and not swapped:
+                swapped = True
+                path.unlink()
+                path.symlink_to(outside)
+            return path
+
+        def restoring_read_text(path: Path, *args: Any, **kwargs: Any) -> str:
+            text = real_read_text(path, *args, **kwargs)
+            if path == response_path and path.is_symlink():
+                path.unlink()
+                path.write_bytes(original_response)
+            return text
+
+        monkeypatch.setattr(
+            campaign_artifacts, "_resolve_safe_path", swapping_resolve
+        )
+        monkeypatch.setattr(Path, "read_text", restoring_read_text)
+        control = replace(_control(), evaluation_backend="korvid_readonly")
+
+        with pytest.raises(ValueError, match="response|symlink"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state()
+            )
+
+    def test_readonly_campaign_rejects_package_root_swap(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        _upgrade_round_summary_to_readonly(root)
+        _upgrade_comparison_to_readonly(root)
+        original_root = tmp_path / "original-evidence"
+        real_resolve = campaign_artifacts._resolve_safe_path
+        swapped = False
+
+        def swapping_root(safe_root: Path, filename: str) -> Path:
+            nonlocal swapped
+            path = real_resolve(safe_root, filename)
+            if filename.startswith("responses/") and not swapped:
+                swapped = True
+                safe_root.rename(original_root)
+                shutil.copytree(original_root, safe_root)
+            return path
+
+        monkeypatch.setattr(
+            campaign_artifacts, "_resolve_safe_path", swapping_root
+        )
+        control = replace(_control(), evaluation_backend="korvid_readonly")
+
+        with pytest.raises(ValueError, match="root.*changed"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state()
+            )
+
+    def test_readonly_campaign_rejects_oversized_response(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        _upgrade_round_summary_to_readonly(root)
+        _upgrade_comparison_to_readonly(root)
+        response_path = root / "responses" / "case-c-r01.json"
+        response_path.write_bytes(response_path.read_bytes() + b" " * 100_000)
+        control = replace(_control(), evaluation_backend="korvid_readonly")
+
+        with pytest.raises(ValueError, match="too large"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state()
+            )
+
+    def test_rejects_comparison_metric_count_mismatch(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        path = root / "comparison-summary.json"
+        comparison = json.loads(path.read_text())
+        comparison["improved_count"] = 999
+        path.write_text(json.dumps(comparison))
+
+        with pytest.raises(ValueError, match="improved_count"):
+            load_round_outcome(
+                root, _search_action(), control=_control(), state=_state()
+            )
+
+    def test_rejects_json_parser_recursion(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        monkeypatch.setattr(
+            campaign_artifacts.json,
+            "loads",
+            lambda _text: (_ for _ in ()).throw(RecursionError("too deep")),
+        )
+
+        with pytest.raises(ValueError, match="malformed JSON"):
+            load_round_outcome(
+                root, _search_action(), control=_control(), state=_state()
+            )
+
+    def test_rejects_comparison_metric_not_bound_to_round_summary(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        path = root / "comparison-summary.json"
+        comparison = json.loads(path.read_text())
+        aggregate = next(
+            metric
+            for metric in comparison["metrics"]
+            if metric["key"] == "aggregate_score"
+        )
+        aggregate["after"] = 0.9
+        aggregate["delta"] = 0.5
+        path.write_text(json.dumps(comparison))
+
+        with pytest.raises(ValueError, match="aggregate_score.*evidence"):
+            load_round_outcome(
+                root, _search_action(), control=_control(), state=_state()
+            )
+
+    def test_unmeasured_search_binds_comparison_to_before_summary(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        path = root / "comparison-summary.json"
+        comparison = json.loads(path.read_text())
+        aggregate = next(
+            metric
+            for metric in comparison["metrics"]
+            if metric["key"] == "aggregate_score"
+        )
+        aggregate["before"] = 0.9
+        aggregate["delta"] = -0.3
+        aggregate["result"] = "regressed"
+        comparison["outcome"] = "regressed"
+        comparison["improved_count"] = 0
+        comparison["regressed_count"] = 1
+        path.write_text(json.dumps(comparison))
+
+        with pytest.raises(ValueError, match="aggregate_score.*before evidence"):
+            load_round_outcome(
+                root, _search_action(), control=_control(), state=_state()
+            )
+
+    def test_comparison_status_must_match_candidate_fingerprints(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        path = root / "comparison-summary.json"
+        comparison = json.loads(path.read_text())
+        aggregate = next(
+            metric
+            for metric in comparison["metrics"]
+            if metric["key"] == "aggregate_score"
+        )
+        aggregate.update(before=0.6, delta=0.0, result="unchanged")
+        comparison["status"] = "unchanged"
+        comparison["outcome"] = "unchanged"
+        comparison["improved_count"] = 0
+        comparison["unchanged_count"] = 2
+        path.write_text(json.dumps(comparison))
+
+        with pytest.raises(ValueError, match="status.*fingerprint"):
+            load_round_outcome(
+                root, _search_action(), control=_control(), state=_state()
+            )
+
+    def test_measured_unchanged_search_uses_current_evidence_for_both_sides(
+        self, tmp_path: Path
+    ) -> None:
+        candidate = Candidate.from_mapping(_candidate_mapping())
+        state = replace(
+            _state(champion_fingerprint=candidate.fingerprint),
+            champion_score=CampaignScore(
+                fingerprint=candidate.fingerprint,
+                aggregate=0.4,
+                hard_safety_failures=0,
+                core_regression=False,
+                systemic_failures=0,
+                pass_at_3=0.0,
+                pass_at_5=0.0,
+            ),
+        )
+        root = tmp_path / "evidence"
+        _write_search_evidence(
+            root,
+            seed_candidate_fingerprint=candidate.fingerprint,
+        )
+        path = root / "comparison-summary.json"
+        comparison = json.loads(path.read_text())
+        aggregate = next(
+            metric
+            for metric in comparison["metrics"]
+            if metric["key"] == "aggregate_score"
+        )
+        aggregate.update(before=0.6, delta=0.0, result="unchanged")
+        comparison["status"] = "unchanged"
+        comparison["outcome"] = "unchanged"
+        comparison["improved_count"] = 0
+        comparison["unchanged_count"] = 2
+        path.write_text(json.dumps(comparison))
+
+        outcome = load_round_outcome(
+            root, _search_action(), control=_control(), state=state
+        )
+
+        assert outcome.search_improved is False
+
+    def test_unmeasured_search_recomputes_before_summary_from_responses(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        before_path = root / "before-evaluation-summary.json"
+        before = json.loads(before_path.read_text())
+        before["aggregate_score"] = 0.9
+        before["model_scores"] = {"qwen3:0.6b": 0.9}
+        before_path.write_text(json.dumps(before))
+        comparison_path = root / "comparison-summary.json"
+        comparison = json.loads(comparison_path.read_text())
+        aggregate = next(
+            metric
+            for metric in comparison["metrics"]
+            if metric["key"] == "aggregate_score"
+        )
+        aggregate.update(before=0.9, delta=-0.3, result="regressed")
+        comparison["outcome"] = "regressed"
+        comparison["improved_count"] = 0
+        comparison["regressed_count"] = 1
+        comparison_path.write_text(json.dumps(comparison))
+
+        with pytest.raises(ValueError, match="before.*aggregate_score.*responses"):
+            load_round_outcome(
+                root, _search_action(), control=_control(), state=_state()
+            )
+
+    def test_readonly_unmeasured_search_rejects_before_response_leakage(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        _upgrade_round_summary_to_readonly(root)
+        _upgrade_comparison_to_readonly(root)
+        response_path = root / "before-responses" / "case-c-r01.json"
+        response = json.loads(response_path.read_text())
+        response["answer"] = "raw secret answer"
+        response["evidence_source"]["korvid_version"] = "0.4.0"
+        response_path.write_text(json.dumps(response))
+        control = replace(_control(), evaluation_backend="korvid_readonly")
+
+        with pytest.raises(ValueError, match="answer|provenance"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state()
+            )
+
+    def test_measured_search_still_validates_before_response_leakage(
+        self, tmp_path: Path
+    ) -> None:
+        champion = Candidate.from_mapping(_candidate_mapping("champion")).fingerprint
+        state = replace(
+            _state(champion_fingerprint=champion),
+            champion_score=CampaignScore(
+                fingerprint=champion,
+                aggregate=0.4,
+                hard_safety_failures=0,
+                core_regression=False,
+                systemic_failures=0,
+                pass_at_3=0.0,
+                pass_at_5=0.0,
+            ),
+        )
+        root = tmp_path / "evidence"
+        _write_search_evidence(root, seed_candidate_fingerprint=champion)
+        response_path = root / "before-responses" / "case-c-r01.json"
+        response = json.loads(response_path.read_text())
+        response["answer"] = "raw secret answer"
+        response_path.write_text(json.dumps(response))
+
+        with pytest.raises(ValueError, match="answer"):
+            load_round_outcome(
+                root, _search_action(), control=_control(), state=state
+            )
+
+    def test_measured_changed_search_accepts_fresh_stochastic_before_score(
+        self, tmp_path: Path
+    ) -> None:
+        champion = Candidate.from_mapping(_candidate_mapping("champion")).fingerprint
+        state = replace(
+            _state(champion_fingerprint=champion),
+            champion_score=CampaignScore(
+                fingerprint=champion,
+                aggregate=0.4,
+                hard_safety_failures=0,
+                core_regression=False,
+                systemic_failures=0,
+                pass_at_3=0.0,
+                pass_at_5=0.0,
+            ),
+        )
+        root = tmp_path / "evidence"
+        _write_search_evidence(root, seed_candidate_fingerprint=champion)
+        before_path = root / "before-evaluation-summary.json"
+        before = json.loads(before_path.read_text())
+        before["aggregate_score"] = 0.5
+        before["model_scores"] = {"qwen3:0.6b": 0.5}
+        before_path.write_text(json.dumps(before))
+        for response_path in (root / "before-responses").glob("*.json"):
+            response = json.loads(response_path.read_text())
+            response["grade"]["completion"] = 1 / 6
+            response_path.write_text(json.dumps(response))
+        comparison_path = root / "comparison-summary.json"
+        comparison = json.loads(comparison_path.read_text())
+        aggregate = next(
+            metric
+            for metric in comparison["metrics"]
+            if metric["key"] == "aggregate_score"
+        )
+        aggregate.update(before=0.5, delta=0.1)
+        comparison_path.write_text(json.dumps(comparison))
+
+        outcome = load_round_outcome(
+            root, _search_action(), control=_control(), state=state
+        )
+
+        assert outcome.search_improved is True
+
+    def test_search_recomputes_milestone_passed(self, tmp_path: Path) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        path = root / "evaluation-summary.json"
+        summary = json.loads(path.read_text())
+        summary["milestone_passed"] = True
+        path.write_text(json.dumps(summary))
+
+        with pytest.raises(ValueError, match="milestone_passed"):
+            load_round_outcome(
+                root, _search_action(), control=_control(), state=_state()
+            )
+
+    def test_search_rejects_underreported_metric_calls(self, tmp_path: Path) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        path = root / "optimization-summary.json"
+        summary = json.loads(path.read_text())
+        summary["total_metric_calls"] = 1
+        path.write_text(json.dumps(summary))
+
+        with pytest.raises(ValueError, match="total_metric_calls.*minimum"):
+            load_round_outcome(
+                root, _search_action(), control=_control(), state=_state()
+            )
+
+    def test_search_charges_trusted_bounded_metric_maximum(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        path = root / "optimization-summary.json"
+        summary = json.loads(path.read_text())
+        summary["num_candidates"] = 1
+        summary["num_full_val_evals"] = 0
+        summary["total_metric_calls"] = 1
+        path.write_text(json.dumps(summary))
+        action = _search_action()
+        control = _control()
+
+        outcome = load_round_outcome(
+            root, action, control=control, state=_state()
+        )
+
+        assert outcome.metric_calls_used == max_search_metric_calls(
+            control, action.metric_calls
+        )
+
+    def test_rejects_deeply_nested_best_candidate_yaml(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        (root / "best-candidate.yaml").write_text(
+            "[" * 2_000 + "0" + "]" * 2_000
+        )
+
+        with pytest.raises(ValueError, match="malformed YAML"):
+            load_round_outcome(
+                root, _search_action(), control=_control(), state=_state()
+            )
+
+    def test_rejects_oversized_top_level_summary(self, tmp_path: Path) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        path = root / "round-summary.json"
+        path.write_bytes(path.read_bytes() + b" " * 1_100_000)
+
+        with pytest.raises(ValueError, match="too large"):
+            load_round_outcome(
+                root, _search_action(), control=_control(), state=_state()
+            )
+
+    def test_rejects_top_level_summary_root_swap(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        original_root = tmp_path / "original-evidence"
+        real_resolve = campaign_artifacts._resolve_safe_path
+        swapped = False
+
+        def swapping_root(safe_root: Path, filename: str) -> Path:
+            nonlocal swapped
+            path = real_resolve(safe_root, filename)
+            if filename == "round-summary.json" and not swapped:
+                swapped = True
+                safe_root.rename(original_root)
+                shutil.copytree(original_root, safe_root)
+            return path
+
+        monkeypatch.setattr(
+            campaign_artifacts, "_resolve_safe_path", swapping_root
+        )
+
+        with pytest.raises(ValueError, match="root.*changed"):
+            load_round_outcome(
+                root, _search_action(), control=_control(), state=_state()
+            )
+
+    def test_rejects_oversized_best_candidate_yaml(self, tmp_path: Path) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        path = root / "best-candidate.yaml"
+        path.write_bytes(path.read_bytes() + b" " * 1_100_000)
+
+        with pytest.raises(ValueError, match="too large"):
+            load_round_outcome(
+                root, _search_action(), control=_control(), state=_state()
+            )
+
+    def test_rejects_best_candidate_root_swap(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        original_root = tmp_path / "original-evidence"
+        real_resolve = campaign_artifacts._resolve_safe_path
+        swapped = False
+
+        def swapping_root(safe_root: Path, filename: str) -> Path:
+            nonlocal swapped
+            path = real_resolve(safe_root, filename)
+            if filename == "best-candidate.yaml" and not swapped:
+                swapped = True
+                safe_root.rename(original_root)
+                shutil.copytree(original_root, safe_root)
+            return path
+
+        monkeypatch.setattr(
+            campaign_artifacts, "_resolve_safe_path", swapping_root
+        )
+
+        with pytest.raises(ValueError, match="root.*changed"):
+            load_round_outcome(
+                root, _search_action(), control=_control(), state=_state()
+            )
 
     def test_evidence_campaign_id_binds_to_evaluation_campaign(
         self, tmp_path: Path,
@@ -556,7 +1603,7 @@ class TestLoadRoundOutcome:
         root = tmp_path / "evidence"
         _write_search_evidence(root, seed_candidate_fingerprint="wrong")
         action = _search_action()
-        with pytest.raises(ValueError, match="seed_candidate_fingerprint mismatch"):
+        with pytest.raises(ValueError, match="fingerprint mismatch"):
             load_round_outcome(root, action, control=_control(), state=_state())
 
     @pytest.mark.parametrize(
@@ -989,19 +2036,19 @@ _REGRESSED_CORE_METRICS: list[dict[str, object]] = [
     {
         "key": "aggregate_score",
         "label": "Aggregate score",
-        "before": 0.4,
+        "before": 1.0,
         "after": 0.9,
-        "delta": 0.5,
-        "result": "improved",
+        "delta": -0.1,
+        "result": "regressed",
         "integer": False,
         "core": True,
     },
     {
         "key": "pass_at_3",
         "label": "pass@3",
-        "before": 0.8,
+        "before": 1.0,
         "after": 0.2,
-        "delta": -0.6,
+        "delta": -0.8,
         "result": "regressed",
         "integer": False,
         "core": True,
@@ -1018,6 +2065,7 @@ class TestCoreRegressionDerivation:
             root,
             comparison_outcome="regressed",
             comparison_metrics=_REGRESSED_CORE_METRICS,
+            before_passed=True,
         )
         outcome = load_round_outcome(
             root, _search_action(), control=_control(), state=_state(),
@@ -1067,8 +2115,9 @@ class TestCoreRegressionDerivation:
             root,
             comparison_outcome="improved",
             comparison_metrics=_REGRESSED_CORE_METRICS,
+            before_passed=True,
         )
-        with pytest.raises(ValueError, match="contradicts"):
+        with pytest.raises(ValueError, match="status|contradicts"):
             load_round_outcome(
                 root, _search_action(), control=_control(), state=_state(),
             )
@@ -1081,11 +2130,12 @@ class TestCoreRegressionDerivation:
             root,
             comparison_outcome="unchanged",
             comparison_metrics=_REGRESSED_CORE_METRICS,
+            before_passed=True,
         )
         comparison = json.loads((root / "comparison-summary.json").read_text())
         comparison["status"] = "unchanged"
         (root / "comparison-summary.json").write_text(json.dumps(comparison))
-        with pytest.raises(ValueError, match="contradicts"):
+        with pytest.raises(ValueError, match="status|contradicts"):
             load_round_outcome(
                 root, _search_action(), control=_control(), state=_state(),
             )
@@ -1106,12 +2156,12 @@ class TestCoreRegressionDerivation:
             _state(champion_fingerprint=champion),
             champion_score=CampaignScore(
                 fingerprint=champion,
-                aggregate=0.4,
+                aggregate=1.0,
                 hard_safety_failures=0,
                 core_regression=False,
                 systemic_failures=0,
-                pass_at_3=0.8,
-                pass_at_5=0.8,
+                pass_at_3=1.0,
+                pass_at_5=1.0,
             ),
         )
         action = next_action(control, state, NOW)
@@ -1124,6 +2174,7 @@ class TestCoreRegressionDerivation:
             seed_candidate_fingerprint=champion,
             comparison_outcome="regressed",
             comparison_metrics=_REGRESSED_CORE_METRICS,
+            before_passed=True,
         )
         outcome = load_round_outcome(root, action, control=control, state=state)
         assert outcome.core_regression is True
@@ -1138,7 +2189,15 @@ class TestCoreRegressionDerivation:
             pass_at_5=outcome.pass_at_5,
         )
         advanced = advance_state(
-            control, state, action, AttemptOutcome(kind="evidence", score=score), NOW,
+            control,
+            state,
+            action,
+            AttemptOutcome(
+                kind="evidence",
+                score=score,
+                search_improved=outcome.search_improved,
+            ),
+            NOW,
         )
         assert advanced.champion_fingerprint == champion
-        assert advanced.champion_score.aggregate == 0.4
+        assert advanced.champion_score.aggregate == 1.0

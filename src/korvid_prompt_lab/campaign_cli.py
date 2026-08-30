@@ -372,6 +372,7 @@ def _cmd_advance(args: argparse.Namespace) -> int:
             score=score,
             metric_calls_used=outcome_data.metric_calls_used,
             search_improved=outcome_data.search_improved,
+            incumbent_score=outcome_data.incumbent_score,
         )
     else:
         if args.evidence is not None:
@@ -455,6 +456,8 @@ def _cmd_validate_evidence(args: argparse.Namespace) -> int:
                 kind="evidence",
                 score=score,
                 metric_calls_used=outcome_data.metric_calls_used,
+                search_improved=outcome_data.search_improved,
+                incumbent_score=outcome_data.incumbent_score,
             ),
             datetime.now(tz=UTC),
         )

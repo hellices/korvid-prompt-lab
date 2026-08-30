@@ -240,6 +240,9 @@ def main() -> int:
     if mode == "malformed-json":
         args.json.write_text("{not json", encoding="utf-8")
         return _exit_code(default=0)
+    if mode == "oversized-json":
+        args.json.write_text("{}" + " " * 1_100_000, encoding="utf-8")
+        return _exit_code(default=0)
 
     scenario_id = _first_scenario_id(args.scenarios)
     if mode == "identity-mismatch":
