@@ -1099,11 +1099,10 @@ def _load_yaml_mapping(
     *,
     expected_root_identity: tuple[int, int],
 ) -> Mapping[str, Any]:
-    source_path = _resolve_source_path(root, path)
     try:
         file_fd = _open_artifact_file(
             root,
-            source_path,
+            path,
             expected_root_identity=expected_root_identity,
         )
         try:

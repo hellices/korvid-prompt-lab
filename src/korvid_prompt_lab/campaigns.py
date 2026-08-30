@@ -1071,7 +1071,12 @@ def advance_state(
                     "unchanged candidate fingerprint cannot be search_improved"
                 )
             new_champion_fp = state.champion_fingerprint
-            new_champion_score = candidate_score
+            new_champion_score = (
+                candidate_score
+                if candidate_score.systemic_failures == 0
+                and not candidate_score.core_regression
+                else state.champion_score
+            )
             new_stagnation = state.stagnation_attempts + 1
         elif (
             candidate_score.fingerprint != state.champion_fingerprint

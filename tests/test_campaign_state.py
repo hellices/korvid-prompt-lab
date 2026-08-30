@@ -260,6 +260,74 @@ def test_measured_same_fingerprint_search_refreshes_champion_score() -> None:
     assert advanced.champion_score == refreshed
 
 
+def test_measured_same_fingerprint_systemic_result_keeps_prior_score() -> None:
+    ctrl = _control()
+    initial = _init(ctrl)
+    prior = _score(initial.champion_fingerprint, aggregate=0.4)
+    state = replace(initial, champion_score=prior, stagnation_attempts=1)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+    failed = _score(
+        state.champion_fingerprint,
+        aggregate=0.0,
+        systemic_failures=1,
+    )
+
+    advanced = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(
+            kind="evidence",
+            score=failed,
+            search_improved=False,
+        ),
+        LATER,
+    )
+
+    assert advanced.champion_score == prior
+
+
+def test_unmeasured_changed_regression_requires_incumbent_score() -> None:
+    ctrl = _control()
+    state = _init(ctrl)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+
+    with pytest.raises(ValueError, match="incumbent_score"):
+        advance_state(
+            ctrl,
+            state,
+            action,
+            AttemptOutcome(
+                kind="evidence",
+                score=_score("changed", aggregate=0.1),
+                search_improved=False,
+            ),
+            LATER,
+        )
+
+
+def test_same_fingerprint_cannot_claim_search_improvement() -> None:
+    ctrl = _control()
+    state = _init(ctrl)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+
+    with pytest.raises(ValueError, match="unchanged.*search_improved"):
+        advance_state(
+            ctrl,
+            state,
+            action,
+            AttemptOutcome(
+                kind="evidence",
+                score=_score(state.champion_fingerprint, aggregate=0.4),
+                search_improved=True,
+            ),
+            LATER,
+        )
+
+
 def test_changed_search_promotes_from_fresh_improved_comparison() -> None:
     ctrl = _control()
     initial = _init(ctrl)

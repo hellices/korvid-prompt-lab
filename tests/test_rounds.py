@@ -213,6 +213,23 @@ def test_safe_evidence_rejects_oversized_best_candidate_yaml(
         write_safe_evidence(artifact_root, tmp_path / "safe")
 
 
+def test_safe_evidence_rejects_best_candidate_symlink_inside_root(
+    tmp_path: Path,
+) -> None:
+    artifact_root = write_live_fixture(
+        tmp_path / "input",
+        include_optimization=True,
+        include_best_candidate=True,
+    )
+    candidate_path = artifact_root / "best-candidate.yaml"
+    target_path = artifact_root / "candidate-target.yaml"
+    candidate_path.rename(target_path)
+    candidate_path.symlink_to(target_path.name)
+
+    with pytest.raises(ValueError, match="malformed|symlink|could not read"):
+        write_safe_evidence(artifact_root, tmp_path / "safe")
+
+
 def test_build_round_report_rejects_unsafe_evidence_source_version(
     tmp_path: Path,
 ) -> None:
