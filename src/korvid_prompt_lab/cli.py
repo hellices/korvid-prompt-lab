@@ -16,16 +16,24 @@ from .aks import (
     AKSPreflightTransientError,
 )
 from .artifacts import write_json_artifact
+from .baseline import PROFILE_NAMES, build_baseline_candidate, write_baseline_candidate
 from .bridge_worker import EXECUTION_MODE_LIVE
 from .config import load_campaign, load_candidate
-from .contracts import AKSPortForwardServing, Campaign, Candidate, EvalCase
+from .contracts import (
+    AKSPortForwardServing,
+    Campaign,
+    Candidate,
+    EvalCase,
+    KorvidReadonlyServing,
+)
+from .korvid_readonly import KorvidReadonlyRunner
 from .optimize import (
     DEFAULT_OPTIMIZATION_SEED,
     OptimizationArtifacts,
     optimize_campaign,
 )
 from .publish import DEFAULT_MINIMUM_MODEL_IMPROVEMENT, publish_bundle
-from .runner import BridgeSystemError, KorvidProcessRunner
+from .runner import BridgeSystemError, KorvidProcessRunner, KorvidRunner
 from .scoring import RepetitionOutcome, pass_hat_k, result_passed, score_result
 
 
@@ -182,6 +190,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     publish_parser.set_defaults(func=command_publish)
 
+    baseline_parser = subparsers.add_parser(
+        "korvid-baseline",
+        help="Materialize the installed Korvid profile's shipped system prompt as a seed candidate.",
+    )
+    baseline_parser.add_argument(
+        "--profile",
+        choices=PROFILE_NAMES,
+        required=True,
+        help="Installed Korvid agent profile to materialize (small or full).",
+    )
+    baseline_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Path to write the immutable baseline candidate YAML to; must not already exist.",
+    )
+    baseline_parser.set_defaults(func=command_korvid_baseline)
+
     return parser
 
 
@@ -238,11 +264,7 @@ def command_evaluate(args: argparse.Namespace) -> int:
     artifact_root = Path(args.artifact_root)
     try:
         with _serving_session(campaign, artifact_root) as model_endpoint:
-            runner = KorvidProcessRunner(
-                campaign=campaign,
-                timeout_seconds=campaign.bridge_timeout_seconds,
-                model_endpoint=model_endpoint,
-            )
+            runner = _build_runner(campaign, model_endpoint=model_endpoint)
             summary = _evaluate_campaign(
                 candidate=candidate,
                 campaign=campaign,
@@ -319,11 +341,7 @@ def command_optimize(args: argparse.Namespace) -> int:
     try:
         with _serving_session(campaign, Path(args.artifact_root)) as model_endpoint:
             artifacts = optimize_campaign(
-                runner=KorvidProcessRunner(
-                    campaign=campaign,
-                    timeout_seconds=campaign.bridge_timeout_seconds,
-                    model_endpoint=model_endpoint,
-                ),
+                runner=_build_runner(campaign, model_endpoint=model_endpoint),
                 seed_candidate=candidate,
                 train_cases=train_cases,
                 validation_cases=validation_cases,
@@ -409,6 +427,21 @@ def command_publish(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_korvid_baseline(args: argparse.Namespace) -> int:
+    try:
+        candidate = build_baseline_candidate(args.profile)
+        write_baseline_candidate(candidate, args.output)
+    except (OSError, ValueError, FileExistsError) as exc:
+        print(f"korvid-baseline failed: {exc}", file=_stderr())
+        return 2
+
+    print(
+        f"wrote baseline candidate={candidate.candidate_id} fingerprint={candidate.fingerprint} "
+        f"profile={args.profile} output={args.output}"
+    )
+    return 0
+
+
 def _stderr() -> Any:
     import sys
 
@@ -424,6 +457,22 @@ def _serving_session(campaign: Campaign, workspace_dir: Path) -> Iterator[str | 
         return
     with AKSPortForward(serving, workspace_dir=workspace_dir) as forward:
         yield forward.base_url
+
+
+def _build_runner(campaign: Campaign, *, model_endpoint: str | None) -> KorvidRunner:
+    """Select the evidence-producing runner by campaign.serving.backend.
+
+    korvid_readonly campaigns run entirely against the installed korvid.evals
+    CLI and take no model_endpoint; process/aks_port_forward campaigns keep
+    their existing KorvidProcessRunner construction unchanged.
+    """
+    if isinstance(campaign.serving, KorvidReadonlyServing):
+        return KorvidReadonlyRunner(campaign=campaign)
+    return KorvidProcessRunner(
+        campaign=campaign,
+        timeout_seconds=campaign.bridge_timeout_seconds,
+        model_endpoint=model_endpoint,
+    )
 
 
 def _load_candidate_campaign(
@@ -531,7 +580,7 @@ def _evaluate_campaign(
     candidate: Candidate,
     campaign: Campaign,
     selected_cases: Sequence[EvalCase],
-    runner: KorvidProcessRunner,
+    runner: KorvidRunner,
     artifact_root: Path,
     bundle_kind: str,
     case_sets: Mapping[str, Sequence[str]],

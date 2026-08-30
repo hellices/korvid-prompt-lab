@@ -165,6 +165,7 @@ def _roll_to_second_tier(
                 pass_at_3=0.5,
                 pass_at_5=0.5,
             ),
+            search_improved=True,
         ),
         now,
     )
@@ -187,6 +188,7 @@ def _roll_to_second_tier(
                     pass_at_3=0.0,
                     pass_at_5=0.0,
                 ),
+                search_improved=False,
             ),
             now,
         )

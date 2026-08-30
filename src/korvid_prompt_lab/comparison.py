@@ -28,6 +28,7 @@ class EvaluationContract:
     models: tuple[str, ...]
     case_repetitions: tuple[tuple[str, str, int], ...]
     execution_modes: tuple[str, ...]
+    evidence_sources: tuple[tuple[str, str, int, str, str, str], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +40,20 @@ class EvaluationSnapshot:
     pass_at_5: float | None
     systemic_failures: int
     hard_failure_counts: tuple[tuple[str, int], ...]
+    run_evidence: tuple[
+        tuple[
+            str,
+            str,
+            int,
+            str,
+            float | None,
+            float | None,
+            float | None,
+            tuple[str, ...],
+            str,
+        ],
+        ...,
+    ]
 
     @classmethod
     def from_report(cls, report: RoundReport) -> EvaluationSnapshot:
@@ -55,6 +70,7 @@ class EvaluationSnapshot:
                 execution_modes=tuple(
                     sorted({run.execution_mode for run in report.runs})
                 ),
+                evidence_sources=report.evidence_sources,
             ),
             candidate_fingerprint=report.candidate_fingerprint,
             aggregate_score=report.aggregate_score,
@@ -62,6 +78,22 @@ class EvaluationSnapshot:
             pass_at_5=report.pass_at_5,
             systemic_failures=report.systemic_failures,
             hard_failure_counts=tuple(sorted(report.hard_failure_counts.items())),
+            run_evidence=tuple(
+                sorted(
+                    (
+                        run.case_id,
+                        run.model,
+                        run.repetition,
+                        run.status,
+                        run.completion,
+                        run.verification,
+                        run.efficiency,
+                        run.hard_failures,
+                        run.execution_mode,
+                    )
+                    for run in report.runs
+                )
+            ),
         )
 
 
@@ -347,8 +379,9 @@ def render_single_evaluation_markdown(report: RoundReport) -> str:
 
 
 def comparison_payload(comparison: RoundComparison) -> dict[str, object]:
+    evidence_sources = comparison.contract.evidence_sources
     return {
-        "schema_version": 1,
+        "schema_version": 2 if evidence_sources else 1,
         "status": comparison.status,
         "outcome": comparison.outcome,
         "seed_candidate_fingerprint": comparison.seed_candidate_fingerprint,
@@ -358,6 +391,11 @@ def comparison_payload(comparison: RoundComparison) -> dict[str, object]:
             "models": list(comparison.contract.models),
             "case_repetitions": [list(cr) for cr in comparison.contract.case_repetitions],
             "execution_modes": list(comparison.contract.execution_modes),
+            **(
+                {"evidence_sources": [list(source) for source in evidence_sources]}
+                if evidence_sources
+                else {}
+            ),
         },
         "metrics": [
             {

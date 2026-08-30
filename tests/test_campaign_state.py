@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from korvid_prompt_lab.campaigns import (
     SearchStage,
     advance_state,
     initial_state,
+    max_search_metric_calls,
     next_action,
     state_hash,
 )
@@ -117,6 +119,7 @@ def _run_seeds(ctrl: OptimizationCampaign, state: CampaignState, count: int) -> 
         outcome = AttemptOutcome(
             kind="evidence",
             score=_score(f"candidate-{state.metric_calls_used}-{i}", aggregate=0.1 * (i + 1)),
+            search_improved=True,
         )
         state = advance_state(ctrl, state, action, outcome, LATER)
     return state
@@ -158,7 +161,11 @@ def test_promotes_strictly_better_candidate() -> None:
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
     assert action is not None
-    outcome = AttemptOutcome(kind="evidence", score=_score("better", aggregate=0.9))
+    outcome = AttemptOutcome(
+        kind="evidence",
+        score=_score("better", aggregate=0.9),
+        search_improved=True,
+    )
     advanced = advance_state(ctrl, state, action, outcome, LATER)
     assert advanced.champion_fingerprint == "better"
     assert advanced.stagnation_attempts == 0
@@ -216,13 +223,250 @@ def test_first_search_records_real_score_when_seed_fingerprint_is_unchanged() ->
     assert advanced.stagnation_attempts == 1
 
 
+def test_measured_same_fingerprint_search_refreshes_champion_score() -> None:
+    ctrl = _control()
+    initial = _init(ctrl)
+    state = replace(
+        initial,
+        champion_score=_score(
+            initial.champion_fingerprint,
+            aggregate=0.2,
+            pass_at_3=0.0,
+            pass_at_5=0.0,
+        ),
+        stagnation_attempts=1,
+    )
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+    refreshed = _score(
+        state.champion_fingerprint,
+        aggregate=0.4,
+        pass_at_3=0.0,
+        pass_at_5=0.0,
+    )
+
+    advanced = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(
+            kind="evidence",
+            score=refreshed,
+            search_improved=False,
+        ),
+        LATER,
+    )
+
+    assert advanced.champion_score == refreshed
+
+
+def test_measured_same_fingerprint_systemic_result_keeps_prior_score() -> None:
+    ctrl = _control()
+    initial = _init(ctrl)
+    prior = _score(initial.champion_fingerprint, aggregate=0.4)
+    state = replace(initial, champion_score=prior, stagnation_attempts=1)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+    failed = _score(
+        state.champion_fingerprint,
+        aggregate=0.0,
+        systemic_failures=1,
+    )
+
+    advanced = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(
+            kind="evidence",
+            score=failed,
+            search_improved=False,
+        ),
+        LATER,
+    )
+
+    assert advanced.champion_score == prior
+
+
+def test_unmeasured_changed_regression_requires_incumbent_score() -> None:
+    ctrl = _control()
+    state = _init(ctrl)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+
+    with pytest.raises(ValueError, match="incumbent_score"):
+        advance_state(
+            ctrl,
+            state,
+            action,
+            AttemptOutcome(
+                kind="evidence",
+                score=_score("changed", aggregate=0.1),
+                search_improved=False,
+            ),
+            LATER,
+        )
+
+
+def test_same_fingerprint_cannot_claim_search_improvement() -> None:
+    ctrl = _control()
+    state = _init(ctrl)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+
+    with pytest.raises(ValueError, match="unchanged.*search_improved"):
+        advance_state(
+            ctrl,
+            state,
+            action,
+            AttemptOutcome(
+                kind="evidence",
+                score=_score(state.champion_fingerprint, aggregate=0.4),
+                search_improved=True,
+            ),
+            LATER,
+        )
+
+
+def test_changed_search_promotes_from_fresh_improved_comparison() -> None:
+    ctrl = _control()
+    initial = _init(ctrl)
+    state = replace(
+        initial,
+        champion_score=_score(initial.champion_fingerprint, aggregate=0.9),
+        stagnation_attempts=1,
+    )
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+    candidate = _score("fresh-improvement", aggregate=0.3)
+
+    advanced = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(
+            kind="evidence",
+            score=candidate,
+            search_improved=True,
+        ),
+        LATER,
+    )
+
+    assert advanced.champion_score == candidate
+
+
+def test_changed_search_does_not_promote_fresh_regression() -> None:
+    ctrl = _control()
+    initial = _init(ctrl)
+    state = replace(
+        initial,
+        champion_score=_score(initial.champion_fingerprint, aggregate=0.2),
+        stagnation_attempts=1,
+    )
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+    candidate = _score("fresh-regression", aggregate=0.8)
+
+    advanced = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(
+            kind="evidence",
+            score=candidate,
+            search_improved=False,
+        ),
+        LATER,
+    )
+
+    assert advanced.champion_fingerprint == state.champion_fingerprint
+
+
+def test_first_search_records_incumbent_when_changed_candidate_does_not_improve() -> None:
+    ctrl = _control()
+    state = _init(ctrl)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+    changed = _score("changed", aggregate=0.01)
+    incumbent = _score(
+        state.champion_fingerprint,
+        aggregate=0.4,
+        pass_at_3=0.0,
+        pass_at_5=0.0,
+    )
+
+    advanced = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(
+            kind="evidence",
+            score=changed,
+            search_improved=False,
+            incumbent_score=incumbent,
+        ),
+        LATER,
+    )
+
+    assert advanced.champion_score == incumbent
+    assert advanced.stagnation_attempts == 1
+
+
+def test_first_search_requires_comparison_signal() -> None:
+    ctrl = _control()
+    state = _init(ctrl)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+
+    with pytest.raises(ValueError, match="search_improved"):
+        advance_state(
+            ctrl,
+            state,
+            action,
+            AttemptOutcome(kind="evidence", score=_score("changed")),
+            LATER,
+        )
+
+
+def test_first_search_records_systemic_same_seed_measurement() -> None:
+    ctrl = _control()
+    state = _init(ctrl)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+    measured = _score(
+        SEED_FINGERPRINT,
+        aggregate=0.0,
+        systemic_failures=1,
+    )
+
+    advanced = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(
+            kind="evidence",
+            score=measured,
+            search_improved=False,
+        ),
+        LATER,
+    )
+
+    assert advanced.champion_score == measured
+
+
 def test_systemic_search_never_promoted() -> None:
     """systemic_failures > 0 is never promotable."""
     ctrl = _control()
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
     assert action is not None
-    outcome = AttemptOutcome(kind="evidence", score=_score("systemic-candidate", aggregate=0.99, systemic_failures=1))
+    outcome = AttemptOutcome(
+        kind="evidence",
+        score=_score(
+            SEED_FINGERPRINT, aggregate=0.99, systemic_failures=1
+        ),
+        search_improved=False,
+    )
     advanced = advance_state(ctrl, state, action, outcome, LATER)
     assert advanced.champion_fingerprint == state.champion_fingerprint
     assert advanced.stagnation_attempts == 1
@@ -233,7 +477,17 @@ def test_equal_core_scores_never_promote() -> None:
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
     assert action is not None
-    outcome = AttemptOutcome(kind="evidence", score=_score("aaa", aggregate=0.0, pass_at_3=0.0, pass_at_5=0.0, systemic_failures=0))
+    outcome = AttemptOutcome(
+        kind="evidence",
+        score=_score(
+            SEED_FINGERPRINT,
+            aggregate=0.0,
+            pass_at_3=0.0,
+            pass_at_5=0.0,
+            systemic_failures=0,
+        ),
+        search_improved=False,
+    )
     advanced = advance_state(ctrl, state, action, outcome, LATER)
     assert advanced.champion_fingerprint == state.champion_fingerprint
 
@@ -264,6 +518,7 @@ def test_rejects_hard_safety_regression() -> None:
         AttemptOutcome(
             kind="evidence",
             score=_score("regressor", aggregate=0.99, hard_safety_failures=2),
+            search_improved=False,
         ),
         LATER + timedelta(minutes=5),
     )
@@ -276,7 +531,13 @@ def test_rejects_core_regression() -> None:
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
     assert action is not None
-    outcome = AttemptOutcome(kind="evidence", score=_score("regressor", aggregate=0.99, core_regression=True))
+    outcome = AttemptOutcome(
+        kind="evidence",
+        score=_score(
+            SEED_FINGERPRINT, aggregate=0.99, core_regression=True
+        ),
+        search_improved=False,
+    )
     advanced = advance_state(ctrl, state, action, outcome, LATER)
     assert advanced.champion_fingerprint == state.champion_fingerprint
 
@@ -284,7 +545,7 @@ def test_rejects_core_regression() -> None:
 # --- System error ---
 
 
-def test_system_error_does_not_consume_budget() -> None:
+def test_search_system_error_uses_retry_budget_not_metric_budget() -> None:
     ctrl = _control()
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
@@ -294,6 +555,87 @@ def test_system_error_does_not_consume_budget() -> None:
     assert advanced.metric_calls_used == 0
     assert advanced.retries_used == 1
     assert advanced.status is CampaignStatus.RUNNING
+
+
+def test_search_system_error_retry_is_not_blocked_by_metric_budget() -> None:
+    ctrl = _control(
+        stages=(
+            SearchStage(name="first", metric_calls=5, seeds=(0,)),
+            SearchStage(name="second", metric_calls=1, seeds=(1,)),
+        ),
+        total_metric_call_limit=12,
+    )
+    state = _init(ctrl)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+
+    advanced = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(kind="system_error", error_message="race"),
+        LATER,
+    )
+
+    assert advanced.status is CampaignStatus.RUNNING
+    assert advanced.stop_reason is None
+    assert next_action(ctrl, advanced, LATER) is not None
+
+
+def test_search_retry_records_initial_incumbent_measurement() -> None:
+    ctrl = _control(total_metric_call_limit=100)
+    state = _init(ctrl)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+    retry_state = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(kind="system_error", error_message="race"),
+        LATER,
+    )
+    retry_action = next_action(ctrl, retry_state, LATER)
+    assert retry_action is not None
+    measured = _score(
+        SEED_FINGERPRINT,
+        aggregate=0.2,
+        hard_safety_failures=3,
+        pass_at_3=0.0,
+        pass_at_5=0.0,
+    )
+
+    advanced = advance_state(
+        ctrl,
+        retry_state,
+        retry_action,
+        AttemptOutcome(
+            kind="evidence",
+            score=measured,
+            search_improved=False,
+        ),
+        LATER,
+    )
+
+    assert advanced.champion_score == measured
+
+
+def test_search_evidence_ignores_underreported_metric_usage() -> None:
+    ctrl = _control()
+    state = _init(ctrl)
+    action = next_action(ctrl, state, NOW)
+    assert action is not None
+    outcome = AttemptOutcome(
+        kind="evidence",
+        metric_calls_used=1,
+        score=_score("candidate", aggregate=0.5),
+        search_improved=True,
+    )
+
+    advanced = advance_state(ctrl, state, action, outcome, LATER)
+
+    assert advanced.metric_calls_used == max_search_metric_calls(
+        ctrl, action.metric_calls
+    )
 
 
 def test_retry_exhaustion_terminates() -> None:
@@ -357,7 +699,11 @@ def test_retry_counter_resets_after_valid_evidence() -> None:
         ctrl,
         s1,
         evidence_action,
-        AttemptOutcome(kind="evidence", score=_score("candidate-a", aggregate=0.7)),
+        AttemptOutcome(
+            kind="evidence",
+            score=_score("candidate-a", aggregate=0.7),
+            search_improved=True,
+        ),
         LATER,
     )
     assert s2.status is CampaignStatus.RUNNING
@@ -418,10 +764,11 @@ def test_exact_metric_accounting() -> None:
             kind="evidence",
             score=_score("a", aggregate=0.2),
             metric_calls_used=7,
+            search_improved=True,
         ),
         LATER,
     )
-    assert state.metric_calls_used == 7
+    assert state.metric_calls_used == 8
     action = next_action(ctrl, state, NOW)
     assert action is not None and action.metric_calls == 10
     state = advance_state(
@@ -432,10 +779,11 @@ def test_exact_metric_accounting() -> None:
             kind="evidence",
             score=_score("b", aggregate=0.3),
             metric_calls_used=13,
+            search_improved=True,
         ),
         LATER,
     )
-    assert state.metric_calls_used == 20
+    assert state.metric_calls_used == 21
 
 
 def test_total_call_limit_terminates() -> None:
@@ -454,6 +802,7 @@ def test_total_call_limit_terminates() -> None:
             kind="evidence",
             score=_score("c1", aggregate=0.1),
             metric_calls_used=15,
+            search_improved=True,
         ),
         LATER,
     )
@@ -480,13 +829,14 @@ def test_remaining_budget_below_next_gepa_bound_terminates() -> None:
             kind="evidence",
             score=_score("a", aggregate=0.2),
             metric_calls_used=7,
+            search_improved=True,
         ),
         LATER,
     )
 
     assert terminal.status is CampaignStatus.NOT_CONVERGED
     assert terminal.stop_reason == "total_metric_call_limit"
-    assert terminal.metric_calls_used == 7
+    assert terminal.metric_calls_used == 8
     assert next_action(ctrl, terminal, LATER) is None
 
 
@@ -519,7 +869,11 @@ def test_stagnation_non_final_tier_rolls_over() -> None:
     for _ in range(2):
         action = next_action(ctrl, state, NOW)
         assert action is not None
-        outcome = AttemptOutcome(kind="evidence", score=_score(state.champion_fingerprint, aggregate=0.0))
+        outcome = AttemptOutcome(
+            kind="evidence",
+            score=_score(state.champion_fingerprint, aggregate=0.0),
+            search_improved=False,
+        )
         state = advance_state(ctrl, state, action, outcome, LATER)
     # Rolled to tier 1
     assert state.status is CampaignStatus.RUNNING
@@ -536,7 +890,11 @@ def test_stagnation_final_tier_terminates() -> None:
     for _ in range(2):
         action = next_action(ctrl, state, NOW)
         assert action is not None
-        outcome = AttemptOutcome(kind="evidence", score=_score(state.champion_fingerprint, aggregate=0.0))
+        outcome = AttemptOutcome(
+            kind="evidence",
+            score=_score(state.champion_fingerprint, aggregate=0.0),
+            search_improved=False,
+        )
         state = advance_state(ctrl, state, action, outcome, LATER)
     assert state.status is CampaignStatus.NOT_CONVERGED
 
@@ -563,6 +921,7 @@ def _stagnate_to_tier_roll(
         assert action is not None
         outcome = AttemptOutcome(
             kind="evidence", score=_score(state.champion_fingerprint, aggregate=0.0),
+            search_improved=False,
         )
         state = advance_state(ctrl, state, action, outcome, now)
     return state
@@ -570,7 +929,7 @@ def _stagnate_to_tier_roll(
 
 def test_tier_roll_without_metric_budget_terminates_not_converged() -> None:
     """A next tier that cannot afford one legal action must not start RUNNING."""
-    ctrl = _two_tier_control(total_metric_call_limit=38)
+    ctrl = _two_tier_control(total_metric_call_limit=44)
     state = _stagnate_to_tier_roll(ctrl, _init(ctrl))
 
     assert state.status is CampaignStatus.NOT_CONVERGED
@@ -580,12 +939,41 @@ def test_tier_roll_without_metric_budget_terminates_not_converged() -> None:
 
 def test_tier_roll_with_exact_metric_budget_still_rolls() -> None:
     """Budget that exactly covers the next tier's first action still rolls."""
-    ctrl = _two_tier_control(total_metric_call_limit=39)
+    ctrl = _two_tier_control(total_metric_call_limit=45)
     state = _stagnate_to_tier_roll(ctrl, _init(ctrl))
 
     assert state.status is CampaignStatus.RUNNING
     assert state.tier_index == 1
     assert next_action(ctrl, state, LATER) is not None
+
+
+def test_next_tier_records_first_unchanged_seed_measurement() -> None:
+    ctrl = _two_tier_control(total_metric_call_limit=100)
+    tier_state = _stagnate_to_tier_roll(ctrl, _init(ctrl))
+    assert tier_state.tier_index == 1
+    action = next_action(ctrl, tier_state, LATER)
+    assert action is not None
+    measured = _score(
+        tier_state.seed_candidate_fingerprint,
+        aggregate=0.3,
+        hard_safety_failures=2,
+        pass_at_3=0.0,
+        pass_at_5=0.0,
+    )
+
+    advanced = advance_state(
+        ctrl,
+        tier_state,
+        action,
+        AttemptOutcome(
+            kind="evidence",
+            score=measured,
+            search_improved=False,
+        ),
+        LATER,
+    )
+
+    assert advanced.champion_score == measured
 
 
 def test_tier_roll_without_wall_clock_budget_terminates_not_converged() -> None:
@@ -607,7 +995,17 @@ def test_stale_action_replay() -> None:
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
     assert action is not None
-    advanced = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_score("c1", aggregate=0.5)), LATER)
+    advanced = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(
+            kind="evidence",
+            score=_score("c1", aggregate=0.5),
+            search_improved=True,
+        ),
+        LATER,
+    )
     with pytest.raises(ValueError, match="stale|state_hash"):
         advance_state(ctrl, advanced, action, AttemptOutcome(kind="evidence", score=_score("c1", aggregate=0.5)), LATER)
 
@@ -793,7 +1191,11 @@ def test_model_identity_rollover() -> None:
     state = _init(ctrl)
     action = next_action(ctrl, state, NOW)
     assert action is not None
-    outcome = AttemptOutcome(kind="evidence", score=_score(state.champion_fingerprint))
+    outcome = AttemptOutcome(
+        kind="evidence",
+        score=_score(state.champion_fingerprint),
+        search_improved=False,
+    )
     state = advance_state(ctrl, state, action, outcome, LATER)
     # Rolled to tier 1
     assert state.tier_index == 1
@@ -845,7 +1247,17 @@ def test_state_hash_changes_on_advance() -> None:
     h1 = state_hash(state)
     action = next_action(ctrl, state, NOW)
     assert action is not None
-    s2 = advance_state(ctrl, state, action, AttemptOutcome(kind="evidence", score=_score("new", aggregate=0.9)), LATER)
+    s2 = advance_state(
+        ctrl,
+        state,
+        action,
+        AttemptOutcome(
+            kind="evidence",
+            score=_score("new", aggregate=0.9),
+            search_improved=True,
+        ),
+        LATER,
+    )
     assert state_hash(s2) != h1
 
 
@@ -916,7 +1328,11 @@ def test_tier_roll_seeds_the_next_tier_with_the_real_seed_fingerprint() -> None:
         ctrl,
         state,
         action,
-        AttemptOutcome(kind="evidence", score=_score("c" * 64, aggregate=0.9)),
+        AttemptOutcome(
+            kind="evidence",
+            score=_score("c" * 64, aggregate=0.9),
+            search_improved=True,
+        ),
         LATER,
     )
     assert state.champion_fingerprint == "c" * 64

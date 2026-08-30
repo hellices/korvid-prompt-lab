@@ -147,13 +147,22 @@ class AKSPortForwardServing:
 
 
 @dataclass(frozen=True, slots=True)
+class KorvidReadonlyServing:
+    backend: str
+    provider: str
+    base_url: str
+    profile: str
+    timeout_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
 class Campaign:
     schema_version: int
     campaign_id: str
     repetitions: int
     models: tuple[str, ...]
     cases: tuple[EvalCase, ...]
-    serving: ProcessServing | AKSPortForwardServing
+    serving: ProcessServing | AKSPortForwardServing | KorvidReadonlyServing
     bridge_timeout_seconds: float = DEFAULT_BRIDGE_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:

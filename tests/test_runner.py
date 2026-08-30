@@ -17,8 +17,10 @@ from korvid_prompt_lab.contracts import (
     Campaign,
     Candidate,
     EvalCase,
+    KorvidReadonlyServing,
     ProcessServing,
 )
+from korvid_prompt_lab.korvid_readonly import KorvidReadonlyRunner
 from korvid_prompt_lab.runner import (
     BRIDGE_TIMEOUT_ENV,
     LAUNCHER_TEARDOWN_RESERVATION_SECONDS,
@@ -35,6 +37,7 @@ from korvid_prompt_lab.runner import (
     BridgeSystemError,
     BridgeTimeoutError,
     KorvidProcessRunner,
+    KorvidRunner,
     launcher_timeout_seconds,
 )
 
@@ -812,3 +815,51 @@ def test_runner_timeout_kills_a_stubborn_worker_behind_the_real_launcher(
     assert _await_process_exit(descendants) == dict.fromkeys(descendants, False)
     assert time.monotonic() - started < late_write_after
     assert not (run_dir / "response.json").exists()
+
+
+def _accepts_korvid_runner(runner: KorvidRunner) -> Campaign:
+    return runner.campaign
+
+
+def test_process_and_readonly_runners_satisfy_the_shared_korvid_runner_protocol() -> None:
+    """adapter/optimizer/CLI code selects a concrete runner by campaign.serving.backend
+    and afterwards only ever depends on the shared `KorvidRunner` shape (a `campaign`
+    attribute plus `run()`), so both concrete runners must satisfy it structurally
+    without any special-casing upstream."""
+    process_case = _case("case-1")
+    process_campaign = Campaign(
+        schema_version=1,
+        campaign_id="campaign-process",
+        repetitions=1,
+        models=("mock-small",),
+        cases=(process_case,),
+        serving=ProcessServing(backend="process", command=(sys.executable, "-c", "pass")),
+    )
+    process_runner = KorvidProcessRunner(process_campaign, timeout_seconds=1.0)
+
+    readonly_case = EvalCase(
+        case_id="oom-killed",
+        template_id="template-1",
+        prompt="Why does the worker pod in namespace jobs keep dying?",
+        models=("mock-small",),
+    )
+    readonly_campaign = Campaign(
+        schema_version=1,
+        campaign_id="campaign-readonly",
+        repetitions=1,
+        models=("mock-small",),
+        cases=(readonly_case,),
+        serving=KorvidReadonlyServing(
+            backend="korvid_readonly",
+            provider="openai-compat",
+            base_url="http://127.0.0.1:41001/v1",
+            profile="small",
+            timeout_seconds=160.0,
+        ),
+    )
+    readonly_runner = KorvidReadonlyRunner(readonly_campaign)
+
+    assert isinstance(process_runner, KorvidRunner)
+    assert isinstance(readonly_runner, KorvidRunner)
+    assert _accepts_korvid_runner(process_runner) is process_runner.campaign
+    assert _accepts_korvid_runner(readonly_runner) is readonly_runner.campaign

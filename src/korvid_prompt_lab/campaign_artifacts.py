@@ -1,9 +1,10 @@
 """Safe campaign evidence ingestion and artifact rendering.
 
 This module forms the trust boundary between Grounding safe-evidence packages
-and the pure campaign state machine. It reads only allowlisted top-level
-summary files, never traverses symlinks or touches responses/, raw answers,
-requests, audit journals, optimizer state, or reflection transcripts.
+and the pure campaign state machine. It reads allowlisted top-level summaries
+and only the identity/provenance fields of explicitly referenced, redacted
+responses. It never traverses symlinks or touches raw answers, requests, audit
+journals, optimizer state, or reflection transcripts.
 """
 
 from __future__ import annotations
@@ -13,7 +14,10 @@ import json
 import math
 import os
 import re
+import stat
 import uuid
+from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -23,14 +27,17 @@ import yaml  # type: ignore[import-untyped]
 from .campaigns import (
     ActionKind,
     CampaignAction,
+    CampaignScore,
     CampaignState,
     CampaignStatus,
     OptimizationCampaign,
+    _has_unmeasured_incumbent,
     max_search_metric_calls,
     next_action,
     state_hash,
 )
 from .contracts import Candidate
+from .scoring import RepetitionOutcome, pass_hat_k
 
 #: Files the safe ingestion layer is allowed to read from a round evidence package.
 _ALLOWED_FILES = frozenset({
@@ -39,6 +46,7 @@ _ALLOWED_FILES = frozenset({
     "comparison-summary.json",
     "optimization-summary.json",
     "best-candidate.yaml",
+    "before-evaluation-summary.json",
 })
 
 #: Every top-level file `write_safe_evidence` is allowed to emit.
@@ -175,7 +183,7 @@ _RUN_IDENTITY_REQUIRED_KEYS = frozenset({
     "proposal_source",
 })
 
-_ROUND_SUMMARY_REQUIRED_KEYS = frozenset({
+_ROUND_SUMMARY_V1_KEYS = frozenset({
     "schema_version",
     "campaign_id",
     "candidate_id",
@@ -199,6 +207,10 @@ _ROUND_SUMMARY_REQUIRED_KEYS = frozenset({
     "reproduction_command",
     "campaign_action_id",
 })
+_ROUND_SUMMARY_V2_KEYS = _ROUND_SUMMARY_V1_KEYS | {
+    "evaluation_backend",
+    "evidence_sources",
+}
 
 _EVAL_SUMMARY_REQUIRED_KEYS = frozenset({
     "bundle_kind",
@@ -239,12 +251,15 @@ _COMPARISON_SUMMARY_REQUIRED_KEYS = frozenset({
     "not_comparable_count",
 })
 
-_COMPARISON_CONTRACT_REQUIRED_KEYS = frozenset({
+_COMPARISON_CONTRACT_V1_KEYS = frozenset({
     "campaign_id",
     "models",
     "case_repetitions",
     "execution_modes",
 })
+_COMPARISON_CONTRACT_V2_KEYS = _COMPARISON_CONTRACT_V1_KEYS | {
+    "evidence_sources"
+}
 
 _COMPARISON_METRIC_REQUIRED_KEYS = frozenset({
     "key",
@@ -255,6 +270,80 @@ _COMPARISON_METRIC_REQUIRED_KEYS = frozenset({
     "result",
     "integer",
     "core",
+})
+_COMPARISON_CORE_METRICS = {
+    "aggregate_score": (False, False),
+    "pass_at_3": (False, False),
+    "pass_at_5": (False, False),
+    "hard_safety_failures": (True, True),
+    "systemic_failures": (True, True),
+}
+_MAX_SAFE_RESPONSE_BYTES = 64 * 1024
+_MAX_SAFE_TOP_LEVEL_BYTES = 1024 * 1024
+_PROJECTED_RESPONSE_KEYS = frozenset({
+    "protocol_version",
+    "status",
+    "execution_mode",
+    "candidate_fingerprint",
+    "request_identity",
+    "evidence_source",
+    "grade",
+    "answer",
+    "journal",
+    "usage",
+    "error",
+})
+_PROJECTED_PROCESS_RESPONSE_KEYS = _PROJECTED_RESPONSE_KEYS - {"evidence_source"}
+_PROJECTED_IDENTITY_KEYS = frozenset({
+    "case_id",
+    "template_id",
+    "model",
+    "repetition",
+    "seed",
+    "seed_applied",
+})
+_PROJECTED_PROCESS_IDENTITY_KEYS = _PROJECTED_IDENTITY_KEYS - {"seed_applied"}
+_PROJECTED_SOURCE_KEYS = frozenset({
+    "kind",
+    "korvid_version",
+    "scenario_sha256",
+})
+_PROJECTED_GRADE_KEYS = frozenset({
+    "completion",
+    "verification",
+    "efficiency",
+    "hard_failures",
+})
+_PROJECTED_COMPLETED_JOURNAL_KEYS = frozenset({
+    "journey_id",
+    "checkpoints",
+    "missing_checkpoints",
+    "checkpoint_counts",
+    "journal_event_count",
+    "audit_record_count",
+    "hard_failure_count",
+})
+_PROJECTED_FAILURE_JOURNAL_KEYS = frozenset({
+    "checkpoints",
+    "checkpoint_counts",
+})
+_PROJECTED_COMPLETED_USAGE_KEYS = frozenset({
+    "tool_calls",
+    "iterations",
+    "wall_time_seconds",
+})
+_ROUND_RUN_KEYS = frozenset({
+    "run_id",
+    "case_id",
+    "model",
+    "repetition",
+    "status",
+    "completion",
+    "verification",
+    "efficiency",
+    "elapsed_seconds",
+    "hard_failures",
+    "execution_mode",
 })
 
 
@@ -408,6 +497,11 @@ def _validate_comparison_summary(
     round_summary: dict[str, Any],
     eval_summary: dict[str, Any],
     expected_case_ids: tuple[str, ...],
+    evaluation_backend: str,
+    expected_evidence_sources: tuple[
+        tuple[str, str, int, str, str, str], ...
+    ],
+    before_evaluation_summary: Mapping[str, Any] | None,
 ) -> bool:
     """Validate a comparison summary and return its derived core-regression flag."""
     _ensure_exact_keys(
@@ -415,11 +509,18 @@ def _validate_comparison_summary(
         _COMPARISON_SUMMARY_REQUIRED_KEYS,
         "comparison-summary",
     )
-    if _require_positive_int(
+    schema_version = _require_positive_int(
         comparison_summary.get("schema_version"),
         "comparison-summary.schema_version",
-    ) != 1:
-        raise ValueError("comparison-summary.schema_version must be 1")
+    )
+    if schema_version not in {1, 2}:
+        raise ValueError("comparison-summary.schema_version must be 1 or 2")
+    expected_schema_version = 2 if evaluation_backend == "korvid_readonly" else 1
+    if schema_version != expected_schema_version:
+        raise ValueError(
+            "comparison-summary.schema_version must be "
+            f"{expected_schema_version} for {evaluation_backend} evaluation"
+        )
 
     status = _require_str(comparison_summary.get("status"), "comparison-summary.status")
     if status not in {"changed", "unchanged"}:
@@ -459,9 +560,26 @@ def _validate_comparison_summary(
     )
     if comparison_best != round_candidate_fingerprint or comparison_best != eval_candidate_fingerprint:
         raise ValueError("comparison-summary.best_candidate_fingerprint mismatch")
+    expected_status = (
+        "unchanged" if comparison_seed == comparison_best else "changed"
+    )
+    if status != expected_status:
+        raise ValueError(
+            "comparison-summary.status does not match candidate fingerprints"
+        )
 
-    contract = _require_mapping(comparison_summary.get("contract"), "comparison-summary.contract")
-    _ensure_exact_keys(contract, _COMPARISON_CONTRACT_REQUIRED_KEYS, "comparison-summary.contract")
+    contract = _require_mapping(
+        comparison_summary.get("contract"), "comparison-summary.contract"
+    )
+    _ensure_exact_keys(
+        contract,
+        (
+            _COMPARISON_CONTRACT_V2_KEYS
+            if schema_version == 2
+            else _COMPARISON_CONTRACT_V1_KEYS
+        ),
+        "comparison-summary.contract",
+    )
     contract_campaign_id = _require_str(
         contract.get("campaign_id"),
         "comparison-summary.contract.campaign_id",
@@ -544,10 +662,99 @@ def _validate_comparison_summary(
             "comparison-summary.contract.execution_modes must contain exactly 'live'"
         )
 
+    comparison_evidence_sources = _validate_evidence_sources(
+        contract.get("evidence_sources") if schema_version == 2 else [],
+        expected_triplets=expected_triplets,
+        context="comparison-summary.contract.evidence_sources",
+        required=schema_version == 2,
+    )
+    if comparison_evidence_sources != expected_evidence_sources:
+        raise ValueError(
+            "comparison provenance does not match round-summary provenance"
+        )
+
     metrics = comparison_summary.get("metrics")
     if not isinstance(metrics, list):
         raise ValueError("comparison-summary.metrics must be a list")  # noqa: TRY004
     core_results: list[str] = []
+    metric_keys: set[str] = set()
+    result_counts: Counter[str] = Counter()
+    before_summary = before_evaluation_summary
+    expected_core_values: dict[str, tuple[float | int, float | int]] = {
+        "aggregate_score": (
+            (
+                state.champion_score.aggregate
+                if before_summary is None
+                else _require_finite_float(
+                    before_summary.get("aggregate_score"),
+                    "before-evaluation-summary.aggregate_score",
+                )
+            ),
+            _require_finite_float(
+                round_summary.get("aggregate_score"),
+                "round-summary.aggregate_score",
+            ),
+        ),
+        "pass_at_3": (
+            (
+                state.champion_score.pass_at_3
+                if before_summary is None
+                else _require_finite_float(
+                    before_summary.get("pass_at_3"),
+                    "before-evaluation-summary.pass_at_3",
+                )
+            ),
+            _require_finite_float(
+                eval_summary.get("pass_at_3"), "evaluation-summary.pass_at_3"
+            ),
+        ),
+        "pass_at_5": (
+            (
+                state.champion_score.pass_at_5
+                if before_summary is None
+                else _require_finite_float(
+                    before_summary.get("pass_at_5"),
+                    "before-evaluation-summary.pass_at_5",
+                )
+            ),
+            _require_finite_float(
+                eval_summary.get("pass_at_5"), "evaluation-summary.pass_at_5"
+            ),
+        ),
+        "hard_safety_failures": (
+            (
+                state.champion_score.hard_safety_failures
+                if before_summary is None
+                else _require_non_negative_int(
+                    before_summary.get("hard_safety_failures"),
+                    "before-evaluation-summary.hard_safety_failures",
+                )
+            ),
+            _require_non_negative_int(
+                eval_summary.get("hard_safety_failures"),
+                "evaluation-summary.hard_safety_failures",
+            ),
+        ),
+        "systemic_failures": (
+            (
+                state.champion_score.systemic_failures
+                if before_summary is None
+                else _require_non_negative_int(
+                    before_summary.get("systemic_failures"),
+                    "before-evaluation-summary.systemic_failures",
+                )
+            ),
+            _require_non_negative_int(
+                eval_summary.get("systemic_failures"),
+                "evaluation-summary.systemic_failures",
+            ),
+        ),
+    }
+    if status == "unchanged":
+        expected_core_values = {
+            key: (after_value, after_value)
+            for key, (_before_value, after_value) in expected_core_values.items()
+        }
     for index, metric in enumerate(metrics):
         metric_mapping = _require_mapping(metric, f"comparison-summary.metrics[{index}]")
         _ensure_exact_keys(
@@ -555,7 +762,12 @@ def _validate_comparison_summary(
             _COMPARISON_METRIC_REQUIRED_KEYS,
             f"comparison-summary.metrics[{index}]",
         )
-        _require_str(metric_mapping.get("key"), f"comparison-summary.metrics[{index}].key")
+        key = _require_str(
+            metric_mapping.get("key"), f"comparison-summary.metrics[{index}].key"
+        )
+        if key in metric_keys:
+            raise ValueError(f"comparison-summary.metrics[{index}].key is duplicate")
+        metric_keys.add(key)
         _require_str(metric_mapping.get("label"), f"comparison-summary.metrics[{index}].label")
         before = metric_mapping.get("before")
         if before is not None:
@@ -571,17 +783,728 @@ def _validate_comparison_summary(
             raise ValueError(
                 f"comparison-summary.metrics[{index}].result must be a comparison result"
             )
-        _require_bool(metric_mapping.get("integer"), f"comparison-summary.metrics[{index}].integer")
+        integer = _require_bool(
+            metric_mapping.get("integer"),
+            f"comparison-summary.metrics[{index}].integer",
+        )
         is_core = _require_bool(
             metric_mapping.get("core"), f"comparison-summary.metrics[{index}].core"
         )
+        if key in _COMPARISON_CORE_METRICS:
+            expected_integer, lower_is_better = _COMPARISON_CORE_METRICS[key]
+            if not is_core or integer != expected_integer:
+                raise ValueError(
+                    f"comparison-summary metric {key!r} has invalid schema flags"
+                )
+            expected_before, expected_after = expected_core_values[key]
+            before_mismatch = (
+                not (
+                    _has_unmeasured_incumbent(state)
+                    and before_evaluation_summary is None
+                )
+                and before != expected_before
+            )
+            if before_mismatch:
+                raise ValueError(
+                    f"comparison-summary metric {key!r} does not match before evidence"
+                )
+            if after != expected_after:
+                raise ValueError(
+                    f"comparison-summary metric {key!r} does not match evidence"
+                )
+        else:
+            lower_is_better = True
+            if is_core or not integer:
+                raise ValueError(
+                    f"comparison-summary metric {key!r} has invalid failure schema"
+                )
+        if before is None or after is None:
+            if delta is not None or result != "not_comparable":
+                raise ValueError(
+                    f"comparison-summary metric {key!r} has inconsistent null values"
+                )
+        else:
+            expected_delta = after - before
+            if delta is None or not math.isclose(
+                float(delta), float(expected_delta), rel_tol=0.0, abs_tol=1e-12
+            ):
+                raise ValueError(
+                    f"comparison-summary metric {key!r} has inconsistent delta"
+                )
+            expected_result = (
+                "unchanged"
+                if expected_delta == 0
+                else (
+                    "improved"
+                    if (expected_delta < 0 if lower_is_better else expected_delta > 0)
+                    else "regressed"
+                )
+            )
+            if result != expected_result:
+                raise ValueError(
+                    f"comparison-summary metric {key!r} has inconsistent result"
+                )
+        result_counts[result] += 1
         if is_core and result != "not_comparable":
             core_results.append(result)
 
-    for key in ("improved_count", "unchanged_count", "regressed_count", "not_comparable_count"):
-        _require_non_negative_int(comparison_summary.get(key), f"comparison-summary.{key}")
+    if schema_version == 2 and set(_COMPARISON_CORE_METRICS) - metric_keys:
+        raise ValueError("comparison-summary.metrics missing required core metrics")
+    for result_name in (
+        "improved",
+        "unchanged",
+        "regressed",
+        "not_comparable",
+    ):
+        count_key = f"{result_name}_count"
+        declared_count = _require_non_negative_int(
+            comparison_summary.get(count_key), f"comparison-summary.{count_key}"
+        )
+        if declared_count != result_counts[result_name]:
+            raise ValueError(
+                f"comparison-summary.{count_key} does not match metrics"
+            )
 
     return _derive_core_regression(status=status, outcome=outcome, core_results=core_results)
+
+
+def _validate_evidence_sources(
+    value: Any,
+    *,
+    expected_triplets: list[tuple[str, str, int]],
+    context: str,
+    required: bool,
+) -> tuple[tuple[str, str, int, str, str, str], ...]:
+    if not isinstance(value, list) or (required and not value):
+        requirement = "a non-empty list" if required else "a list"
+        raise ValueError(f"{context} must be {requirement}")
+    source_triplets: set[tuple[str, str, int]] = set()
+    canonical_sources: list[tuple[str, str, int, str, str, str]] = []
+    for index, entry in enumerate(value):
+        entry_context = f"{context}[{index}]"
+        if not isinstance(entry, list) or len(entry) != 6:
+            raise ValueError(
+                f"{entry_context} must be [case_id, model, repetition, kind, "
+                "korvid_version, scenario_sha256]"
+            )
+        case_id = _require_str(entry[0], f"{entry_context}[0]")
+        model = _require_str(entry[1], f"{entry_context}[1]")
+        repetition = _require_positive_int(entry[2], f"{entry_context}[2]")
+        triplet = (case_id, model, repetition)
+        if triplet not in expected_triplets or triplet in source_triplets:
+            raise ValueError(
+                f"{entry_context} has an unexpected or duplicate run identity"
+            )
+        source_triplets.add(triplet)
+        kind = _require_str(entry[3], f"{entry_context}.kind")
+        if kind != "korvid_readonly":
+            raise ValueError(f"{entry_context}.kind must be korvid_readonly")
+        korvid_version = _require_str(
+            entry[4], f"{entry_context}.korvid_version"
+        )
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.!+_-]{0,63}", korvid_version) is None:
+            raise ValueError(f"{entry_context}.korvid_version must be canonical")
+        scenario_sha256 = _require_str(
+            entry[5], f"{entry_context}.scenario_sha256"
+        )
+        if re.fullmatch(r"[0-9a-f]{64}", scenario_sha256) is None:
+            raise ValueError(
+                f"{entry_context}.scenario_sha256 must be lowercase SHA-256"
+            )
+        canonical_sources.append(
+            (
+                case_id,
+                model,
+                repetition,
+                kind,
+                korvid_version,
+                scenario_sha256,
+            )
+        )
+    if source_triplets and source_triplets != set(expected_triplets):
+        raise ValueError(f"{context} must cover every run")
+    return tuple(sorted(canonical_sources))
+
+
+def _load_response_evidence_sources(
+    safe_root: Path,
+    refs_value: Any,
+    *,
+    expected_triplets: list[tuple[str, str, int]],
+    expected_candidate_fingerprint: str,
+    expected_root_identity: tuple[int, int],
+    expected_runs: Mapping[
+        tuple[str, str, int],
+        tuple[str, float | None, float | None, float | None, tuple[str, ...], str, float | None],
+    ],
+) -> tuple[tuple[str, str, int, str, str, str], ...]:
+    refs = _require_string_list(
+        refs_value, "round-summary.evaluation_artifact_refs"
+    )
+    response_refs = [
+        ref
+        for ref in refs
+        if len(PurePosixPath(ref).parts) == 2
+        and PurePosixPath(ref).parts[0] == "responses"
+        and PurePosixPath(ref).suffix == ".json"
+    ]
+    if len(response_refs) != len(expected_triplets):
+        raise ValueError(
+            "readonly response provenance requires one referenced response per run"
+        )
+
+    sources: list[list[Any]] = []
+    for ref in response_refs:
+        payload = _read_referenced_response(
+            safe_root, ref, expected_root_identity=expected_root_identity
+        )
+        response = _require_mapping(payload, ref)
+        _validate_projected_response_shape(response, ref, readonly=True)
+        response_candidate = _require_str(
+            response.get("candidate_fingerprint"),
+            f"{ref}.candidate_fingerprint",
+        )
+        if response_candidate != expected_candidate_fingerprint:
+            raise ValueError(f"{ref}.candidate_fingerprint mismatch")
+        identity = _require_mapping(
+            response.get("request_identity"), f"{ref}.request_identity"
+        )
+        source = _require_mapping(
+            response.get("evidence_source"), f"{ref}.evidence_source"
+        )
+        triplet = (
+            _require_str(identity.get("case_id"), f"{ref}.case_id"),
+            _require_str(identity.get("model"), f"{ref}.model"),
+            _require_positive_int(
+                identity.get("repetition"), f"{ref}.repetition"
+            ),
+        )
+        grade = response.get("grade")
+        grade_mapping = grade if isinstance(grade, dict) else None
+        hard_failures = (
+            tuple(grade_mapping["hard_failures"])
+            if grade_mapping is not None
+            else ()
+        )
+        usage = _require_mapping(response.get("usage"), f"{ref}.usage")
+        actual_run = (
+            _require_str(response.get("status"), f"{ref}.status"),
+            grade_mapping.get("completion") if grade_mapping is not None else None,
+            grade_mapping.get("verification") if grade_mapping is not None else None,
+            grade_mapping.get("efficiency") if grade_mapping is not None else None,
+            hard_failures,
+            _require_str(response.get("execution_mode"), f"{ref}.execution_mode"),
+            usage.get("wall_time_seconds"),
+        )
+        if expected_runs.get(triplet) != actual_run:
+            raise ValueError(f"response does not match round-summary run: {ref}")
+        if response.get("answer") != "":
+            raise ValueError(f"{ref}.answer must be redacted")
+        if response.get("error") not in (None, "model_failure"):
+            raise ValueError(f"{ref}.error must be redacted")
+        sources.append(
+            [
+                *triplet,
+                source.get("kind"),
+                source.get("korvid_version"),
+                source.get("scenario_sha256"),
+            ]
+        )
+    return _validate_evidence_sources(
+        sources,
+        expected_triplets=expected_triplets,
+        context="response.evidence_source",
+        required=True,
+    )
+
+
+def _parse_round_runs(
+    value: Any,
+    *,
+    expected_triplets: list[tuple[str, str, int]],
+    aggregate_score: float,
+    status_counts_value: Any,
+    hard_failure_counts_value: Any,
+) -> dict[
+    tuple[str, str, int],
+    tuple[str, float | None, float | None, float | None, tuple[str, ...], str, float | None],
+]:
+    if not isinstance(value, list):
+        raise ValueError("round-summary.runs must be a list")  # noqa: TRY004 - preserve validation API
+    runs: dict[
+        tuple[str, str, int],
+        tuple[str, float | None, float | None, float | None, tuple[str, ...], str, float | None],
+    ] = {}
+    status_counts: Counter[str] = Counter()
+    hard_failure_counts: Counter[str] = Counter()
+    scores: list[float] = []
+    for index, item in enumerate(value):
+        context = f"round-summary.runs[{index}]"
+        run = _require_mapping(item, context)
+        _ensure_exact_keys(run, _ROUND_RUN_KEYS, context)
+        triplet = (
+            _require_str(run.get("case_id"), f"{context}.case_id"),
+            _require_str(run.get("model"), f"{context}.model"),
+            _require_positive_int(
+                run.get("repetition"), f"{context}.repetition"
+            ),
+        )
+        if triplet not in expected_triplets or triplet in runs:
+            raise ValueError(f"{context} has unexpected or duplicate identity")
+        status = _require_str(run.get("status"), f"{context}.status")
+        if status not in {"completed", "model_failure"}:
+            raise ValueError(f"{context}.status is invalid")
+        execution_mode = _require_str(
+            run.get("execution_mode"), f"{context}.execution_mode"
+        )
+        if execution_mode != "live":
+            raise ValueError(f"{context}.execution_mode must be live")
+        raw_failures = run.get("hard_failures")
+        if not isinstance(raw_failures, list):
+            raise ValueError(f"{context}.hard_failures must be a list")  # noqa: TRY004 - preserve validation API
+        hard_failures = tuple(
+            _require_bounded_text(
+                failure, f"{context}.hard_failures[{failure_index}]", max_length=64
+            )
+            for failure_index, failure in enumerate(raw_failures)
+        )
+        completion: float | None
+        verification: float | None
+        efficiency: float | None
+        elapsed: float | None
+        if status == "completed":
+            completion = _require_projected_metric(
+                run.get("completion"), f"{context}.completion"
+            )
+            verification = _require_projected_metric(
+                run.get("verification"), f"{context}.verification"
+            )
+            efficiency = _require_projected_metric(
+                run.get("efficiency"), f"{context}.efficiency"
+            )
+            elapsed = _require_projected_duration(
+                run.get("elapsed_seconds"), f"{context}.elapsed_seconds"
+            )
+            scores.append(
+                0.0
+                if hard_failures
+                else 0.6 * completion + 0.3 * verification + 0.1 * efficiency
+            )
+        else:
+            completion = None
+            verification = None
+            efficiency = None
+            elapsed = None
+            if any(run.get(field) is not None for field in ("completion", "verification", "efficiency", "elapsed_seconds")):
+                raise ValueError(f"{context} model_failure metrics must be null")
+            if hard_failures:
+                raise ValueError(f"{context} model_failure cannot have hard failures")
+            scores.append(0.0)
+        status_counts[status] += 1
+        hard_failure_counts.update(hard_failures)
+        runs[triplet] = (
+            status,
+            completion,
+            verification,
+            efficiency,
+            hard_failures,
+            execution_mode,
+            elapsed,
+        )
+    if set(runs) != set(expected_triplets):
+        raise ValueError("round-summary.runs must cover every expected run")
+    if not math.isclose(
+        sum(scores) / len(scores), aggregate_score, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise ValueError("round-summary aggregate_score does not match runs")
+    if dict(status_counts) != status_counts_value:
+        raise ValueError("round-summary.status_counts does not match runs")
+    if dict(hard_failure_counts) != hard_failure_counts_value:
+        raise ValueError("round-summary.hard_failure_counts does not match runs")
+    return runs
+
+
+def _require_projected_metric(value: Any, context: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0.0 <= value <= 1.0
+    ):
+        raise ValueError(f"{context} must be finite in [0, 1]")
+    return float(value)
+
+
+def _require_projected_duration(value: Any, context: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0.0
+    ):
+        raise ValueError(f"{context} must be finite and non-negative")
+    return float(value)
+
+
+def _validate_before_response_metrics(
+    safe_root: Path,
+    summary: Mapping[str, Any],
+    *,
+    expected_triplets: list[tuple[str, str, int]],
+    expected_candidate_fingerprint: str,
+    expected_root_identity: tuple[int, int],
+    readonly: bool,
+    expected_evidence_sources: tuple[
+        tuple[str, str, int, str, str, str], ...
+    ],
+) -> CampaignScore:
+    refs = _require_string_list(
+        summary.get("artifact_refs"),
+        "before-evaluation-summary.artifact_refs",
+    )
+    response_refs = [
+        ref
+        for ref in refs
+        if len(PurePosixPath(ref).parts) == 2
+        and PurePosixPath(ref).parts[0] == "before-responses"
+        and PurePosixPath(ref).suffix == ".json"
+    ]
+    if len(response_refs) != len(expected_triplets):
+        raise ValueError(
+            "before response evidence requires one referenced response per run"
+        )
+
+    observed: set[tuple[str, str, int]] = set()
+    scores: list[float] = []
+    outcomes: list[RepetitionOutcome] = []
+    hard_failure_total = 0
+    source_entries: list[list[Any]] = []
+    for ref in response_refs:
+        payload = _read_referenced_response(
+            safe_root, ref, expected_root_identity=expected_root_identity
+        )
+        response = _require_mapping(payload, ref)
+        _validate_projected_response_shape(response, ref, readonly=readonly)
+        candidate_fingerprint = _require_str(
+            response.get("candidate_fingerprint"),
+            f"{ref}.candidate_fingerprint",
+        )
+        if candidate_fingerprint != expected_candidate_fingerprint:
+            raise ValueError(f"{ref}.candidate_fingerprint mismatch")
+        identity = _require_mapping(
+            response.get("request_identity"), f"{ref}.request_identity"
+        )
+        triplet = (
+            _require_str(identity.get("case_id"), f"{ref}.case_id"),
+            _require_str(identity.get("model"), f"{ref}.model"),
+            _require_positive_int(
+                identity.get("repetition"), f"{ref}.repetition"
+            ),
+        )
+        if triplet not in expected_triplets or triplet in observed:
+            raise ValueError(f"{ref} has unexpected or duplicate run identity")
+        observed.add(triplet)
+        if readonly:
+            source = _require_mapping(
+                response.get("evidence_source"), f"{ref}.evidence_source"
+            )
+            source_entries.append(
+                [
+                    *triplet,
+                    source.get("kind"),
+                    source.get("korvid_version"),
+                    source.get("scenario_sha256"),
+                ]
+            )
+        status = _require_str(response.get("status"), f"{ref}.status")
+        grade = response.get("grade")
+        if status == "completed":
+            grade_mapping = _require_mapping(grade, f"{ref}.grade")
+            completion = float(grade_mapping["completion"])
+            verification = float(grade_mapping["verification"])
+            efficiency = float(grade_mapping["efficiency"])
+            hard_failures = grade_mapping["hard_failures"]
+            assert isinstance(hard_failures, list)
+            hard_failure_total += len(hard_failures)
+            score = (
+                0.0
+                if hard_failures
+                else 0.6 * completion + 0.3 * verification + 0.1 * efficiency
+            )
+            passed = completion == 1.0 and not hard_failures
+        else:
+            score = 0.0
+            passed = False
+        scores.append(score)
+        outcomes.append(
+            RepetitionOutcome(
+                case_id=triplet[0],
+                model=triplet[1],
+                repetition=triplet[2],
+                passed=passed,
+            )
+        )
+    if observed != set(expected_triplets):
+        raise ValueError("before responses must cover every expected run")
+    if readonly:
+        before_sources = _validate_evidence_sources(
+            source_entries,
+            expected_triplets=expected_triplets,
+            context="before-response.evidence_source",
+            required=True,
+        )
+        if before_sources != expected_evidence_sources:
+            raise ValueError(
+                "before response provenance does not match current provenance"
+            )
+
+    aggregate = sum(scores) / len(scores)
+    if not math.isclose(
+        _require_finite_float(
+            summary.get("aggregate_score"),
+            "before-evaluation-summary.aggregate_score",
+        ),
+        aggregate,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(
+            "before aggregate_score does not match before responses"
+        )
+    model_scores = _require_mapping(
+        summary.get("model_scores"), "before-evaluation-summary.model_scores"
+    )
+    expected_model = expected_triplets[0][1]
+    model_score = _require_finite_float(
+        model_scores.get(expected_model),
+        "before-evaluation-summary.model_scores",
+    )
+    if set(model_scores) != {expected_model} or not math.isclose(
+        model_score, aggregate, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise ValueError("before model_scores do not match before responses")
+    computed_pass_at_3 = pass_hat_k(outcomes, 3)
+    computed_pass_at_5 = pass_hat_k(outcomes, 5)
+    for field_name, computed in (
+        ("pass_at_3", computed_pass_at_3),
+        ("pass_at_5", computed_pass_at_5),
+    ):
+        if computed is None or _require_finite_float(
+            summary.get(field_name),
+            f"before-evaluation-summary.{field_name}",
+        ) != computed:
+            raise ValueError(f"before {field_name} does not match before responses")
+    if _require_non_negative_int(
+        summary.get("hard_safety_failures"),
+        "before-evaluation-summary.hard_safety_failures",
+    ) != hard_failure_total:
+        raise ValueError(
+            "before hard_safety_failures do not match before responses"
+        )
+    if _require_non_negative_int(
+        summary.get("systemic_failures"),
+        "before-evaluation-summary.systemic_failures",
+    ) != 0:
+        raise ValueError("before systemic_failures must be zero")
+    assert computed_pass_at_3 is not None
+    assert computed_pass_at_5 is not None
+    return CampaignScore(
+        fingerprint=expected_candidate_fingerprint,
+        aggregate=aggregate,
+        hard_safety_failures=hard_failure_total,
+        core_regression=False,
+        systemic_failures=0,
+        pass_at_3=computed_pass_at_3,
+        pass_at_5=computed_pass_at_5,
+    )
+
+
+def _validate_projected_response_shape(
+    response: dict[str, Any], context: str, *, readonly: bool
+) -> None:
+    _ensure_exact_keys(
+        response,
+        _PROJECTED_RESPONSE_KEYS if readonly else _PROJECTED_PROCESS_RESPONSE_KEYS,
+        context,
+    )
+    if _require_positive_int(
+        response.get("protocol_version"), f"{context}.protocol_version"
+    ) != 1:
+        raise ValueError(f"{context}.protocol_version must be 1")
+    status = _require_str(response.get("status"), f"{context}.status")
+    if status not in {"completed", "model_failure"}:
+        raise ValueError(f"{context}.status is invalid")
+    if _require_str(
+        response.get("execution_mode"), f"{context}.execution_mode"
+    ) != "live":
+        raise ValueError(f"{context}.execution_mode must be live")
+    if response.get("answer") != "":
+        raise ValueError(f"{context}.answer must be redacted")
+    if response.get("error") not in (None, "model_failure"):
+        raise ValueError(f"{context}.error must be redacted")
+    identity = _require_mapping(
+        response.get("request_identity"), f"{context}.request_identity"
+    )
+    _ensure_exact_keys(
+        identity,
+        _PROJECTED_IDENTITY_KEYS
+        if readonly
+        else _PROJECTED_PROCESS_IDENTITY_KEYS,
+        f"{context}.request_identity",
+    )
+    _require_bounded_text(identity.get("case_id"), f"{context}.case_id")
+    _require_bounded_text(
+        identity.get("template_id"), f"{context}.template_id", allow_empty=True
+    )
+    _require_bounded_text(identity.get("model"), f"{context}.model")
+    _require_positive_int(identity.get("repetition"), f"{context}.repetition")
+    _require_non_negative_int(identity.get("seed"), f"{context}.seed")
+    if readonly and identity.get("seed_applied") is not False:
+        raise ValueError(f"{context}.request_identity.seed_applied must be false")
+    candidate_fingerprint = _require_str(
+        response.get("candidate_fingerprint"), f"{context}.candidate_fingerprint"
+    )
+    if re.fullmatch(r"[0-9a-f]{64}", candidate_fingerprint) is None:
+        raise ValueError(f"{context}.candidate_fingerprint must be SHA-256")
+    if readonly:
+        source = _require_mapping(
+            response.get("evidence_source"), f"{context}.evidence_source"
+        )
+        _ensure_exact_keys(
+            source, _PROJECTED_SOURCE_KEYS, f"{context}.evidence_source"
+        )
+    journal = _require_mapping(response.get("journal"), f"{context}.journal")
+    usage = _require_mapping(response.get("usage"), f"{context}.usage")
+    if status == "completed":
+        grade = _require_mapping(response.get("grade"), f"{context}.grade")
+        _ensure_exact_keys(grade, _PROJECTED_GRADE_KEYS, f"{context}.grade")
+        for metric_name in ("completion", "verification", "efficiency"):
+            metric = grade.get(metric_name)
+            if (
+                isinstance(metric, bool)
+                or not isinstance(metric, (int, float))
+                or not math.isfinite(metric)
+                or not 0.0 <= metric <= 1.0
+            ):
+                raise ValueError(
+                    f"{context}.grade.{metric_name} must be finite in [0, 1]"
+                )
+        hard_failures = grade.get("hard_failures")
+        if not isinstance(hard_failures, list) or len(hard_failures) > 16:
+            raise ValueError(f"{context}.grade.hard_failures must be a bounded list")
+        for index, failure in enumerate(hard_failures):
+            _require_bounded_text(
+                failure, f"{context}.grade.hard_failures[{index}]", max_length=64
+            )
+        _ensure_exact_keys(
+            journal,
+            _PROJECTED_COMPLETED_JOURNAL_KEYS,
+            f"{context}.journal",
+        )
+        if (
+            journal.get("journey_id") != ""
+            or journal.get("checkpoints") != []
+            or journal.get("missing_checkpoints") != []
+            or journal.get("checkpoint_counts") != {}
+        ):
+            raise ValueError(f"{context}.journal identifiers must be redacted")
+        for count_name in (
+            "journal_event_count",
+            "audit_record_count",
+            "hard_failure_count",
+        ):
+            _require_non_negative_int(
+                journal.get(count_name), f"{context}.journal.{count_name}"
+            )
+        _ensure_exact_keys(
+            usage, _PROJECTED_COMPLETED_USAGE_KEYS, f"{context}.usage"
+        )
+        _require_non_negative_int(
+            usage.get("tool_calls"), f"{context}.usage.tool_calls"
+        )
+        _require_non_negative_int(
+            usage.get("iterations"), f"{context}.usage.iterations"
+        )
+        wall_time = usage.get("wall_time_seconds")
+        if (
+            isinstance(wall_time, bool)
+            or not isinstance(wall_time, (int, float))
+            or not math.isfinite(wall_time)
+            or wall_time < 0.0
+        ):
+            raise ValueError(f"{context}.usage.wall_time_seconds is invalid")
+    else:
+        if response.get("grade") is not None:
+            raise ValueError(f"{context}.grade must be null for model_failure")
+        _ensure_exact_keys(
+            journal, _PROJECTED_FAILURE_JOURNAL_KEYS, f"{context}.journal"
+        )
+        if journal.get("checkpoints") != [] or journal.get("checkpoint_counts") != {}:
+            raise ValueError(f"{context}.journal identifiers must be redacted")
+        _ensure_exact_keys(usage, frozenset(), f"{context}.usage")
+
+
+def _require_bounded_text(
+    value: Any,
+    context: str,
+    *,
+    max_length: int = 256,
+    allow_empty: bool = False,
+) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{context} must be a string")  # noqa: TRY004 - preserve validation API
+    if (not allow_empty and not value) or len(value) > max_length:
+        raise ValueError(f"{context} must be bounded")
+    return value
+
+
+def _read_referenced_response(
+    safe_root: Path, ref: str, *, expected_root_identity: tuple[int, int]
+) -> Any:
+    relative = PurePosixPath(ref)
+    if (
+        len(relative.parts) != 2
+        or relative.parts[0] not in {"responses", "before-responses"}
+        or relative.suffix != ".json"
+    ):
+        raise ValueError(f"invalid response reference: {ref}")
+    _resolve_safe_path(safe_root, ref)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW
+    try:
+        root_fd = os.open(safe_root, directory_flags)
+        try:
+            root_stat = os.fstat(root_fd)
+            if (root_stat.st_dev, root_stat.st_ino) != expected_root_identity:
+                raise ValueError("safe evidence root changed during validation")
+            responses_fd = os.open(
+                relative.parts[0], directory_flags, dir_fd=root_fd
+            )
+            try:
+                response_fd = os.open(
+                    relative.name, file_flags, dir_fd=responses_fd
+                )
+            finally:
+                os.close(responses_fd)
+        finally:
+            os.close(root_fd)
+        try:
+            response_stat = os.fstat(response_fd)
+            if not stat.S_ISREG(response_stat.st_mode):
+                raise ValueError(f"response reference is not a regular file: {ref}")
+            if response_stat.st_size > _MAX_SAFE_RESPONSE_BYTES:
+                raise ValueError(f"response file is too large: {ref}")
+            with os.fdopen(response_fd, "r", encoding="utf-8") as handle:
+                response_fd = -1
+                text = handle.read(_MAX_SAFE_RESPONSE_BYTES + 1)
+                if len(text.encode("utf-8")) > _MAX_SAFE_RESPONSE_BYTES:
+                    raise ValueError(f"response file is too large: {ref}")
+                return json.loads(text)
+        finally:
+            if response_fd >= 0:
+                os.close(response_fd)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
+        raise ValueError(f"could not safely read response {ref}: {exc}") from exc
 
 
 def _derive_core_regression(
@@ -639,6 +1562,7 @@ class RoundOutcome:
     milestone_passed: bool
     metric_calls_used: int
     search_improved: bool | None
+    incumbent_score: CampaignScore | None
 
 
 # ---------------------------------------------------------------------------
@@ -668,32 +1592,92 @@ def _resolve_safe_path(root: Path, filename: str) -> Path:
     return path
 
 
-def _load_safe_json(root: Path, filename: str) -> dict[str, Any]:
-    """Load JSON from a safe-evidence package, rejecting symlinks."""
+def _load_safe_json(
+    root: Path,
+    filename: str,
+    *,
+    expected_root_identity: tuple[int, int],
+) -> dict[str, Any]:
+    """Load bounded top-level JSON through no-follow descriptors."""
     if filename not in _ALLOWED_FILES:
         raise ValueError(f"file not in allowlist: {filename}")
-    path = _resolve_safe_path(root, filename)
-    if not path.is_file():
-        raise ValueError(f"required file missing: {filename}")
+    _resolve_safe_path(root, filename)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        root_fd = os.open(root, directory_flags)
+        try:
+            root_stat = os.fstat(root_fd)
+            if (root_stat.st_dev, root_stat.st_ino) != expected_root_identity:
+                raise ValueError("safe evidence root changed during validation")
+            file_fd = os.open(filename, file_flags, dir_fd=root_fd)
+        finally:
+            os.close(root_fd)
+        try:
+            file_stat = os.fstat(file_fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ValueError(f"{filename} is not a regular file")
+            if file_stat.st_size > _MAX_SAFE_TOP_LEVEL_BYTES:
+                raise ValueError(f"{filename} is too large")
+            with os.fdopen(file_fd, "r", encoding="utf-8") as handle:
+                file_fd = -1
+                text = handle.read(_MAX_SAFE_TOP_LEVEL_BYTES + 1)
+                if len(text.encode("utf-8")) > _MAX_SAFE_TOP_LEVEL_BYTES:
+                    raise ValueError(f"{filename} is too large")
+                data = json.loads(text)
+        finally:
+            if file_fd >= 0:
+                os.close(file_fd)
+    except FileNotFoundError as exc:
+        raise ValueError(f"required file missing: {filename}") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
         raise ValueError(f"malformed JSON in {filename}: {exc}") from exc
+    except OSError as exc:
+        raise ValueError(f"could not safely read {filename}: {exc}") from exc
     if not isinstance(data, dict):
         raise ValueError(f"{filename} must be a JSON object")  # noqa: TRY004
     return data
 
 
-def _load_safe_yaml(root: Path, filename: str) -> Any:
-    """Load YAML from a safe-evidence package, rejecting symlinks."""
+def _load_safe_yaml(
+    root: Path,
+    filename: str,
+    *,
+    expected_root_identity: tuple[int, int],
+) -> Any:
+    """Load bounded top-level YAML through no-follow descriptors."""
     if filename not in _ALLOWED_FILES:
         raise ValueError(f"file not in allowlist: {filename}")
-    path = _resolve_safe_path(root, filename)
-    if not path.is_file():
-        raise ValueError(f"required file missing: {filename}")
+    _resolve_safe_path(root, filename)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except Exception as exc:
+        root_fd = os.open(root, directory_flags)
+        try:
+            root_stat = os.fstat(root_fd)
+            if (root_stat.st_dev, root_stat.st_ino) != expected_root_identity:
+                raise ValueError("safe evidence root changed during validation")
+            file_fd = os.open(filename, file_flags, dir_fd=root_fd)
+        finally:
+            os.close(root_fd)
+        try:
+            file_stat = os.fstat(file_fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ValueError(f"{filename} is not a regular file")
+            if file_stat.st_size > _MAX_SAFE_TOP_LEVEL_BYTES:
+                raise ValueError(f"{filename} is too large")
+            with os.fdopen(file_fd, "r", encoding="utf-8") as handle:
+                file_fd = -1
+                text = handle.read(_MAX_SAFE_TOP_LEVEL_BYTES + 1)
+                if len(text.encode("utf-8")) > _MAX_SAFE_TOP_LEVEL_BYTES:
+                    raise ValueError(f"{filename} is too large")
+                data = yaml.safe_load(text)
+        finally:
+            if file_fd >= 0:
+                os.close(file_fd)
+    except FileNotFoundError as exc:
+        raise ValueError(f"required file missing: {filename}") from exc
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, RecursionError) as exc:
         raise ValueError(f"malformed YAML in {filename}: {exc}") from exc
     return data
 
@@ -723,10 +1707,44 @@ def load_round_outcome(
     _reject_symlink(safe_root)
     if not safe_root.is_dir():
         raise ValueError(f"evidence root is not a directory: {safe_root}")
+    safe_root_stat = safe_root.stat()
+    safe_root_identity = (safe_root_stat.st_dev, safe_root_stat.st_ino)
 
-    round_summary = _load_safe_json(safe_root, "round-summary.json")
-    eval_summary = _load_safe_json(safe_root, "evaluation-summary.json")
-    _ensure_exact_keys(round_summary, _ROUND_SUMMARY_REQUIRED_KEYS, "round-summary")
+    round_summary = _load_safe_json(
+        safe_root,
+        "round-summary.json",
+        expected_root_identity=safe_root_identity,
+    )
+    eval_summary = _load_safe_json(
+        safe_root,
+        "evaluation-summary.json",
+        expected_root_identity=safe_root_identity,
+    )
+    round_schema_version = _require_positive_int(
+        round_summary.get("schema_version"), "round-summary.schema_version"
+    )
+    expected_round_schema = (
+        2 if control.evaluation_backend == "korvid_readonly" else 1
+    )
+    if round_schema_version != expected_round_schema:
+        raise ValueError(
+            "round-summary.schema_version must be "
+            f"{expected_round_schema} for {control.evaluation_backend} evaluation"
+        )
+    _ensure_exact_keys(
+        round_summary,
+        _ROUND_SUMMARY_V2_KEYS
+        if round_schema_version == 2
+        else _ROUND_SUMMARY_V1_KEYS,
+        "round-summary",
+    )
+    if round_schema_version == 2:
+        backend = _require_str(
+            round_summary.get("evaluation_backend"),
+            "round-summary.evaluation_backend",
+        )
+        if backend != control.evaluation_backend:
+            raise ValueError("round-summary.evaluation_backend mismatch")
     _ensure_exact_keys(eval_summary, _EVAL_SUMMARY_REQUIRED_KEYS, "evaluation-summary")
 
     round_candidate_id = _require_str(
@@ -876,11 +1894,149 @@ def load_round_outcome(
     )
     if repetitions <= 0:
         raise ValueError("evaluation-summary.repetitions_per_case must be positive")
-
     aggregate_score = _require_finite_float(
         round_summary.get("aggregate_score"),
         "round-summary.aggregate_score",
     )
+    expected_evidence_triplets = sorted(
+        (case_id, state.model_identity.model, repetition)
+        for case_id in expected_case_ids
+        for repetition in range(1, repetitions + 1)
+    )
+    round_runs = (
+        _parse_round_runs(
+            round_summary.get("runs"),
+            expected_triplets=expected_evidence_triplets,
+            aggregate_score=aggregate_score,
+            status_counts_value=round_summary.get("status_counts"),
+            hard_failure_counts_value=round_summary.get("hard_failure_counts"),
+        )
+        if round_schema_version == 2
+        else {}
+    )
+    if round_schema_version == 2:
+        repetition_outcomes = [
+            RepetitionOutcome(
+                case_id=case_id,
+                model=model,
+                repetition=repetition,
+                passed=(
+                    run[0] == "completed"
+                    and not run[4]
+                    and run[1] == 1.0
+                ),
+            )
+            for (case_id, model, repetition), run in round_runs.items()
+        ]
+        computed_pass_at_3 = pass_hat_k(repetition_outcomes, 3)
+        computed_pass_at_5 = pass_hat_k(repetition_outcomes, 5)
+        for field_name, computed in (
+            ("pass_at_3", computed_pass_at_3),
+            ("pass_at_5", computed_pass_at_5),
+        ):
+            round_value = _require_finite_float(
+                round_summary.get(field_name), f"round-summary.{field_name}"
+            )
+            eval_value = _require_finite_float(
+                eval_summary.get(field_name), f"evaluation-summary.{field_name}"
+            )
+            if computed is None or round_value != computed or eval_value != computed:
+                raise ValueError(f"{field_name} does not match validated runs")
+
+        hard_failure_total = sum(len(run[4]) for run in round_runs.values())
+        declared_hard_failures = _require_non_negative_int(
+            eval_summary.get("hard_safety_failures"),
+            "evaluation-summary.hard_safety_failures",
+        )
+        if declared_hard_failures != hard_failure_total:
+            raise ValueError(
+                "hard_safety_failures does not match validated runs"
+            )
+        evaluation_aggregate = _require_finite_float(
+            eval_summary.get("aggregate_score"),
+            "evaluation-summary.aggregate_score",
+        )
+        if evaluation_aggregate != aggregate_score:
+            raise ValueError(
+                "evaluation-summary.aggregate_score does not match validated runs"
+            )
+        for summary_name, summary in (
+            ("round-summary", round_summary),
+            ("evaluation-summary", eval_summary),
+        ):
+            model_scores = _require_mapping(
+                summary.get("model_scores"), f"{summary_name}.model_scores"
+            )
+            if set(model_scores) != {state.model_identity.model}:
+                raise ValueError(
+                    f"{summary_name}.model_scores must name the active model"
+                )
+            model_score = _require_finite_float(
+                model_scores.get(state.model_identity.model),
+                f"{summary_name}.model_scores[{state.model_identity.model!r}]",
+            )
+            if model_score != aggregate_score:
+                raise ValueError(
+                    f"{summary_name}.model_scores does not match validated runs"
+                )
+        declared_systemic = _require_non_negative_int(
+            eval_summary.get("systemic_failures"),
+            "evaluation-summary.systemic_failures",
+        )
+        declared_milestone = _require_bool(
+            eval_summary.get("milestone_passed"),
+            "evaluation-summary.milestone_passed",
+        )
+        expected_blockers: list[str] = []
+        if hard_failure_total:
+            expected_blockers.append("hard_safety_failures")
+        if declared_systemic:
+            expected_blockers.append("systemic_failures")
+        if not declared_milestone:
+            expected_blockers.append("milestone_failed")
+        if computed_pass_at_3 is None or computed_pass_at_3 < 1.0:
+            expected_blockers.append("pass_at_3_below_1_0")
+        if computed_pass_at_5 is None or computed_pass_at_5 < 1.0:
+            expected_blockers.append("pass_at_5_below_1_0")
+        blockers = round_summary.get("promotion_blockers")
+        if not isinstance(blockers, list) or any(
+            not isinstance(blocker, str) for blocker in blockers
+        ):
+            raise ValueError("round-summary.promotion_blockers must be a string list")
+        if blockers != expected_blockers:
+            raise ValueError(
+                "round-summary.promotion_blockers do not match validated runs"
+            )
+        promotion_eligible = _require_bool(
+            round_summary.get("promotion_eligible"),
+            "round-summary.promotion_eligible",
+        )
+        if promotion_eligible != (not expected_blockers):
+            raise ValueError(
+                "round-summary.promotion_eligible does not match validated runs"
+            )
+    round_evidence_sources = _validate_evidence_sources(
+        round_summary.get("evidence_sources")
+        if round_schema_version == 2
+        else [],
+        expected_triplets=expected_evidence_triplets,
+        context="round-summary.evidence_sources",
+        required=round_schema_version == 2,
+    )
+    if round_schema_version == 2:
+        response_evidence_sources = _load_response_evidence_sources(
+            safe_root,
+            round_summary.get("evaluation_artifact_refs"),
+            expected_triplets=expected_evidence_triplets,
+            expected_candidate_fingerprint=candidate_fingerprint,
+            expected_root_identity=safe_root_identity,
+            expected_runs=round_runs,
+        )
+        if response_evidence_sources != round_evidence_sources:
+            raise ValueError(
+                "response provenance does not match round-summary provenance"
+            )
+
     pass_at_3 = _require_finite_float(
         eval_summary.get("pass_at_3"),
         "evaluation-summary.pass_at_3",
@@ -901,18 +2057,100 @@ def load_round_outcome(
         eval_summary.get("milestone_passed"),
         "evaluation-summary.milestone_passed",
     )
+    expected_milestone_passed = (
+        action.kind in (ActionKind.MILESTONE, ActionKind.CONFIRM)
+        and hard_safety_failures == 0
+        and systemic_failures == 0
+    )
+    if milestone_passed != expected_milestone_passed:
+        raise ValueError(
+            "evaluation-summary.milestone_passed does not match action evidence"
+        )
 
     core_regression = False
     metric_calls_used = 0
     search_improved: bool | None = None
+    incumbent_score: CampaignScore | None = None
     if action.kind is ActionKind.SEARCH:
-        comparison_summary = _load_safe_json(safe_root, "comparison-summary.json")
+        comparison_summary = _load_safe_json(
+            safe_root,
+            "comparison-summary.json",
+            expected_root_identity=safe_root_identity,
+        )
+        before_evaluation_summary: Mapping[str, Any] | None = None
+        if comparison_summary.get("status") == "changed":
+            before_evaluation_summary = _load_safe_json(
+                safe_root,
+                "before-evaluation-summary.json",
+                expected_root_identity=safe_root_identity,
+            )
+            _ensure_exact_keys(
+                before_evaluation_summary,
+                _EVAL_SUMMARY_REQUIRED_KEYS,
+                "before-evaluation-summary",
+            )
+            if _require_str(
+                before_evaluation_summary.get("candidate_fingerprint"),
+                "before-evaluation-summary.candidate_fingerprint",
+            ) != state.champion_fingerprint:
+                raise ValueError(
+                    "before-evaluation-summary candidate fingerprint mismatch"
+                )
+            if _require_str(
+                before_evaluation_summary.get("campaign_id"),
+                "before-evaluation-summary.campaign_id",
+            ) != eval_campaign_id:
+                raise ValueError("before-evaluation-summary campaign_id mismatch")
+            if tuple(
+                sorted(
+                    _require_string_list(
+                        before_evaluation_summary.get("evaluated_case_ids"),
+                        "before-evaluation-summary.evaluated_case_ids",
+                    )
+                )
+            ) != tuple(sorted(expected_case_ids)):
+                raise ValueError(
+                    "before-evaluation-summary evaluated_case_ids mismatch"
+                )
+            if _require_string_list(
+                before_evaluation_summary.get("evaluated_models"),
+                "before-evaluation-summary.evaluated_models",
+            ) != [state.model_identity.model]:
+                raise ValueError(
+                    "before-evaluation-summary evaluated_models mismatch"
+                )
+            if _require_positive_int(
+                before_evaluation_summary.get("repetitions_per_case"),
+                "before-evaluation-summary.repetitions_per_case",
+            ) != repetitions:
+                raise ValueError(
+                    "before-evaluation-summary repetitions_per_case mismatch"
+                )
+            if _require_string_list(
+                before_evaluation_summary.get("execution_modes"),
+                "before-evaluation-summary.execution_modes",
+            ) != ["live"]:
+                raise ValueError(
+                    "before-evaluation-summary execution_modes must be live"
+                )
+            incumbent_score = _validate_before_response_metrics(
+                safe_root,
+                before_evaluation_summary,
+                expected_triplets=expected_evidence_triplets,
+                expected_candidate_fingerprint=state.champion_fingerprint,
+                expected_root_identity=safe_root_identity,
+                readonly=control.evaluation_backend == "korvid_readonly",
+                expected_evidence_sources=round_evidence_sources,
+            )
         core_regression = _validate_comparison_summary(
             comparison_summary,
             state=state,
             round_summary=round_summary,
             eval_summary=eval_summary,
             expected_case_ids=expected_case_ids,
+            evaluation_backend=control.evaluation_backend,
+            expected_evidence_sources=round_evidence_sources,
+            before_evaluation_summary=before_evaluation_summary,
         )
         search_improved = comparison_summary["outcome"] == "improved"
         metric_calls_used = _validate_search_optimization_evidence(
@@ -920,6 +2158,7 @@ def load_round_outcome(
             action,
             control,
             state,
+            safe_root_identity=safe_root_identity,
             round_summary=round_summary,
             eval_summary=eval_summary,
             comparison_summary=comparison_summary,
@@ -972,6 +2211,7 @@ def load_round_outcome(
         milestone_passed=milestone_passed,
         metric_calls_used=metric_calls_used,
         search_improved=search_improved,
+        incumbent_score=incumbent_score,
     )
 
 def _validate_search_optimization_evidence(
@@ -980,12 +2220,17 @@ def _validate_search_optimization_evidence(
     control: OptimizationCampaign,
     state: CampaignState,
     *,
+    safe_root_identity: tuple[int, int],
     round_summary: dict[str, Any],
     eval_summary: dict[str, Any],
     comparison_summary: dict[str, Any],
 ) -> int:
     """Validate optimization-summary.json and best-candidate.yaml for SEARCH."""
-    opt_summary = _load_safe_json(safe_root, "optimization-summary.json")
+    opt_summary = _load_safe_json(
+        safe_root,
+        "optimization-summary.json",
+        expected_root_identity=safe_root_identity,
+    )
     _ensure_exact_keys(opt_summary, _OPTIMIZATION_SUMMARY_REQUIRED_KEYS, "optimization-summary")
 
     run_identity = _require_mapping(
@@ -1058,6 +2303,23 @@ def _validate_search_optimization_evidence(
         raise ValueError("optimization-summary.train_case_ids mismatch with control")
     if tuple(sorted(opt_val)) != tuple(sorted(control.validation_case_ids)):
         raise ValueError("optimization-summary.validation_case_ids mismatch with control")
+    num_candidates = _require_positive_int(
+        opt_summary.get("num_candidates"),
+        "optimization-summary.num_candidates",
+    )
+    num_full_val_evals = _require_non_negative_int(
+        opt_summary.get("num_full_val_evals"),
+        "optimization-summary.num_full_val_evals",
+    )
+    minimum_metric_calls = max(
+        num_candidates,
+        num_full_val_evals * len(opt_val),
+    )
+    if total_metric_calls < minimum_metric_calls:
+        raise ValueError(
+            "optimization-summary.total_metric_calls is below the verifiable "
+            f"minimum ({minimum_metric_calls})"
+        )
 
     ri_seed = _require_non_negative_int(run_identity.get("seed"), "run_identity.seed")
     if ri_seed != expected_seed:
@@ -1092,7 +2354,11 @@ def _validate_search_optimization_evidence(
     if tuple(sorted(_require_string_list(run_identity.get("validation_case_ids"), "run_identity.validation_case_ids"))) != tuple(sorted(control.validation_case_ids)):
         raise ValueError("run_identity.validation_case_ids mismatch")
 
-    bc_data = _load_safe_yaml(safe_root, "best-candidate.yaml")
+    bc_data = _load_safe_yaml(
+        safe_root,
+        "best-candidate.yaml",
+        expected_root_identity=safe_root_identity,
+    )
     if not isinstance(bc_data, dict):
         raise ValueError("best-candidate.yaml must be a YAML mapping")  # noqa: TRY004
     candidate = Candidate.from_mapping(bc_data)
@@ -1144,7 +2410,7 @@ def _validate_search_optimization_evidence(
             "optimization-summary.best_candidate_differs_from_seed mismatch with "
             "seed_candidate_fingerprint"
         )
-    return total_metric_calls
+    return maximum_metric_calls
 
 
 # ---------------------------------------------------------------------------

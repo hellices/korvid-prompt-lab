@@ -8,8 +8,8 @@ from typing import Any
 
 from gepa.core.adapter import EvaluationBatch, ProposalFn
 
-from .contracts import Candidate, EvalCase
-from .runner import BridgeExecutionModeError, KorvidProcessRunner
+from .contracts import Candidate, EvalCase, KorvidReadonlyServing
+from .runner import BridgeExecutionModeError, KorvidRunner
 from .scoring import BridgeResult, ScoredResult, grade_quality, score_result
 
 
@@ -20,12 +20,28 @@ class SafeExecutionTrace:
     model: str
     execution_mode: str
     final_answer: str
+    answer_redacted: bool
     checkpoint_names: tuple[str, ...]
     tool_call_count: int
     outcome: str
     missing_checkpoints: tuple[str, ...]
     hard_failures: tuple[str, ...]
     score: float
+    # korvid_readonly-only reflection feedback (Task 3). Always None for
+    # write/approval (KorvidProcessRunner) evidence: completion/verification
+    # do not mean "diagnosis"/"evidence" outcomes there. Populated only when
+    # this adapter's runner serves korvid_readonly evidence, and derived
+    # exclusively from the bounded journal/grade fields
+    # korvid_readonly.py already exposes (never raw request, fixture, or
+    # credential data).
+    diagnosis_success: bool | None = None
+    evidence_fetched: bool | None = None
+    missing_mention_count: int | None = None
+    missing_evidence_count: int | None = None
+    resolvable_tool_call_count: int | None = None
+    malformed_tool_call_count: int | None = None
+    citation_coverage: float | None = None
+    citation_precision: float | None = None
 
 
 def _search_score(scored: ScoredResult) -> float:
@@ -46,7 +62,7 @@ class KorvidGEPAAdapter:
 
     def __init__(
         self,
-        runner: KorvidProcessRunner,
+        runner: KorvidRunner,
         artifact_root: Path | str,
         *,
         candidate_id: str = "gepa-candidate",
@@ -95,11 +111,16 @@ class KorvidGEPAAdapter:
             result = self.runner.run(resolved_candidate, case, run_dir)
             self._record_execution_mode(result)
             scored = score_result(result)
-            outputs.append(result)
+            safe_result = self._safe_optimizer_output(result)
+            outputs.append(safe_result)
             search_score = _search_score(scored)
             scores.append(search_score)
             if capture_traces:
-                traces.append(self._build_trace(case, result, score=search_score, unsafe=scored.unsafe))
+                traces.append(
+                    self._build_trace(
+                        case, safe_result, score=search_score, unsafe=scored.unsafe
+                    )
+                )
 
         return EvaluationBatch(
             outputs=outputs,
@@ -124,6 +145,21 @@ class KorvidGEPAAdapter:
                 raise ValueError(f"unknown candidate component: {component_name}")
             reflective_dataset[component_name] = [self._trace_to_record(trace) for trace in eval_batch.trajectories]
         return reflective_dataset
+
+    def _safe_optimizer_output(self, result: BridgeResult) -> BridgeResult:
+        if not isinstance(self.runner.campaign.serving, KorvidReadonlyServing):
+            return result
+        return BridgeResult(
+            protocol_version=result.protocol_version,
+            status=result.status,
+            execution_mode=result.execution_mode,
+            candidate_fingerprint=result.candidate_fingerprint,
+            grade=result.grade,
+            answer="",
+            journal=result.journal,
+            usage=result.usage,
+            error="model_failure" if result.error is not None else None,
+        )
 
     def _materialize_candidate(self, candidate: Mapping[str, str]) -> Candidate:
         return Candidate.from_mapping(
@@ -150,40 +186,119 @@ class KorvidGEPAAdapter:
             model=case.models[0],
             execution_mode=result.execution_mode,
             final_answer=result.answer,
+            answer_redacted=isinstance(
+                self.runner.campaign.serving, KorvidReadonlyServing
+            ),
             checkpoint_names=checkpoint_names,
             tool_call_count=_count_tool_calls(reported_tool_calls),
             outcome="unsafe" if unsafe else result.status,
             missing_checkpoints=_missing_checkpoints(journal, checkpoint_names),
             hard_failures=result.grade.hard_failures if result.grade is not None else (),
             score=score,
+            **self._readonly_reflection_fields(result),
         )
 
+    def _readonly_reflection_fields(self, result: BridgeResult) -> dict[str, Any]:
+        """Bounded, read-only-specific reflection feedback (Task 3).
+
+        `completion`/`verification` are a spec-exact 1:1 encoding of
+        `diagnosis_success`/`evidence_fetched` only for korvid_readonly
+        evidence (see the design's Score Mapping section), so this must stay
+        gated on the runner actually serving korvid_readonly evidence and
+        must never be applied to write/approval (KorvidProcessRunner)
+        results, where those floats carry unrelated meaning.
+        """
+        if not isinstance(self.runner.campaign.serving, KorvidReadonlyServing):
+            return {}
+        journal = result.journal
+        grade = result.grade
+        if grade is None:
+            return {}
+        return {
+            "diagnosis_success": journal.get("diagnosis_success"),
+            "evidence_fetched": journal.get("evidence_fetched"),
+            "missing_mention_count": _coerce_optional_int(journal.get("missing_mentions")),
+            "missing_evidence_count": _coerce_optional_int(journal.get("missing_evidence")),
+            "resolvable_tool_call_count": _coerce_optional_int(
+                journal.get("resolvable_tool_calls")
+            ),
+            "malformed_tool_call_count": _coerce_optional_int(journal.get("malformed_tool_calls")),
+            "citation_coverage": _coerce_optional_float(journal.get("citation_coverage")),
+            "citation_precision": _coerce_optional_float(journal.get("citation_precision")),
+        }
+
     def _trace_to_record(self, trace: SafeExecutionTrace) -> Mapping[str, Any]:
+        generated_outputs = {
+            "checkpoint_names": list(trace.checkpoint_names),
+            "tool_call_count": trace.tool_call_count,
+            "outcome": trace.outcome,
+            "execution_mode": trace.execution_mode,
+            **_readonly_output_fields(trace),
+        }
+        if not trace.answer_redacted:
+            generated_outputs["answer"] = trace.final_answer
         return {
             "Inputs": {
                 "case_id": trace.case_id,
                 "template_id": trace.template_id,
                 "model": trace.model,
             },
-            "Generated Outputs": {
-                "answer": trace.final_answer,
-                "checkpoint_names": list(trace.checkpoint_names),
-                "tool_call_count": trace.tool_call_count,
-                "outcome": trace.outcome,
-                "execution_mode": trace.execution_mode,
-            },
+            "Generated Outputs": generated_outputs,
             "Feedback": _build_feedback(trace),
             "score": trace.score,
         }
 
 
+def _readonly_output_fields(trace: SafeExecutionTrace) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    if trace.diagnosis_success is not None:
+        fields["diagnosis_success"] = trace.diagnosis_success
+    if trace.evidence_fetched is not None:
+        fields["evidence_fetched"] = trace.evidence_fetched
+    if trace.missing_mention_count is not None:
+        fields["missing_mention_count"] = trace.missing_mention_count
+    if trace.missing_evidence_count is not None:
+        fields["missing_evidence_count"] = trace.missing_evidence_count
+    if trace.resolvable_tool_call_count is not None:
+        fields["resolvable_tool_call_count"] = trace.resolvable_tool_call_count
+    if trace.malformed_tool_call_count is not None:
+        fields["malformed_tool_call_count"] = trace.malformed_tool_call_count
+    if trace.citation_coverage is not None:
+        fields["citation_coverage"] = trace.citation_coverage
+    if trace.citation_precision is not None:
+        fields["citation_precision"] = trace.citation_precision
+    return fields
+
+
 def _build_feedback(trace: SafeExecutionTrace) -> str:
     parts = [f"Outcome: {trace.outcome}."]
+    if trace.diagnosis_success is not None:
+        parts.append(f"Diagnosis: {'success' if trace.diagnosis_success else 'failure'}.")
+    if trace.evidence_fetched is not None:
+        parts.append(f"Evidence: {'fetched' if trace.evidence_fetched else 'missing'}.")
+    if trace.missing_mention_count:
+        parts.append(f"Missing mentions: {trace.missing_mention_count}.")
+    if trace.missing_evidence_count:
+        parts.append(f"Missing evidence items: {trace.missing_evidence_count}.")
+    if trace.resolvable_tool_call_count is not None:
+        parts.append(
+            f"Resolvable tool calls: {trace.resolvable_tool_call_count} "
+            f"of {trace.tool_call_count}."
+        )
+    if trace.malformed_tool_call_count:
+        parts.append(f"Malformed tool calls: {trace.malformed_tool_call_count}.")
+    if trace.citation_coverage is not None:
+        precision_text = f"{trace.citation_precision:.2f}" if trace.citation_precision is not None else "n/a"
+        parts.append(f"Citation coverage: {trace.citation_coverage:.2f}, precision: {precision_text}.")
     if trace.missing_checkpoints:
         parts.append(f"Missing checkpoints: {', '.join(trace.missing_checkpoints)}.")
     if trace.hard_failures:
         parts.append(f"Hard failures: {', '.join(trace.hard_failures)}.")
-    if not trace.missing_checkpoints and not trace.hard_failures:
+    if (
+        trace.diagnosis_success is None
+        and not trace.missing_checkpoints
+        and not trace.hard_failures
+    ):
         parts.append("No missing checkpoints or hard failures.")
     return " ".join(parts)
 
@@ -202,6 +317,22 @@ def _count_tool_calls(value: Any) -> int:
     if isinstance(value, Mapping):
         return sum(item for item in value.values() if isinstance(item, int) and item >= 0)
     return 0
+
+
+def _coerce_optional_int(value: Any) -> int | None:
+    """Best-effort enrichment only: korvid_readonly.py already validated this
+    field strictly, so this never raises and simply omits a malformed value."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _coerce_optional_float(value: Any) -> float | None:
+    """Best-effort enrichment only: korvid_readonly.py already validated this
+    field strictly, so this never raises and simply omits a malformed value."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
 
 
 def _missing_checkpoints(journal: Mapping[str, Any], checkpoint_names: Sequence[str]) -> tuple[str, ...]:

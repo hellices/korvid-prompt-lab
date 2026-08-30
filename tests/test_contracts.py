@@ -14,6 +14,7 @@ from korvid_prompt_lab.contracts import (
     DEFAULT_BRIDGE_TIMEOUT_SECONDS,
     AKSPortForwardServing,
     Candidate,
+    KorvidReadonlyServing,
     ProcessServing,
 )
 
@@ -487,3 +488,188 @@ serving:
 
     with pytest.raises(ValueError, match=r"\{request\}"):
         load_campaign(path)
+
+
+def _korvid_readonly_campaign_yaml(serving_lines: str) -> str:
+    return (
+        """
+schema_version: 1
+campaign_id: korvid-readonly-campaign
+repetitions: 1
+models: [qwen3-4b]
+cases:
+  - case_id: oom-killed
+    template_id: template-a
+    prompt: "The database pod keeps restarting. Why?"
+    models: [qwen3-4b]
+serving:
+  backend: korvid_readonly
+  provider: ollama
+  base_url: env:KORVID_READONLY_BASE_URL
+  profile: small
+  timeout_seconds: 160
+"""
+        + serving_lines
+    ).strip() + "\n"
+
+
+def test_load_campaign_parses_korvid_readonly_serving(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("KORVID_READONLY_BASE_URL", "http://127.0.0.1:11434")
+    path = tmp_path / "campaign.yaml"
+    path.write_text(_korvid_readonly_campaign_yaml(""), encoding="utf-8")
+
+    campaign = load_campaign(path)
+
+    assert isinstance(campaign.serving, KorvidReadonlyServing)
+    assert campaign.serving.backend == "korvid_readonly"
+    assert campaign.serving.provider == "ollama"
+    assert campaign.serving.base_url == "http://127.0.0.1:11434"
+    assert campaign.serving.profile == "small"
+    assert campaign.serving.timeout_seconds == pytest.approx(160.0)
+    assert not hasattr(campaign.serving, "__dict__")
+
+
+def test_load_campaign_rejects_korvid_readonly_missing_base_url_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("KORVID_READONLY_BASE_URL", raising=False)
+    path = tmp_path / "campaign.yaml"
+    path.write_text(_korvid_readonly_campaign_yaml(""), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="serving.base_url"):
+        load_campaign(path)
+
+
+def test_load_campaign_rejects_literal_korvid_readonly_base_url(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "campaign.yaml"
+    path.write_text(
+        _korvid_readonly_campaign_yaml("").replace(
+            "env:KORVID_READONLY_BASE_URL", "http://127.0.0.1:11434"
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"serving\.base_url.*env:"):
+        load_campaign(path)
+
+
+def test_load_campaign_rejects_korvid_readonly_timeout_below_runtime_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("KORVID_READONLY_BASE_URL", "http://127.0.0.1:11434")
+    path = tmp_path / "campaign.yaml"
+    path.write_text(
+        _korvid_readonly_campaign_yaml("").replace(
+            "timeout_seconds: 160", "timeout_seconds: 120"
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="serving probe"):
+        load_campaign(path)
+
+
+@pytest.mark.parametrize(
+    ("field_overrides", "message"),
+    [
+        ("  provider: grpc\n", "provider"),
+        ("  profile: medium\n", "profile"),
+        ("  timeout_seconds: 0\n", "timeout_seconds"),
+        ("  timeout_seconds: -5\n", "timeout_seconds"),
+        ("  unexpected: true\n", "unknown"),
+    ],
+)
+def test_load_campaign_rejects_invalid_korvid_readonly_serving(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, field_overrides: str, message: str
+) -> None:
+    monkeypatch.setenv("KORVID_READONLY_BASE_URL", "http://127.0.0.1:11434")
+    path = tmp_path / "campaign.yaml"
+    path.write_text(_korvid_readonly_campaign_yaml(field_overrides), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_campaign(path)
+
+
+def test_load_campaign_rejects_openai_compat_provider_with_missing_fields(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("KORVID_READONLY_BASE_URL", "http://127.0.0.1:8000/v1")
+    path = tmp_path / "campaign.yaml"
+    path.write_text(
+        (
+            """
+schema_version: 1
+campaign_id: korvid-readonly-campaign
+repetitions: 1
+models: [qwen3-4b]
+cases:
+  - case_id: oom-killed
+    template_id: template-a
+    prompt: "The database pod keeps restarting. Why?"
+    models: [qwen3-4b]
+serving:
+  backend: korvid_readonly
+  provider: openai-compat
+  base_url: env:KORVID_READONLY_BASE_URL
+  profile: full
+"""
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="serving.timeout_seconds"):
+        load_campaign(path)
+
+
+def test_readonly_small_example_matches_installed_bundled_scenarios(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The checked-in example never vendors scenario text: it hand-copies exact
+
+    case ids and authored questions from whichever Korvid wheel is installed.
+    This test re-derives that same catalog from the installed wheel so a
+    Korvid dependency bump that silently reworded a scenario fails this test
+    visibly instead of corrupting the example campaign's identity silently.
+    """
+    from korvid.evals.scenario import bundled_scenarios_dir, load_scenario
+
+    monkeypatch.setenv("KORVID_READONLY_BASE_URL", "http://127.0.0.1:11434")
+    campaign = load_campaign(ROOT / "examples/campaigns/korvid-readonly-small.yaml")
+
+    assert isinstance(campaign.serving, KorvidReadonlyServing)
+    assert campaign.serving.backend == "korvid_readonly"
+    assert campaign.serving.provider == "ollama"
+    assert campaign.serving.profile == "small"
+
+    bundled_questions = {
+        scenario.id: scenario.question
+        for scenario in (
+            load_scenario(path) for path in bundled_scenarios_dir().glob("*.yaml")
+        )
+    }
+    assert bundled_questions, "installed Korvid wheel exposed no bundled scenarios"
+
+    assert len(campaign.cases) >= 4
+    case_ids = [case.case_id for case in campaign.cases]
+    assert len(set(case_ids)) == len(case_ids), "example campaign cases must be unique"
+
+    for case in campaign.cases:
+        assert case.case_id in bundled_questions, (
+            f"{case.case_id!r} is not a scenario shipped by the installed Korvid "
+            "wheel; update examples/campaigns/korvid-readonly-small.yaml to match "
+            "the currently installed korvid[agent] distribution"
+        )
+        assert case.prompt == bundled_questions[case.case_id], (
+            f"{case.case_id!r}'s authored question changed in the installed "
+            "Korvid wheel; update examples/campaigns/korvid-readonly-small.yaml's "
+            "prompt to match verbatim rather than silently drifting from it"
+        )
+
+    train_case_ids = {"oom-killed", "crashloop-app-panic"}
+    validation_case_ids = {"image-pull-typo", "healthy-deployment"}
+    assert train_case_ids <= set(case_ids)
+    assert validation_case_ids <= set(case_ids)
+    assert train_case_ids.isdisjoint(validation_case_ids)

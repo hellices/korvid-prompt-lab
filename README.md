@@ -245,6 +245,163 @@ uv run --python 3.12 korvid-prompt-lab evaluate \
   --json
 ```
 
+### Read-only Korvid backend (`korvid_readonly`)
+
+`korvid_readonly` serves `evaluate` and `optimize` from the installed
+`korvid[agent]` wheel's own `python -m korvid.evals` CLI instead of a
+`process`/`aks_port_forward` bridge. There is nothing to vendor and nothing to
+pin: each case's exact scenario id is selected out of whatever the installed
+wheel currently bundles, projected into a private temporary scenario pack,
+handed to `korvid.evals` for exactly one repetition, and deleted again when
+the run ends. A Korvid version bump changes which scenarios exist and what
+they ask — never how Prompt Lab talks to them.
+
+```yaml
+serving:
+  backend: korvid_readonly
+  provider: ollama
+  base_url: env:KORVID_READONLY_BASE_URL
+  profile: small
+  timeout_seconds: 160
+```
+
+`provider` is `ollama` (a native ollama root URL, `/v1` is appended
+automatically) or `openai-compat` (used verbatim); `profile` is the installed
+`korvid.evals --profile` choice (`small` or `full`); `base_url` must use
+`env:` interpolation, the same convention as the AKS backend above, so no live
+endpoint is hard-coded into a checked-in campaign. Only a candidate's `system`
+and optional `append` components are supported — they map to
+`--system-prompt-file`/`--prompt-append-file` — and the runner fails closed on
+any other component, on a malformed or missing `korvid.evals` JSON result, on
+a scenario-identity mismatch, or on a timeout — with one exception: the
+installed Korvid CLI's own contract for a genuine model failure is a
+documented exit code `1` paired with an otherwise-valid, exactly-one-run result
+whose `error` is populated, and the runner reports that as
+`status: model_failure` rather than failing closed. Any other non-zero exit
+(including a signal, a success-looking result, malformed JSON, or an identity
+mismatch) still fails closed as a systemic process error.
+
+`timeout_seconds` is this runner's own whole-process budget — the
+`subprocess.run(timeout=...)` this runner enforces around the whole
+`korvid.evals` invocation — not the per-HTTP-request timeout Korvid's own
+agent loop uses internally. Handing Korvid that same value as
+`KORVID_EVAL_TIMEOUT_SECONDS` would let this runner's outer process kill
+preempt Korvid mid-iteration, before it could ever write the `run.error`
+above, turning a genuine model failure into a systemic one. The runner
+instead derives `KORVID_EVAL_TIMEOUT_SECONDS` from the effective
+`timeout_seconds` (honoring a `KorvidReadonlyRunner(timeout_seconds=...)`
+override over the campaign's own value): it first reserves the installed CLI's
+four sequential serving probes, including each probe's installed 10-second
+connect phase and 20-second response phase, then a bounded share for non-HTTP
+process overhead. The remainder is divided across the installed profile's
+`max_iterations` — read from the installed wheel via
+`korvid.agent.profiles.build_profile`, never hard-coded here. A whole-process
+budget that cannot fit the serving probe phases and process overhead is rejected
+instead of silently turning a legitimate model timeout into a systemic
+subprocess timeout.
+
+The CLI's full JSON is read only from the same private temporary pack as the
+prompt overrides and scenario. It is deleted after strict profile, prompt
+fingerprint, tool-arm, model, scenario, and run validation. Evaluation and GEPA
+artifacts retain only normalized scores, counts, labels, and usage. Each run
+also writes a normalized `response.json` for the existing comparison pipeline;
+its answer is blank and model errors are reduced to the `model_failure` label.
+The raw model answer is not included in read-only reflection records.
+
+Campaign repetitions are separate one-run CLI invocations. The installed
+Korvid 0.3 CLI has no random-seed input, so Prompt Lab records the requested
+repetition and seed in normalized evidence for auditability but does not claim
+that the backend applies deterministic seeding.
+
+The following walkthrough is a **runnable path**, not optimized journey
+evidence: it demonstrates the wiring end to end against a local model and
+makes no claim about prompt quality. `examples/campaigns/korvid-readonly-small.yaml`
+is the checked-in example; its four cases are exact scenario ids and exact
+authored questions copied verbatim from the installed Korvid 0.3 bundled
+evals (never rewritten), split disjointly into a two-case train set
+(`oom-killed`, `crashloop-app-panic`) and a two-case validation set
+(`image-pull-typo`, `healthy-deployment`). A dedicated test cross-checks those
+four cases against the installed wheel's bundled scenario catalog, so a
+Korvid dependency update that reworded one of them fails visibly instead of
+silently drifting. This is entirely separate from the write/approval
+operation journeys and their commit-SHA pin above — those still exercise
+Korvid's own Textual confirmation dialog from a source checkout and are
+untouched by anything below.
+
+1. Materialize the currently installed profile's shipped system prompt as a
+   seed candidate — no prompt text is hard-coded in Prompt Lab itself:
+
+   ```bash
+   uv run --python 3.12 korvid-prompt-lab korvid-baseline \
+     --profile small \
+     --output artifacts/baseline/korvid-baseline-small.yaml
+   ```
+
+2. Point the backend at a locally served `qwen3:0.6b` (any OpenAI-compatible
+   or ollama endpoint works; nothing here reaches a shared or public address):
+
+   ```bash
+   export KORVID_READONLY_BASE_URL=http://127.0.0.1:11434
+   ```
+
+3. Evaluate the shipped baseline on the example campaign:
+
+   ```bash
+   uv run --python 3.12 korvid-prompt-lab evaluate \
+     --candidate artifacts/baseline/korvid-baseline-small.yaml \
+     --campaign examples/campaigns/korvid-readonly-small.yaml \
+     --artifact-root artifacts/evaluate/korvid-readonly-baseline \
+     --train-case-id oom-killed \
+     --train-case-id crashloop-app-panic \
+     --validation-case-id image-pull-typo \
+     --validation-case-id healthy-deployment \
+     --json
+   ```
+
+4. Optimize with a reflection model, per the same `--reflection-model`
+   requirement documented for `optimize` above (a local ollama reflection
+   model needs no credential file, matching the Grounding Rounds convention):
+
+   ```bash
+   uv run --python 3.12 korvid-prompt-lab optimize \
+     --candidate artifacts/baseline/korvid-baseline-small.yaml \
+     --campaign examples/campaigns/korvid-readonly-small.yaml \
+     --artifact-root artifacts/optimize/korvid-readonly-small \
+     --max-metric-calls 8 \
+     --reflection-model ollama_chat/qwen3:0.6b \
+     --seed 0 \
+     --train-case-id oom-killed \
+     --train-case-id crashloop-app-panic \
+     --validation-case-id image-pull-typo \
+     --validation-case-id healthy-deployment
+   ```
+
+   The printed `best_candidate=...` path (also
+   `artifacts/optimize/korvid-readonly-small/invocations/<run_id>/best-candidate.yaml`)
+   is the candidate to evaluate next.
+
+5. Evaluate that best candidate on the identical case set used above:
+
+   ```bash
+   uv run --python 3.12 korvid-prompt-lab evaluate \
+     --candidate artifacts/optimize/korvid-readonly-small/invocations/<run_id>/best-candidate.yaml \
+     --campaign examples/campaigns/korvid-readonly-small.yaml \
+     --artifact-root artifacts/evaluate/korvid-readonly-best \
+     --train-case-id oom-killed \
+     --train-case-id crashloop-app-panic \
+     --validation-case-id image-pull-typo \
+     --validation-case-id healthy-deployment \
+     --json
+   ```
+
+6. Compare the two runs concisely: `evaluation-summary.json` under
+   `artifacts/evaluate/korvid-readonly-baseline/` and
+   `artifacts/evaluate/korvid-readonly-best/` are the before/after artifacts —
+   both record the same candidate/campaign identity fields, case coverage, and
+   train/validation provenance described in **Evaluate** above, so their
+   `aggregate score`/`pass^3`/`pass^5` fields are directly comparable without
+   any additional tooling.
+
 ## The `korvid-bridge` entry point
 
 `korvid-bridge` is the real bridge this repository ships. It runs exactly one

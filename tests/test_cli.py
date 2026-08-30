@@ -18,8 +18,17 @@ from korvid_prompt_lab.aks import (
     AKSPreflightTransientError,
 )
 from korvid_prompt_lab.cli import main
+from korvid_prompt_lab.rounds import build_round_report
 
 ROOT = Path(__file__).resolve().parents[1]
+
+#: Real scenarios shipped with the installed Korvid wheel, used so korvid_readonly
+#: fixtures exercise the genuine bundled catalog rather than a hand-rolled stand-in.
+REAL_SCENARIO_ID = "oom-killed"
+REAL_SCENARIO_QUESTION = "Why does the worker pod in namespace jobs keep dying?"
+REAL_SCENARIO_ID_2 = "image-pull-typo"
+REAL_SCENARIO_QUESTION_2 = "Pod web-1 in namespace front is stuck in ImagePullBackOff. What is the cause?"
+FAKE_KORVID_EVALS = ROOT / "tests" / "fixtures" / "fake_korvid_evals.py"
 
 
 def _run_cli(args: list[str]) -> tuple[int, str, str]:
@@ -125,6 +134,47 @@ def _aks_campaign_payload(
                 "{response}",
             ],
         },
+    }
+
+
+def _korvid_readonly_campaign_payload(
+    *,
+    cases: tuple[tuple[str, str], ...] = ((REAL_SCENARIO_ID, REAL_SCENARIO_QUESTION),),
+    campaign_id: str = "korvid-readonly-smoke",
+    base_url_env: str = "KORVID_READONLY_TEST_BASE_URL",
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "campaign_id": campaign_id,
+        "repetitions": 1,
+        "models": ["mock-small"],
+        "cases": [
+            {
+                "case_id": case_id,
+                "template_id": "readonly-template",
+                "prompt": prompt,
+                "models": ["mock-small"],
+            }
+            for case_id, prompt in cases
+        ],
+        "serving": {
+            "backend": "korvid_readonly",
+            "provider": "openai-compat",
+            "base_url": f"env:{base_url_env}",
+            "profile": "small",
+            "timeout_seconds": 160,
+        },
+    }
+
+
+def _readonly_candidate_payload() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "candidate_id": "readonly-candidate",
+        "components": {
+            "system": "You are korvid's read-only diagnostic agent.",
+        },
+        "metadata": {"source": "test"},
     }
 
 
@@ -2547,6 +2597,208 @@ def test_evaluate_rejects_a_non_positive_campaign_bridge_timeout(
     assert exit_code == 2
     assert stdout == ""
     assert "bridge_timeout_seconds must be a positive number" in stderr
+
+
+# ---------------------------------------------------------------------------
+# korvid_readonly runner selection (Task 3: shared runner protocol wiring)
+# ---------------------------------------------------------------------------
+
+
+def _patch_runner_recorders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[Any], list[Any]]:
+    from korvid_prompt_lab import cli as cli_module
+
+    process_created: list[Any] = []
+    readonly_created: list[Any] = []
+    real_process_runner = cli_module.KorvidProcessRunner
+    real_readonly_runner = cli_module.KorvidReadonlyRunner
+
+    def recording_process_runner(**kwargs: Any) -> Any:
+        runner = real_process_runner(**kwargs)
+        process_created.append(runner)
+        return runner
+
+    def recording_readonly_runner(**kwargs: Any) -> Any:
+        runner = real_readonly_runner(**kwargs)
+        readonly_created.append(runner)
+        return runner
+
+    monkeypatch.setattr(
+        "korvid_prompt_lab.cli.KorvidProcessRunner", recording_process_runner
+    )
+    monkeypatch.setattr(
+        "korvid_prompt_lab.cli.KorvidReadonlyRunner", recording_readonly_runner
+    )
+    return process_created, readonly_created
+
+
+def test_command_evaluate_selects_the_readonly_runner_for_korvid_readonly_campaigns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    process_created, readonly_created = _patch_runner_recorders(monkeypatch)
+    monkeypatch.setattr(
+        "korvid_prompt_lab.korvid_readonly._KORVID_EVALS_COMMAND",
+        (sys.executable, str(FAKE_KORVID_EVALS)),
+    )
+    monkeypatch.setenv("KORVID_READONLY_TEST_BASE_URL", "http://127.0.0.1:41001/v1")
+
+    candidate_path = _write_yaml(
+        tmp_path / "candidate.yaml", _readonly_candidate_payload()
+    )
+    campaign_path = _write_yaml(
+        tmp_path / "campaign.yaml",
+        _korvid_readonly_campaign_payload(
+            cases=(
+                (REAL_SCENARIO_ID, REAL_SCENARIO_QUESTION),
+                (REAL_SCENARIO_ID_2, REAL_SCENARIO_QUESTION_2),
+            )
+        ),
+    )
+
+    exit_code, _stdout, stderr = _run_cli(
+        _evaluate_args(
+            candidate_path,
+            campaign_path,
+            tmp_path / "artifacts",
+            train=(REAL_SCENARIO_ID,),
+            validation=(REAL_SCENARIO_ID_2,),
+        )
+    )
+
+    assert exit_code == 0, stderr
+    assert len(readonly_created) == 1
+    assert not process_created
+    artifacts = tmp_path / "artifacts"
+    responses = sorted((artifacts / "runs").glob("*/response.json"))
+    assert len(responses) == 2
+    assert all(json.loads(path.read_text(encoding="utf-8"))["answer"] == "" for path in responses)
+    for path in responses:
+        source = json.loads(path.read_text(encoding="utf-8"))["evidence_source"]
+        assert source["kind"] == "korvid_readonly"
+        assert source["korvid_version"]
+        assert len(source["scenario_sha256"]) == 64
+    report = build_round_report(artifacts)
+    assert report.candidate_id == "readonly-candidate"
+    assert len(report.evidence_sources) == 2
+
+
+def test_command_evaluate_still_selects_the_process_runner_for_process_campaigns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    process_created, readonly_created = _patch_runner_recorders(monkeypatch)
+
+    candidate_path = _write_yaml(tmp_path / "candidate.yaml", _candidate_payload())
+    campaign_path = _write_yaml(
+        tmp_path / "campaign.yaml",
+        _process_campaign_payload("smoke-happy", extra_case_ids=("smoke-guardrail",)),
+    )
+
+    exit_code, _stdout, stderr = _run_cli(
+        _evaluate_args(candidate_path, campaign_path, tmp_path / "artifacts")
+    )
+
+    assert exit_code == 0, stderr
+    assert len(process_created) == 1
+    assert not readonly_created
+
+
+def test_command_optimize_selects_the_readonly_runner_for_korvid_readonly_campaigns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    process_created, readonly_created = _patch_runner_recorders(monkeypatch)
+    monkeypatch.setattr(
+        "korvid_prompt_lab.korvid_readonly._KORVID_EVALS_COMMAND",
+        (sys.executable, str(FAKE_KORVID_EVALS)),
+    )
+    monkeypatch.setenv("KORVID_READONLY_TEST_BASE_URL", "http://127.0.0.1:41001/v1")
+    monkeypatch.setattr(
+        "korvid_prompt_lab.cli._build_reflection_lm", lambda model: {"model": model}
+    )
+    monkeypatch.setattr(
+        "korvid_prompt_lab.cli.optimize_campaign",
+        lambda **kwargs: _fake_optimization_artifacts(
+            tmp_path / "invocation", kwargs
+        ),
+    )
+
+    candidate_path = _write_yaml(
+        tmp_path / "candidate.yaml", _readonly_candidate_payload()
+    )
+    campaign_path = _write_yaml(
+        tmp_path / "campaign.yaml",
+        _korvid_readonly_campaign_payload(
+            cases=(
+                (REAL_SCENARIO_ID, REAL_SCENARIO_QUESTION),
+                (REAL_SCENARIO_ID_2, REAL_SCENARIO_QUESTION_2),
+            )
+        ),
+    )
+
+    exit_code, _stdout, stderr = _run_cli(
+        [
+            "optimize",
+            "--candidate",
+            str(candidate_path),
+            "--campaign",
+            str(campaign_path),
+            "--artifact-root",
+            str(tmp_path / "optimization"),
+            "--max-metric-calls",
+            "2",
+            "--reflection-model",
+            "openai/gpt-4.1-mini",
+            "--train-case-id",
+            REAL_SCENARIO_ID,
+            "--validation-case-id",
+            REAL_SCENARIO_ID_2,
+        ]
+    )
+
+    assert exit_code == 0, stderr
+    assert len(readonly_created) == 1
+    assert not process_created
+
+
+def test_command_evaluate_accepts_the_korvid_baseline_produced_candidate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The korvid-baseline CLI's output must be usable, unmodified, against a real
+    korvid_readonly campaign backed by the installed korvid.evals CLI shape."""
+    from korvid_prompt_lab.baseline import (
+        build_baseline_candidate,
+        write_baseline_candidate,
+    )
+
+    monkeypatch.setattr(
+        "korvid_prompt_lab.korvid_readonly._KORVID_EVALS_COMMAND",
+        (sys.executable, str(FAKE_KORVID_EVALS)),
+    )
+    monkeypatch.setenv("KORVID_READONLY_TEST_BASE_URL", "http://127.0.0.1:41001/v1")
+
+    candidate_path = tmp_path / "baseline-candidate.yaml"
+    write_baseline_candidate(build_baseline_candidate("small"), candidate_path)
+    campaign_path = _write_yaml(
+        tmp_path / "campaign.yaml",
+        _korvid_readonly_campaign_payload(
+            cases=(
+                (REAL_SCENARIO_ID, REAL_SCENARIO_QUESTION),
+                (REAL_SCENARIO_ID_2, REAL_SCENARIO_QUESTION_2),
+            )
+        ),
+    )
+
+    exit_code, _stdout, stderr = _run_cli(
+        _evaluate_args(
+            candidate_path,
+            campaign_path,
+            tmp_path / "artifacts",
+            train=(REAL_SCENARIO_ID,),
+            validation=(REAL_SCENARIO_ID_2,),
+        )
+    )
+
+    assert exit_code == 0, stderr
 
 
 def _fake_optimization_artifacts(invocation_dir: Path, kwargs: dict[str, Any]) -> Any:

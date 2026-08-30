@@ -115,7 +115,7 @@ def _make_state(started_at: str | None = None) -> CampaignState:
         seed_candidate_fingerprint=SEED_FINGERPRINT,
         champion_score=CampaignScore(
             fingerprint=SEED_FINGERPRINT,
-            aggregate=0.0,
+            aggregate=0.4,
             hard_safety_failures=0,
             core_regression=False,
             systemic_failures=0,
@@ -186,6 +186,67 @@ def _write_evidence(
     (evidence_path / "evaluation-summary.json").write_text(
         json.dumps(eval_summary),
     )
+    before_summary = {
+        **eval_summary,
+        "candidate_id": "seed-candidate",
+        "candidate_fingerprint": SEED_FINGERPRINT,
+        "aggregate_score": 0.4,
+        "model_scores": {"qwen3:0.6b": 0.4},
+        "pass_at_3": 0.0,
+        "pass_at_5": 0.0,
+        "artifact_refs": [
+            "before-evaluation-summary.json",
+            *[
+                f"before-responses/case-c-r{repetition:02d}.json"
+                for repetition in range(1, 6)
+            ],
+        ],
+    }
+    (evidence_path / "before-evaluation-summary.json").write_text(
+        json.dumps(before_summary)
+    )
+    before_responses = evidence_path / "before-responses"
+    before_responses.mkdir()
+    for repetition in range(1, 6):
+        (before_responses / f"case-c-r{repetition:02d}.json").write_text(
+            json.dumps(
+                {
+                    "protocol_version": 1,
+                    "status": "completed",
+                    "execution_mode": "live",
+                    "candidate_fingerprint": SEED_FINGERPRINT,
+                    "request_identity": {
+                        "case_id": "case-c",
+                        "template_id": "case-c-template",
+                        "model": "qwen3:0.6b",
+                        "repetition": repetition,
+                        "seed": repetition - 1,
+                    },
+                    "grade": {
+                        "completion": 0.0,
+                        "verification": 1.0,
+                        "efficiency": 1.0,
+                        "hard_failures": [],
+                    },
+                    "answer": "",
+                    "journal": {
+                        "journey_id": "",
+                        "checkpoints": [],
+                        "missing_checkpoints": [],
+                        "checkpoint_counts": {},
+                        "journal_event_count": 0,
+                        "audit_record_count": 0,
+                        "hard_failure_count": 0,
+                    },
+                    "usage": {
+                        "tool_calls": 0,
+                        "iterations": 1,
+                        "wall_time_seconds": 1.0,
+                    },
+                    "error": None,
+                }
+            )
+        )
 
     round_summary = {
         "schema_version": 1,
@@ -253,7 +314,7 @@ def _write_evidence(
                 "core": True,
             },
         ],
-        "improved_count": 0,
+        "improved_count": 1,
         "unchanged_count": 1,
         "regressed_count": 0,
         "not_comparable_count": 0,
@@ -474,9 +535,9 @@ class TestCLIAdvance:
         new_state = json.loads(output_state.read_text())
         assert new_state["status"] == "running"
         assert new_state["seed_index"] == 1
-        assert new_state["metric_calls_used"] == 10
+        assert new_state["metric_calls_used"] == 15
 
-    def test_system_error_advances_retry_without_consuming_budget(
+    def test_system_error_advances_retry_without_metric_charge(
         self, tmp_path: Path,
     ) -> None:
         state_path = tmp_path / "state.json"

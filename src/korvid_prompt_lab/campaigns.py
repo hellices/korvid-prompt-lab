@@ -80,6 +80,7 @@ class OptimizationCampaign:
     infrastructure_retry_limit: int
     stagnation_attempt_limit: int
     confirmation_runs: int
+    evaluation_backend: str = "process"
 
     @classmethod
     def from_mapping(
@@ -183,6 +184,7 @@ class OptimizationCampaign:
             confirmation_runs=_require_positive_int(
                 mapping.get("confirmation_runs"), "confirmation_runs"
             ),
+            evaluation_backend=evaluation_campaign.serving.backend,
         )
 
 
@@ -405,6 +407,7 @@ class AttemptOutcome:
     error_message: str | None = None
     metric_calls_used: int | None = None
     search_improved: bool | None = None
+    incumbent_score: CampaignScore | None = None
 
 
 _CANDIDATE_FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
@@ -483,10 +486,8 @@ def _is_strictly_better(candidate: CampaignScore, champion: CampaignScore) -> bo
 
 def _has_unmeasured_incumbent(state: CampaignState) -> bool:
     return (
-        state.tier_index == 0
-        and state.stage_index == 0
+        state.stage_index == 0
         and state.seed_index == 0
-        and state.metric_calls_used == 0
         and state.stagnation_attempts == 0
         and state.champion_fingerprint == state.seed_candidate_fingerprint
     )
@@ -912,7 +913,6 @@ def advance_state(
 
     started = datetime.fromisoformat(state.started_at)
     elapsed = (now - started).total_seconds()
-
     # --- CONFIG_ERROR outcome: terminal ---
     if outcome.kind == "config_error":
         return CampaignState(
@@ -946,8 +946,15 @@ def advance_state(
         # `infrastructure_retry_limit` is the number of retries *allowed* per
         # attempt: the limit-th consecutive system error still retries the same
         # logical action; the next one terminates.
-        if new_retries > control.infrastructure_retry_limit or wall_clock_exceeded:
-            stop = "wall_clock_limit_exceeded" if wall_clock_exceeded else "infrastructure_retry_limit_exhausted"
+        if (
+            new_retries > control.infrastructure_retry_limit
+            or wall_clock_exceeded
+        ):
+            stop = (
+                "wall_clock_limit_exceeded"
+                if wall_clock_exceeded
+                else "infrastructure_retry_limit_exhausted"
+            )
             return CampaignState(
                 schema_version=state.schema_version,
                 campaign_id=state.campaign_id,
@@ -1016,36 +1023,70 @@ def advance_state(
                 f"outcome.metric_calls_used ({metric_calls_used}) exceeds "
                 f"bounded GEPA maximum ({maximum})"
             )
+        metric_calls_used = maximum
     elif metric_calls_used != 0:
         raise ValueError("milestone and confirmation outcomes must use zero metric calls")
     new_metric_calls = state.metric_calls_used + metric_calls_used
 
     if action.kind is ActionKind.SEARCH:
         candidate_score = outcome.score
-
-        first_measurement = (
-            _has_unmeasured_incumbent(state)
-            and outcome.search_improved is True
+        if not isinstance(outcome.search_improved, bool):
+            raise ValueError("SEARCH outcome requires search_improved")
+        unmeasured_incumbent = _has_unmeasured_incumbent(state)
+        if unmeasured_incumbent:
+            if candidate_score.fingerprint == state.champion_fingerprint:
+                if outcome.search_improved:
+                    raise ValueError(
+                        "unchanged unmeasured incumbent cannot be search_improved"
+                    )
+                new_champion_fp = state.champion_fingerprint
+                new_champion_score = candidate_score
+                new_stagnation = state.stagnation_attempts + 1
+            else:
+                if (
+                    outcome.search_improved
+                    and candidate_score.systemic_failures == 0
+                    and not candidate_score.core_regression
+                ):
+                    new_champion_fp = candidate_score.fingerprint
+                    new_champion_score = candidate_score
+                    new_stagnation = 0
+                else:
+                    incumbent_score = outcome.incumbent_score
+                    if (
+                        incumbent_score is None
+                        or incumbent_score.fingerprint
+                        != state.champion_fingerprint
+                    ):
+                        raise ValueError(
+                            "unmeasured changed candidate requires validated "
+                            "incumbent_score"
+                        )
+                    new_champion_fp = state.champion_fingerprint
+                    new_champion_score = incumbent_score
+                    new_stagnation = state.stagnation_attempts + 1
+        elif candidate_score.fingerprint == state.champion_fingerprint:
+            if outcome.search_improved:
+                raise ValueError(
+                    "unchanged candidate fingerprint cannot be search_improved"
+                )
+            new_champion_fp = state.champion_fingerprint
+            new_champion_score = (
+                candidate_score
+                if candidate_score.systemic_failures == 0
+                and not candidate_score.core_regression
+                else state.champion_score
+            )
+            new_stagnation = state.stagnation_attempts + 1
+        elif (
+            candidate_score.fingerprint != state.champion_fingerprint
+            and outcome.search_improved
             and candidate_score.systemic_failures == 0
             and not candidate_score.core_regression
-        )
-        if first_measurement or (
-            candidate_score.fingerprint != state.champion_fingerprint
-            and _is_strictly_better(candidate_score, state.champion_score)
         ):
             new_champion_fp = candidate_score.fingerprint
             new_champion_score = candidate_score
             new_stagnation = 0
-        elif (
-            _has_unmeasured_incumbent(state)
-            and outcome.search_improved is False
-            and candidate_score.fingerprint == state.champion_fingerprint
-            and candidate_score.systemic_failures == 0
-            and not candidate_score.core_regression
-        ):
-            new_champion_fp = state.champion_fingerprint
-            new_champion_score = candidate_score
-            new_stagnation = state.stagnation_attempts + 1
         else:
             new_champion_fp = state.champion_fingerprint
             new_champion_score = state.champion_score

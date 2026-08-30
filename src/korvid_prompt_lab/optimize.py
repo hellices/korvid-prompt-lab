@@ -18,7 +18,7 @@ from .artifacts import write_json_artifact
 from .campaigns import GEPA_REFLECTION_MINIBATCH_SIZE
 from .contracts import Candidate, EvalCase
 from .reflection import DSPyInstructionProposer
-from .runner import KorvidProcessRunner
+from .runner import KorvidRunner
 
 DEFAULT_OPTIMIZATION_SEED = 0
 RUN_IDENTITY_SCHEMA_VERSION = 1
@@ -38,7 +38,7 @@ class OptimizationArtifacts:
 
 def optimize_campaign(
     *,
-    runner: KorvidProcessRunner,
+    runner: KorvidRunner,
     seed_candidate: Candidate,
     train_cases: Sequence[EvalCase],
     validation_cases: Sequence[EvalCase],
@@ -159,7 +159,7 @@ def optimize_campaign(
 
 def _run_identity(
     *,
-    runner: KorvidProcessRunner,
+    runner: KorvidRunner,
     seed_candidate: Candidate,
     train_case_ids: Sequence[str],
     validation_case_ids: Sequence[str],

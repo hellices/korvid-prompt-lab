@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 import yaml  # type: ignore[import-untyped]
 
+from korvid_prompt_lab import rounds
 from korvid_prompt_lab.bridge_worker import EXECUTION_MODE_LIVE, PROTOCOL_VERSION
 from korvid_prompt_lab.contracts import Candidate
 from korvid_prompt_lab.round_cli import main
@@ -82,6 +83,190 @@ def test_build_round_report_rejects_response_fingerprint_mismatch(tmp_path: Path
 
     with pytest.raises(ValueError, match="fingerprint"):
         build_round_report(artifact_root)
+
+
+def test_build_round_report_rejects_oversized_json_artifact(tmp_path: Path) -> None:
+    artifact_root = write_live_fixture(tmp_path)
+    path = artifact_root / "evaluation-summary.json"
+    path.write_bytes(path.read_bytes() + b" " * 1_100_000)
+
+    with pytest.raises(ValueError, match="too large"):
+        build_round_report(artifact_root)
+
+
+def test_build_round_report_rejects_intermediate_directory_swap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    artifact_root = write_live_fixture(tmp_path)
+    original_runs = artifact_root / "original-runs"
+    real_open = rounds.os.open
+    swapped = False
+
+    def swapping_open(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if path == "runs" and dir_fd is not None and not swapped:
+            swapped = True
+            (artifact_root / "runs").rename(original_runs)
+            (artifact_root / "runs").symlink_to(original_runs, target_is_directory=True)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(rounds.os, "open", swapping_open)
+
+    with pytest.raises(ValueError, match="could not read|symlink"):
+        build_round_report(artifact_root)
+
+
+def test_safe_evidence_parses_each_source_json_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    artifact_root = write_live_fixture(
+        tmp_path / "input",
+        responses=[
+            response("completed", case_id="case-a"),
+            response("completed", case_id="case-b"),
+        ],
+        evaluated_case_ids=["case-a", "case-b"],
+    )
+    calls: dict[Path, int] = {}
+    real_load = rounds._load_json_mapping
+
+    def recording_load(path: Path, **kwargs: Any) -> Mapping[str, Any]:
+        calls[path] = calls.get(path, 0) + 1
+        return real_load(path, **kwargs)
+
+    monkeypatch.setattr(rounds, "_load_json_mapping", recording_load)
+
+    write_safe_evidence(artifact_root, tmp_path / "safe")
+
+    assert calls
+    assert all(count == 1 for count in calls.values())
+
+
+def test_safe_evidence_redacts_process_model_failure_error(
+    tmp_path: Path,
+) -> None:
+    raw_error = "provider failed at https://secret.example?token=credential"
+    artifact_root = write_live_fixture(
+        tmp_path / "input",
+        responses=[response("model_failure", error=raw_error)],
+        aggregate_score=0.0,
+        pass_at_3=0.0,
+        pass_at_5=0.0,
+    )
+    safe_output = tmp_path / "safe"
+
+    write_safe_evidence(artifact_root, safe_output)
+
+    safe_text = all_safe_text(safe_output)
+    assert raw_error not in safe_text
+    projected = json.loads(
+        next((safe_output / "responses").glob("*.json")).read_text()
+    )
+    assert projected["error"] == "model_failure"
+
+
+def test_safe_evidence_redacts_process_journal_identifiers(
+    tmp_path: Path,
+) -> None:
+    raw_secret = "secret-bearing-journey-and-checkpoint"
+    payload = response("completed")
+    payload["journal"]["journey_id"] = raw_secret
+    payload["journal"]["checkpoints"] = [raw_secret]
+    payload["journal"]["missing_checkpoints"] = [raw_secret]
+    payload["journal"]["checkpoint_counts"] = {raw_secret: 1}
+    artifact_root = write_live_fixture(
+        tmp_path / "input", responses=[payload]
+    )
+    safe_output = tmp_path / "safe"
+
+    write_safe_evidence(artifact_root, safe_output)
+
+    safe_text = all_safe_text(safe_output)
+    assert raw_secret not in safe_text
+    projected = json.loads(
+        next((safe_output / "responses").glob("*.json")).read_text()
+    )
+    assert projected["journal"]["journey_id"] == ""
+    assert projected["journal"]["checkpoints"] == []
+    assert projected["journal"]["missing_checkpoints"] == []
+    assert projected["journal"]["checkpoint_counts"] == {}
+
+
+def test_safe_evidence_rejects_oversized_best_candidate_yaml(
+    tmp_path: Path,
+) -> None:
+    artifact_root = write_live_fixture(
+        tmp_path / "input",
+        include_optimization=True,
+        include_best_candidate=True,
+    )
+    path = artifact_root / "best-candidate.yaml"
+    path.write_bytes(path.read_bytes() + b" " * 1_100_000)
+
+    with pytest.raises(ValueError, match="too large"):
+        write_safe_evidence(artifact_root, tmp_path / "safe")
+
+
+def test_safe_evidence_rejects_best_candidate_symlink_inside_root(
+    tmp_path: Path,
+) -> None:
+    artifact_root = write_live_fixture(
+        tmp_path / "input",
+        include_optimization=True,
+        include_best_candidate=True,
+    )
+    candidate_path = artifact_root / "best-candidate.yaml"
+    target_path = artifact_root / "candidate-target.yaml"
+    candidate_path.rename(target_path)
+    candidate_path.symlink_to(target_path.name)
+
+    with pytest.raises(ValueError, match="malformed|symlink|could not read"):
+        write_safe_evidence(artifact_root, tmp_path / "safe")
+
+
+def test_build_round_report_rejects_unsafe_evidence_source_version(
+    tmp_path: Path,
+) -> None:
+    payload = response("completed")
+    payload["evidence_source"] = {
+        "kind": "korvid_readonly",
+        "korvid_version": "secret\n" * 100,
+        "scenario_sha256": "a" * 64,
+    }
+    artifact_root = write_live_fixture(tmp_path, responses=[payload])
+
+    with pytest.raises(ValueError, match="korvid_version"):
+        build_round_report(artifact_root)
+
+
+def test_safe_readonly_round_summary_carries_backend_provenance(
+    tmp_path: Path,
+) -> None:
+    payload = response("completed")
+    payload["evidence_source"] = {
+        "kind": "korvid_readonly",
+        "korvid_version": "0.3.0",
+        "scenario_sha256": "a" * 64,
+    }
+    artifact_root = write_live_fixture(tmp_path / "input", responses=[payload])
+    safe_output = tmp_path / "safe"
+
+    write_safe_evidence(artifact_root, safe_output)
+
+    summary = json.loads(
+        (safe_output / "round-summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["schema_version"] == 2
+    assert summary["evaluation_backend"] == "korvid_readonly"
+    assert summary["evidence_sources"] == [
+        ["case-a", "model-a", 1, "korvid_readonly", "0.3.0", "a" * 64]
+    ]
 
 
 def test_build_round_report_rejects_missing_duplicate_and_extra_evidence(tmp_path: Path) -> None:
