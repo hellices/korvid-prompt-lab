@@ -89,6 +89,20 @@ PASS — bounded proposer now catches only explicit built-in and LiteLLM transpo
 - `uv run --python 3.12 ruff check src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py tests/test_reflection.py tests/test_stable_proposer.py`
 - `uv run --python 3.12 mypy src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py`
 
+## Review Fix 7
+
+PASS — propose() now fails closed on forged request shapes before serialization, and safe_propose converts entrypoint validation errors to None.
+
+## Commit
+
+- `2b3161b` — `fix(search): harden bounded proposer entrypoint`
+
+## Tests
+
+- `uv run --python 3.12 pytest -q tests/test_reflection.py tests/test_stable_proposer.py tests/test_optimize.py`
+- `uv run --python 3.12 ruff check src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py tests/test_reflection.py tests/test_stable_proposer.py`
+- `uv run --python 3.12 mypy src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py`
+
 ## Review Fix 2
 
 PASS — safe_propose now isolates expected LM/runtime/transport failures without swallowing TypeError or other programming bugs.
