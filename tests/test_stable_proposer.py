@@ -163,8 +163,16 @@ def test_bounded_append_proposer_rejects_blank_or_overlong_output(
         proposer.propose(request)
 
 
-@pytest.mark.parametrize("error", [TimeoutError("slow"), subprocess.TimeoutExpired("dspy", 1.0)])
-def test_bounded_append_proposer_safe_propose_returns_none_on_timeout(
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError("slow"),
+        subprocess.TimeoutExpired("dspy", 1.0),
+        RuntimeError("lm runtime exploded"),
+        ConnectionError("transport broke"),
+    ],
+)
+def test_bounded_append_proposer_safe_propose_returns_none_on_expected_failures(
     monkeypatch: pytest.MonkeyPatch, error: BaseException
 ) -> None:
     class FakePredict:
@@ -186,3 +194,26 @@ def test_bounded_append_proposer_safe_propose_returns_none_on_timeout(
         )
         is None
     )
+
+
+def test_bounded_append_proposer_safe_propose_does_not_swallow_programming_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePredict:
+        def __init__(self, signature: object) -> None:
+            self.signature = signature
+
+        def __call__(self, **kwargs: object) -> SimpleNamespace:
+            raise TypeError("bug")
+
+    monkeypatch.setattr("korvid_prompt_lab.stable_proposer.dspy.Predict", FakePredict)
+
+    proposer = BoundedAppendProposer(reflection_lm=object())
+
+    with pytest.raises(TypeError, match="bug"):
+        proposer.safe_propose(
+            object(),
+            finalist_append="inspect runtime evidence before stating a diagnosis.",
+            failure_axis=CandidateAxis.EVIDENCE_FIRST.value,
+            bounded_feedback=_measurement(),
+        )

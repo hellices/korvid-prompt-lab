@@ -21,6 +21,7 @@ __all__ = [
 ]
 
 _MAX_BOUNDED_APPEND_LENGTH = 480
+_SAFE_PROPOSE_FAILURES = (ValueError, TimeoutError, subprocess.TimeoutExpired, RuntimeError, OSError)
 _AGGREGATE_FIELD_NAMES = (
     "mean_score",
     "score_variance",
@@ -98,7 +99,7 @@ class BoundedAppendProposer:
                 else build_proposal_request(request_or_context, **kwargs)
             )
             return self.propose(request)
-        except (ValueError, TimeoutError, subprocess.TimeoutExpired):
+        except _SAFE_PROPOSE_FAILURES:
             return None
 
     def _predictor_or_raise(self) -> dspy.Predict:
