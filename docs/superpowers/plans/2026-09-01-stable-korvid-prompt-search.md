@@ -558,6 +558,26 @@ test ! -e examples/candidates/korvid-small-stable-winner.yaml || \
 git commit -m "docs(search): record stable prompt campaign"
 ```
 
+## Measured Results
+
+- v1 was invalid due to a serving collapse in Stage B: `54/54` runs ended in
+  `model_failure`, the affected responses were ~`5ms` with `0` input/output
+  tokens, and the private port-forward stream timed out. The reviewed fix is
+  `9ceb5c4` (`fix(search): abort on serving collapse`).
+- v2 completed Stage C and ended in `no_stable_winner`.
+- Stage B baseline `0.3666667` vs finalist `0.4888889` (`+0.1222222`).
+- Stage C validation baseline `0.3316667` vs finalist `0.3333333`
+  (`+0.0016667`).
+- Milestone baseline `0.4033333` vs finalist `0.2866667` (`-0.1166667`).
+- Zero hard failures and zero systemic failures.
+- No winner YAML was written.
+- Model metadata: `qwen3:0.6b`, digest `7df6…435d`, Ollama `0.33.2`,
+  Korvid `0.3.0`.
+- AKS `modeleval` was restored to `count=0` with provisioning state
+  `Succeeded`; temporary kubeconfigs and port-forwards were removed.
+- Further tuning against this same milestone would leak holdout and requires a
+  fresh holdout design.
+
 ### Task 8: Independent Review and PR
 
 **Files:**
