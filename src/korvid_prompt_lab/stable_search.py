@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import re
+import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -7,7 +10,7 @@ from typing import Any, Literal
 
 from .artifacts import write_json_artifact
 from .contracts import Candidate, EvalCase
-from .runner import KorvidRunner
+from .runner import BridgeStatusError, KorvidRunner
 from .scoring import BridgeResult, result_passed, score_result
 from .stable_candidates import StructuredCandidate
 from .stable_ranking import (
@@ -26,6 +29,42 @@ __all__ = ["StableSearchArtifacts", "StableSearchConfig", "run_stable_search"]
 
 _SEARCH_SCHEMA_VERSION = 1
 _SCOREABLE_STATUSES = frozenset({"completed", "model_failure"})
+_JOURNAL_INT_FIELDS = frozenset(
+    {
+        "audit_record_count",
+        "forbidden_mentions",
+        "hard_failure_count",
+        "journal_event_count",
+        "malformed_tool_calls",
+        "missing_evidence",
+        "missing_mentions",
+        "on_target_tool_calls",
+        "resolvable_tool_calls",
+        "tool_calls",
+    }
+)
+_JOURNAL_BOOL_FIELDS = frozenset({"diagnosis_success", "evidence_fetched"})
+_JOURNAL_FLOAT_FIELDS = frozenset({"citation_coverage", "citation_precision"})
+_JOURNAL_STRING_LIST_FIELDS = frozenset(
+    {
+        "checkpoints",
+        "hard_failure_labels",
+        "missing_checkpoints",
+    }
+)
+_JOURNAL_COUNT_MAP_FIELDS = frozenset({"checkpoint_counts"})
+_USAGE_INT_FIELDS = frozenset(
+    {
+        "completion_tokens",
+        "input_tokens",
+        "iterations",
+        "output_tokens",
+        "prompt_tokens",
+        "tool_calls",
+    }
+)
+_USAGE_BOOL_FIELDS = frozenset({"tokens_estimated"})
+_USAGE_FLOAT_FIELDS = frozenset({"wall_time_s", "wall_time_seconds"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,13 +426,45 @@ def _run_candidate(
     records: list[NormalizedRunRecord] = []
     for case in cases:
         for repetition in range(1, repetitions + 1):
-            run_dir = stage_dir / "runs" / candidate.candidate_id / split / case.case_id / f"r{repetition:02d}"
+            raw_run_dir = _run_artifact_dir(
+                stage_dir=stage_dir,
+                namespace="_runner",
+                candidate_id=candidate.candidate_id,
+                split=split,
+                case_id=case.case_id,
+                repetition=repetition,
+            )
+            normalized_run_dir = _run_artifact_dir(
+                stage_dir=stage_dir,
+                namespace="runs",
+                candidate_id=candidate.candidate_id,
+                split=split,
+                case_id=case.case_id,
+                repetition=repetition,
+            )
             try:
-                result = runner.run(candidate, case, run_dir, repetition=repetition, seed=repetition - 1)
+                result = runner.run(
+                    candidate,
+                    case,
+                    raw_run_dir,
+                    repetition=repetition,
+                    seed=repetition - 1,
+                )
             finally:
-                _remove_request_artifact(run_dir)
+                _remove_runner_artifacts(raw_run_dir)
             execution_modes.observe(result.execution_mode)
             record = _normalize_result(candidate, split, case.case_id, repetition, result)
+            write_json_artifact(
+                normalized_run_dir / "response.json",
+                _normalized_run_artifact(
+                    candidate=candidate,
+                    case=case,
+                    split=split,
+                    repetition=repetition,
+                    result=result,
+                    record=record,
+                ),
+            )
             records.append(record)
             if _should_stop_early(record):
                 return tuple(records)
@@ -425,10 +496,7 @@ def _normalize_result(
         passed = False
         hard_safety_failures = 0
     else:
-        score = 0.0
-        verification = 0.0
-        passed = False
-        hard_safety_failures = 0 if result.grade is None else len(result.grade.hard_failures)
+        raise BridgeStatusError(f"runner returned systemic status: {result.status}")
 
     tool_calls = _journal_count(result.journal, "tool_calls")
     resolvable_tool_calls = _journal_count(result.journal, "resolvable_tool_calls")
@@ -530,13 +598,178 @@ def _journal_count(journal: Mapping[str, Any], field_name: str) -> int:
     return value
 
 
-def _remove_request_artifact(run_dir: Path) -> None:
-    request_path = run_dir / "request.json"
-    if request_path.is_symlink():
-        raise ValueError(f"stable search request artifact must not be a symlink: {request_path}")
-    if request_path.exists():
-        request_path.unlink()
+def _remove_runner_artifacts(run_dir: Path) -> None:
+    if run_dir.is_symlink():
+        raise ValueError(f"stable search runner artifact directory must not be a symlink: {run_dir}")
+    if not run_dir.exists():
+        return
+    shutil.rmtree(run_dir)
+    _prune_empty_parents(run_dir)
 
+
+def _run_artifact_dir(
+    *,
+    stage_dir: Path,
+    namespace: str,
+    candidate_id: str,
+    split: str,
+    case_id: str,
+    repetition: int,
+) -> Path:
+    return (
+        stage_dir
+        / namespace
+        / _safe_path_component(candidate_id, fallback="candidate")
+        / _safe_path_component(split, fallback="split")
+        / _safe_path_component(case_id, fallback="case")
+        / f"r{repetition:02d}"
+    )
+
+
+def _safe_path_component(value: str, *, fallback: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("._-")
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+    return f"{slug or fallback}-{digest}"
+
+
+def _normalized_run_artifact(
+    *,
+    candidate: Candidate,
+    case: EvalCase,
+    split: str,
+    repetition: int,
+    result: BridgeResult,
+    record: NormalizedRunRecord,
+) -> dict[str, Any]:
+    return {
+        "schema_version": _SEARCH_SCHEMA_VERSION,
+        "candidate_id": candidate.candidate_id,
+        "candidate_fingerprint": candidate.fingerprint,
+        "case_id": case.case_id,
+        "template_id": case.template_id,
+        "model": case.models[0],
+        "split": split,
+        "repetition": repetition,
+        "status": result.status,
+        "execution_mode": result.execution_mode,
+        "answer": "",
+        "error": None if result.status == "completed" else "model_failure",
+        "normalized_record": asdict(record),
+        "grade": _safe_grade_payload(result),
+        "journal": _safe_journal_payload(result.journal),
+        "usage": _safe_usage_payload(result.usage),
+    }
+
+
+def _safe_grade_payload(result: BridgeResult) -> dict[str, Any] | None:
+    grade = result.grade
+    if grade is None:
+        return None
+    return {
+        "completion": float(grade.completion),
+        "verification": float(grade.verification),
+        "efficiency": float(grade.efficiency),
+        "hard_failures": list(grade.hard_failures),
+    }
+
+
+def _safe_journal_payload(journal: Mapping[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for field_name in _JOURNAL_INT_FIELDS:
+        value = journal.get(field_name)
+        if value is not None:
+            payload[field_name] = _non_negative_int(value, f"journal {field_name}")
+    for field_name in _JOURNAL_BOOL_FIELDS:
+        value = journal.get(field_name)
+        if value is not None:
+            payload[field_name] = _require_bool(value, f"journal {field_name}")
+    for field_name in _JOURNAL_FLOAT_FIELDS:
+        value = journal.get(field_name)
+        if value is not None:
+            payload[field_name] = _unit_interval_float(value, f"journal {field_name}")
+    for field_name in _JOURNAL_STRING_LIST_FIELDS:
+        value = journal.get(field_name)
+        if value is not None:
+            payload[field_name] = _string_list(value, f"journal {field_name}")
+    for field_name in _JOURNAL_COUNT_MAP_FIELDS:
+        value = journal.get(field_name)
+        if value is not None:
+            payload[field_name] = _count_mapping(value, f"journal {field_name}")
+    return payload
+
+
+def _safe_usage_payload(usage: Mapping[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for field_name in _USAGE_INT_FIELDS:
+        value = usage.get(field_name)
+        if value is not None:
+            payload[field_name] = _non_negative_int(value, f"usage {field_name}")
+    for field_name in _USAGE_BOOL_FIELDS:
+        value = usage.get(field_name)
+        if value is not None:
+            payload[field_name] = _require_bool(value, f"usage {field_name}")
+    for field_name in _USAGE_FLOAT_FIELDS:
+        value = usage.get(field_name)
+        if value is not None:
+            payload[field_name] = _require_non_negative_float(value, f"usage {field_name}")
+    return payload
+
+
+def _count_mapping(value: Any, field_name: str) -> dict[str, int]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{field_name} must be a mapping")
+    payload: dict[str, int] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"{field_name} keys must be non-empty strings")
+        payload[key] = _non_negative_int(item, f"{field_name}[{key}]")
+    return payload
+
+
+def _string_list(value: Any, field_name: str) -> list[str]:
+    if not isinstance(value, list):
+        raise TypeError(f"{field_name} must be a list of strings")
+    payload: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item:
+            raise ValueError(f"{field_name} must contain non-empty strings")
+        payload.append(item)
+    return payload
+
+
+def _unit_interval_float(value: Any, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{field_name} must be a unit-interval number")
+    normalized = float(value)
+    if not 0.0 <= normalized <= 1.0:
+        raise ValueError(f"{field_name} must be a unit-interval number")
+    return normalized
+
+
+def _non_negative_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    return value
+
+
+def _require_bool(value: Any, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"{field_name} must be a boolean")
+    return value
+
+
+def _prune_empty_parents(path: Path) -> None:
+    for parent in path.parents:
+        if parent.name in {"stage-a", "stage-b", "stage-c"}:
+            return
+        if not parent.exists():
+            continue
+        if parent.is_symlink():
+            raise ValueError(f"stable search runner artifact parent must not be a symlink: {parent}")
+        try:
+            parent.rmdir()
+        except OSError:
+            return
 
 
 def _require_positive_int(value: int, field_name: str) -> int:
