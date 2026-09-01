@@ -83,3 +83,22 @@ def test_dspy_instruction_proposer_rejects_blank_proposals(monkeypatch: pytest.M
 
     with pytest.raises(ValueError, match="blank"):
         proposer({"system": "Stay safe."}, {"system": []}, ["system"])
+
+
+def test_dspy_instruction_proposer_accepts_overlong_rewrites(monkeypatch: pytest.MonkeyPatch) -> None:
+    long_rewrite = "x" * 481
+
+    class FakePredict:
+        def __init__(self, signature: object) -> None:
+            self.signature = signature
+
+        def __call__(self, **kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(revised_component_text=long_rewrite)
+
+    monkeypatch.setattr("korvid_prompt_lab.reflection.dspy.Predict", FakePredict)
+
+    proposer = DSPyInstructionProposer(reflection_lm=object())
+
+    proposals = proposer({"system": "Stay safe."}, {"system": []}, ["system"])
+
+    assert proposals == {"system": long_rewrite}

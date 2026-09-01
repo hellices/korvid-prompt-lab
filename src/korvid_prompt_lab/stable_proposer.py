@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import dspy  # type: ignore[import-untyped]
@@ -13,15 +13,15 @@ from .stable_candidates import CandidateAxis
 from .stable_ranking import CandidateMeasurement, QualificationCandidate
 
 __all__ = [
+    "BoundedAggregateFeedback",
     "BoundedAppendProposalRequest",
     "BoundedAppendProposalSignature",
     "BoundedAppendProposer",
     "build_proposal_request",
 ]
 
-_MEASUREMENT_FIELD_NAMES = (
-    "candidate_id",
-    "split",
+_MAX_BOUNDED_APPEND_LENGTH = 480
+_AGGREGATE_FIELD_NAMES = (
     "mean_score",
     "score_variance",
     "worst_case_mean",
@@ -29,7 +29,6 @@ _MEASUREMENT_FIELD_NAMES = (
     "hard_safety_failures",
     "systemic_failures",
     "repetitions_per_case",
-    "per_case_repetition_counts",
     "mean_verification",
     "malformed_tool_calls",
     "unresolvable_tool_calls",
@@ -37,10 +36,29 @@ _MEASUREMENT_FIELD_NAMES = (
 
 
 @dataclass(frozen=True, slots=True)
+class BoundedAggregateFeedback:
+    mean_score: float
+    score_variance: float
+    worst_case_mean: float
+    pass_at_3: float | None
+    hard_safety_failures: int
+    systemic_failures: int
+    repetitions_per_case: int
+    mean_verification: float
+    malformed_tool_calls: int
+    unresolvable_tool_calls: int
+
+
+@dataclass(frozen=True, slots=True)
 class BoundedAppendProposalRequest:
     finalist_append: str
     failure_axis: CandidateAxis
-    bounded_feedback: dict[str, Any]
+    bounded_feedback: BoundedAggregateFeedback
+
+    def __post_init__(self) -> None:
+        _require_canonical_text(self.finalist_append, "finalist_append")
+        if not isinstance(self.failure_axis, CandidateAxis):
+            raise ValueError("failure_axis must be a known failure axis")  # noqa: TRY004 - preserve validation API
 
 
 class BoundedAppendProposalSignature(dspy.Signature):
@@ -63,13 +81,14 @@ class BoundedAppendProposer:
         prediction = self._predictor_or_raise()(
             current_append=request.finalist_append,
             failure_axis=request.failure_axis.value,
-            bounded_feedback_json=json.dumps(
-                request.bounded_feedback, ensure_ascii=False, sort_keys=True
-            ),
+            bounded_feedback_json=json.dumps(asdict(request.bounded_feedback), ensure_ascii=False, sort_keys=True),
             lm=self.reflection_lm,
         )
         revised = getattr(prediction, "revised_append", None)
-        return canonicalize_proposal_text(revised, context="revised_append")
+        normalized = canonicalize_proposal_text(revised, context="revised_append")
+        if len(normalized) > _MAX_BOUNDED_APPEND_LENGTH:
+            raise ValueError(f"revised_append must be at most {_MAX_BOUNDED_APPEND_LENGTH} characters")
+        return normalized
 
     def safe_propose(self, request_or_context: Any, **kwargs: Any) -> str | None:
         try:
@@ -101,7 +120,7 @@ def build_proposal_request(
     axis_value = failure_axis if failure_axis is not None else _lookup_axis(context)
     feedback_source = bounded_feedback if bounded_feedback is not None else context
     return BoundedAppendProposalRequest(
-        finalist_append=canonicalize_proposal_text(append_text, context="finalist_append"),
+        finalist_append=_require_canonical_text(append_text, "finalist_append"),
         failure_axis=_coerce_axis(axis_value),
         bounded_feedback=_bounded_feedback_payload(feedback_source),
     )
@@ -142,90 +161,75 @@ def _lookup_optional(context: Any, field_name: str) -> Any:
     return getattr(context, field_name, _MISSING)
 
 
-def _bounded_feedback_payload(source: Any) -> dict[str, Any]:
+def _bounded_feedback_payload(source: Any) -> BoundedAggregateFeedback:
+    if isinstance(source, BoundedAggregateFeedback):
+        return source
     if isinstance(source, BoundedAppendProposalRequest):
         return _bounded_feedback_payload(source.bounded_feedback)
     if isinstance(source, CandidateMeasurement):
         return _measurement_payload(source)
     if isinstance(source, QualificationCandidate):
-        return _qualification_payload(source)
+        return _bounded_feedback_payload(source.candidate_validation)
     if isinstance(source, Mapping):
         if "candidate_validation" in source:
-            payload_mapping: dict[str, Any] = {
-                "candidate_validation": _bounded_feedback_payload(source["candidate_validation"])
-            }
-            if "baseline_validation" in source:
-                payload_mapping["baseline_validation"] = _bounded_feedback_payload(source["baseline_validation"])
-            if "baseline_milestone" in source:
-                payload_mapping["baseline_milestone"] = _bounded_feedback_payload(source["baseline_milestone"])
-            if "candidate_milestone" in source:
-                payload_mapping["candidate_milestone"] = _bounded_feedback_payload(source["candidate_milestone"])
-            if "candidate_id" in source:
-                payload_mapping["candidate_id"] = _require_text(source["candidate_id"], "candidate_id")
-            return payload_mapping
-        if any(key in source for key in _MEASUREMENT_FIELD_NAMES):
+            return _bounded_feedback_payload(source["candidate_validation"])
+        if any(key in source for key in _AGGREGATE_FIELD_NAMES):
             return _filter_measurement_mapping(source)
         if "bounded_feedback" in source:
             return _bounded_feedback_payload(source["bounded_feedback"])
     if hasattr(source, "candidate_validation"):
-        payload_object: dict[str, Any] = {
-            "candidate_validation": _bounded_feedback_payload(source.candidate_validation)
-        }
-        for field_name in ("baseline_validation", "baseline_milestone", "candidate_milestone", "candidate_id"):
-            value = getattr(source, field_name, _MISSING)
-            if value is _MISSING:
-                continue
-            if field_name == "candidate_id":
-                payload_object[field_name] = _require_text(value, field_name)
-            else:
-                payload_object[field_name] = _bounded_feedback_payload(value)
-        return payload_object
-    if any(hasattr(source, field_name) for field_name in _MEASUREMENT_FIELD_NAMES):
+        return _bounded_feedback_payload(source.candidate_validation)
+    if any(hasattr(source, field_name) for field_name in _AGGREGATE_FIELD_NAMES):
         return _filter_measurement_object(source)
     if hasattr(source, "bounded_feedback"):
         return _bounded_feedback_payload(source.bounded_feedback)
     raise ValueError("bounded feedback must be a candidate measurement or qualification candidate")
 
 
-def _qualification_payload(candidate: QualificationCandidate) -> dict[str, Any]:
-    return {
-        "candidate_id": candidate.candidate_id,
-        "baseline_validation": _measurement_payload(candidate.baseline_validation),
-        "candidate_validation": _measurement_payload(candidate.candidate_validation),
-        "baseline_milestone": _measurement_payload(candidate.baseline_milestone),
-        "candidate_milestone": _measurement_payload(candidate.candidate_milestone),
-    }
+def _measurement_payload(measurement: CandidateMeasurement) -> BoundedAggregateFeedback:
+    return BoundedAggregateFeedback(
+        mean_score=measurement.mean_score,
+        score_variance=measurement.score_variance,
+        worst_case_mean=measurement.worst_case_mean,
+        pass_at_3=measurement.pass_at_3,
+        hard_safety_failures=measurement.hard_safety_failures,
+        systemic_failures=measurement.systemic_failures,
+        repetitions_per_case=measurement.repetitions_per_case,
+        mean_verification=measurement.mean_verification,
+        malformed_tool_calls=measurement.malformed_tool_calls,
+        unresolvable_tool_calls=measurement.unresolvable_tool_calls,
+    )
 
 
-def _measurement_payload(measurement: CandidateMeasurement) -> dict[str, Any]:
-    return {field_name: getattr(measurement, field_name) for field_name in _MEASUREMENT_FIELD_NAMES}
-
-
-def _filter_measurement_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
-    payload: dict[str, Any] = {}
-    for field_name in _MEASUREMENT_FIELD_NAMES:
-        if field_name in mapping:
-            payload[field_name] = mapping[field_name]
-    if not payload:
+def _filter_measurement_mapping(mapping: Mapping[str, Any]) -> BoundedAggregateFeedback:
+    payload = {field_name: mapping[field_name] for field_name in _AGGREGATE_FIELD_NAMES if field_name in mapping}
+    if len(payload) != len(_AGGREGATE_FIELD_NAMES):
         raise ValueError("bounded feedback must include a known aggregate measurement")
-    return payload
+    return BoundedAggregateFeedback(**payload)
 
 
-def _filter_measurement_object(source: Any) -> dict[str, Any]:
+def _filter_measurement_object(source: Any) -> BoundedAggregateFeedback:
     payload: dict[str, Any] = {}
-    for field_name in _MEASUREMENT_FIELD_NAMES:
+    for field_name in _AGGREGATE_FIELD_NAMES:
         value = getattr(source, field_name, _MISSING)
         if value is not _MISSING:
             payload[field_name] = value
-    if not payload:
+    if len(payload) != len(_AGGREGATE_FIELD_NAMES):
         raise ValueError("bounded feedback must include a known aggregate measurement")
-    return payload
+    return BoundedAggregateFeedback(**payload)
 
 
 def _require_text(value: Any, context: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{context} must be a non-empty string")
     return value
+
+
+def _require_canonical_text(value: Any, context: str) -> str:
+    text = _require_text(value, context)
+    if text != text.strip():
+        raise ValueError(f"{context} must use canonical outer whitespace")
+    return text
 
 
 _MISSING = object()

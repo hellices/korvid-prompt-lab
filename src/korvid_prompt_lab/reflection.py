@@ -6,8 +6,6 @@ from typing import Any
 
 import dspy  # type: ignore[import-untyped]
 
-_MAX_PROPOSAL_LENGTH = 480
-
 
 def canonicalize_proposal_text(text: Any, *, context: str) -> str:
     if not isinstance(text, str):
@@ -15,8 +13,6 @@ def canonicalize_proposal_text(text: Any, *, context: str) -> str:
     normalized = text.strip()
     if not normalized:
         raise ValueError(f"{context} must not be blank")
-    if len(normalized) > _MAX_PROPOSAL_LENGTH:
-        raise ValueError(f"{context} must be at most {_MAX_PROPOSAL_LENGTH} characters")
     return normalized
 
 
