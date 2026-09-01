@@ -9,9 +9,6 @@ from typing import Any
 import dspy  # type: ignore[import-untyped]
 from litellm.exceptions import (
     APIConnectionError,
-    APIError,
-    AuthenticationError,
-    BadRequestError,
     InternalServerError,
     RateLimitError,
     ServiceUnavailableError,
@@ -39,9 +36,6 @@ _SAFE_PROPOSE_FAILURES = (
     ConnectionError,
     subprocess.TimeoutExpired,
     APIConnectionError,
-    APIError,
-    AuthenticationError,
-    BadRequestError,
     InternalServerError,
     RateLimitError,
     ServiceUnavailableError,

@@ -9,7 +9,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from litellm.exceptions import APIConnectionError, RateLimitError
+from litellm.exceptions import (
+    APIConnectionError,
+    AuthenticationError,
+    BadRequestError,
+    InternalServerError,
+    RateLimitError,
+    ServiceUnavailableError,
+)
+from litellm.exceptions import (
+    Timeout as LiteLLMTimeout,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -171,11 +181,19 @@ def test_bounded_append_proposer_rejects_blank_or_overlong_output(
         TimeoutError("slow"),
         subprocess.TimeoutExpired("dspy", 1.0),
         ConnectionError("transport broke"),
+        APIConnectionError("api connection failed", "openai", "model"),
+        RateLimitError("rate limited", "openai", "model"),
+        ServiceUnavailableError("service unavailable", "openai", "model"),
+        InternalServerError("server exploded", "openai", "model"),
+        LiteLLMTimeout("request timed out", "model", "openai"),
     ],
 )
-def test_bounded_append_proposer_safe_propose_returns_none_on_expected_failures(
+def test_bounded_append_proposer_safe_propose_returns_none_on_transient_failures(
     monkeypatch: pytest.MonkeyPatch, error: BaseException
 ) -> None:
+    assert inspect.signature(APIConnectionError).parameters["llm_provider"].name == "llm_provider"
+    assert inspect.signature(RateLimitError).parameters["llm_provider"].name == "llm_provider"
+
     class FakePredict:
         def __init__(self, signature: object) -> None:
             self.signature = signature
@@ -200,15 +218,15 @@ def test_bounded_append_proposer_safe_propose_returns_none_on_expected_failures(
 @pytest.mark.parametrize(
     "error",
     [
-        APIConnectionError("api connection failed", "openai", "model"),
-        RateLimitError("rate limited", "openai", "model"),
+        AuthenticationError("auth failed", "openai", "model"),
+        BadRequestError("bad request", "model", "openai"),
     ],
 )
-def test_bounded_append_proposer_safe_propose_returns_none_on_litellm_errors(
+def test_bounded_append_proposer_safe_propose_propagates_auth_and_bad_request_errors(
     monkeypatch: pytest.MonkeyPatch, error: BaseException
 ) -> None:
-    assert inspect.signature(APIConnectionError).parameters["llm_provider"].name == "llm_provider"
-    assert inspect.signature(RateLimitError).parameters["llm_provider"].name == "llm_provider"
+    assert inspect.signature(AuthenticationError).parameters["llm_provider"].name == "llm_provider"
+    assert inspect.signature(BadRequestError).parameters["llm_provider"].name == "llm_provider"
 
     class FakePredict:
         def __init__(self, signature: object) -> None:
@@ -221,15 +239,13 @@ def test_bounded_append_proposer_safe_propose_returns_none_on_litellm_errors(
 
     proposer = BoundedAppendProposer(reflection_lm=object())
 
-    assert (
+    with pytest.raises(type(error), match=str(error)):
         proposer.safe_propose(
             object(),
             finalist_append="inspect runtime evidence before stating a diagnosis.",
             failure_axis=CandidateAxis.EVIDENCE_FIRST.value,
             bounded_feedback=_measurement(),
         )
-        is None
-    )
 
 
 @pytest.mark.parametrize(
