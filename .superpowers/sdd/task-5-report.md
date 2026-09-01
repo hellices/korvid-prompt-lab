@@ -51,6 +51,20 @@ PASS — entrypoint revalidation now rejects forged exact-type requests before s
 
 - None.
 
+## Review Fix 9
+
+PASS — reusable entry validation now requires repetitions_per_case to be positive, and both direct and forged zero-valued cases are rejected before serialization.
+
+## Commit
+
+- `410b58f` — `fix(search): require positive repetitions per case`
+
+## Tests
+
+- `uv run pytest tests/test_reflection.py tests/test_optimize.py tests/test_stable_proposer.py`
+- `uv run ruff check src tests`
+- `uv run mypy src`
+
 ## Review Fix 4
 
 PASS — narrowed safe_propose to concrete LiteLLM transient failures only; AuthenticationError and BadRequestError now propagate.
