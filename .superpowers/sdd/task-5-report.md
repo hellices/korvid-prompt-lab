@@ -47,6 +47,20 @@ PASS — narrowed safe_propose to concrete LiteLLM transient failures only; Auth
 - `uv run --python 3.12 ruff check src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py tests/test_reflection.py tests/test_stable_proposer.py`
 - `uv run --python 3.12 mypy src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py`
 
+## Review Fix 5
+
+PASS — direct BoundedAppendProposalRequest construction now rejects non-BoundedAggregateFeedback payloads, and bounded metrics validate finite/unit/nonnegative bounds before serialization.
+
+## Commit
+
+- `a0480c1` — `fix(search): validate bounded aggregate feedback`
+
+## Tests
+
+- `uv run --python 3.12 pytest -q tests/test_reflection.py tests/test_stable_proposer.py tests/test_optimize.py`
+- `uv run --python 3.12 ruff check src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py tests/test_reflection.py tests/test_stable_proposer.py`
+- `uv run --python 3.12 mypy src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py`
+
 ## Review Fix 3
 
 PASS — bounded proposer now catches only explicit built-in and LiteLLM transport/runtime failures; RuntimeError, PermissionError, and TypeError propagate.
