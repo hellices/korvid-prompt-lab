@@ -2,7 +2,11 @@
 
 ## Status
 
-Complete pending commit.
+Complete.
+
+## Commits
+
+- `de4912d` — `feat(search): add stable winner qualification`
 
 ## Summary
 
