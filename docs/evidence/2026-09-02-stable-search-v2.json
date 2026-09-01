@@ -13,6 +13,7 @@
   "v1": {
     "status": "invalid",
     "cause": "serving_collapse",
+    "evidence_usage": "failure_classification_only",
     "stage_b": {
       "model_failure": {
         "count": 54,
@@ -51,33 +52,51 @@
       "provisioning_state": "Succeeded"
     }
   },
+  "source_roots": {
+    "v1": "/Users/hwang-inhwan/.copilot/session-state/47d05436-3db4-4f52-8056-abc93a0715f7/files/stable-search-live-20260901-v1",
+    "v2": "/Users/hwang-inhwan/.copilot/session-state/47d05436-3db4-4f52-8056-abc93a0715f7/files/stable-search-live-20260902-v2"
+  },
   "source_artifacts": [
     {
       "label": "v1 stage-b validation",
+      "root": "v1",
+      "path": "stage-b/validation-summary.json",
       "sha256": "8e4644323681b9682513b51ad9342b6066d1afa01bdfca423c1be47a78036987"
     },
     {
       "label": "v2 summary",
+      "root": "v2",
+      "path": "stable-search-summary.json",
       "sha256": "c463455fa7d13ed459dd62e8649e3c2269f016671e64f9a16b507d543f625483"
     },
     {
       "label": "v2 stage-b",
+      "root": "v2",
+      "path": "stage-b/validation-summary.json",
       "sha256": "eaa410f1ea4ca78c84ed2061f870f2097646ec63b056a991b6a0878b75872c55"
     },
     {
       "label": "v2 stage-c",
+      "root": "v2",
+      "path": "stage-c/qualification-summary.json",
       "sha256": "bddf31fefe48b10437e64921218c131dedfca9bbece298136625ce846da3de4a"
     },
     {
       "label": "v2 baseline",
+      "root": "v2",
+      "path": "baseline-candidate.json",
       "sha256": "9dc48e21199c0bbaa82ef5f399be73cd24468b8ce61c3f5d8409261e6a4718e6"
     },
     {
       "label": "v2 candidates",
+      "root": "v2",
+      "path": "candidate-manifest.json",
       "sha256": "a62abe16db1334a0c3b8eb29f3d444acaba7f4a5e3b09a06bdd3813d0ec816a0"
     },
     {
       "label": "v2 scenarios",
+      "root": "v2",
+      "path": "scenario-manifest.json",
       "sha256": "11842c338cb4425c75abc70e54049024d28e5299dc04e4522a09089f23592bd0"
     }
   ]

@@ -565,7 +565,8 @@ git commit -m "docs(search): record stable prompt campaign"
 - v1 was invalid due to a serving collapse in Stage B: `54/54` runs ended in
   `model_failure`, the affected responses were ~`5ms` with `0` input/output
   tokens, and the private port-forward stream timed out. The reviewed fix is
-  `9ceb5c4` (`fix(search): abort on serving collapse`). v1 Stage C is not
+  `9ceb5c4` (`fix(search): abort on serving collapse`). v1 is retained only as
+  failure-classification evidence; none of its stages are prompt-quality
   evidence.
 - v2 completed Stage C and ended in `no_stable_winner`.
 - Stage B baseline `0.3666667` vs finalist `0.4888889` (`+0.1222222`).
