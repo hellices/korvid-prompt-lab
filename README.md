@@ -109,6 +109,56 @@ uv run --python 3.12 korvid-prompt-lab optimize \
 seed fingerprint, and `best_candidate_differs_from_seed` so a silent no-op search
 is visible in the artifact.
 
+### Stable search
+
+`stable-search` is the bounded read-only campaign for the installed Korvid
+`small` prompt. It materializes the installed `korvid-baseline-small` candidate,
+discovers train/validation/milestone splits from the installed scenario catalog,
+builds the structured append matrix, and runs the staged search through
+`KorvidReadonlyRunner` against `KORVID_READONLY_BASE_URL`.
+
+- the artifact root is required and must be fresh; an existing directory is refused
+- the default live upper bound is `306` target-model runs (`54 + 72 + 180`)
+- the final JSON decision is always `promote` or `no_stable_winner`; systemic
+  runner failures abort instead of being normalized into a decision
+- `--enable-bounded-proposer --reflection-model ...` records one bounded Stage B
+  proposer result per finalist in the summary `extension` block without changing
+  the structured decision path, so the `306` target-model upper bound remains intact
+
+Reference defaults live in `examples/stable-search/korvid-small.yaml`.
+
+Local endpoint:
+
+```bash
+export KORVID_READONLY_BASE_URL=http://127.0.0.1:11434
+
+uv run --python 3.12 korvid-prompt-lab stable-search \
+  --artifact-root artifacts/stable-search/local-qwen3-0.6b \
+  --target-per-split 6 \
+  --json
+```
+
+AKS shared-runner endpoint:
+
+```bash
+az aks get-credentials --resource-group rg-pension-guard --name aks-shared-runners
+kubectl -n ollama port-forward svc/ollama 41001:11434
+
+export KORVID_READONLY_BASE_URL=http://127.0.0.1:41001
+
+uv run --python 3.12 korvid-prompt-lab stable-search \
+  --artifact-root artifacts/stable-search/aks-qwen3-0.6b \
+  --target-per-split 6 \
+  --enable-bounded-proposer \
+  --reflection-model ollama_chat/qwen3:4b \
+  --json
+```
+
+Promotion requires both validation and milestone mean deltas `>= 0.10`, five
+repetitions per case, no worst-case regression, and zero safety/systemic
+failures. If no finalist clears that gate, the correct outcome is
+`no_stable_winner`.
+
 #### Run identity, seeds, and contamination safety
 
 GEPA resumes any `gepa_state.bin` it finds in its `run_dir`. A shared, stable

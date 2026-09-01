@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import dspy  # type: ignore[import-untyped]
+from korvid.evals.scenario import bundled_scenarios_dir, load_scenario
 
 from .aks import (
     AKSMissingToolError,
@@ -35,6 +37,16 @@ from .optimize import (
 from .publish import DEFAULT_MINIMUM_MODEL_IMPROVEMENT, publish_bundle
 from .runner import BridgeSystemError, KorvidProcessRunner, KorvidRunner
 from .scoring import RepetitionOutcome, pass_hat_k, result_passed, score_result
+from .stable_candidates import build_structured_candidates
+from .stable_proposer import BoundedAppendProposer
+from .stable_scenarios import ScenarioManifest, build_scenario_manifest
+from .stable_search import StableSearchExtension, run_stable_search
+
+_STABLE_SEARCH_CAMPAIGN_ID = "stable-search-korvid-small"
+_STABLE_SEARCH_MODEL = "qwen3:0.6b"
+_STABLE_SEARCH_PROFILE = "small"
+_STABLE_SEARCH_TIMEOUT_SECONDS = 160.0
+_STABLE_SEARCH_REPETITIONS = 5
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -207,6 +219,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to write the immutable baseline candidate YAML to; must not already exist.",
     )
     baseline_parser.set_defaults(func=command_korvid_baseline)
+
+    stable_search_parser = subparsers.add_parser(
+        "stable-search",
+        help="Run the bounded stable-search campaign against installed Korvid read-only evals.",
+    )
+    stable_search_parser.add_argument(
+        "--artifact-root",
+        type=Path,
+        required=True,
+        help="Fresh directory for immutable stable-search artifacts; must not already exist.",
+    )
+    stable_search_parser.add_argument(
+        "--target-per-split",
+        type=int,
+        default=6,
+        help="Requested scenario count per train/validation/milestone split before fail-closed reduction.",
+    )
+    stable_search_parser.add_argument(
+        "--reflection-model",
+        help="DSPy LM spec for the optional bounded proposer, for example ollama_chat/qwen3:4b.",
+    )
+    stable_search_parser.add_argument(
+        "--enable-bounded-proposer",
+        action="store_true",
+        help="Record one bounded proposer output per Stage B finalist when a structured failure axis exists.",
+    )
+    stable_search_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Write the stable-search summary JSON to stdout.",
+    )
+    stable_search_parser.set_defaults(func=command_stable_search)
 
     return parser
 
@@ -442,6 +486,74 @@ def command_korvid_baseline(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_stable_search(args: argparse.Namespace) -> int:
+    if Path(args.artifact_root).exists() or Path(args.artifact_root).is_symlink():
+        print(
+            f"stable-search failed: stable search artifact root already exists: {args.artifact_root}",
+            file=_stderr(),
+        )
+        return 2
+    if args.enable_bounded_proposer and not args.reflection_model:
+        print(
+            "stable-search failed: --enable-bounded-proposer requires --reflection-model",
+            file=_stderr(),
+        )
+        return 2
+    if args.reflection_model and not args.enable_bounded_proposer:
+        print(
+            "stable-search failed: --reflection-model requires --enable-bounded-proposer",
+            file=_stderr(),
+        )
+        return 2
+
+    try:
+        baseline = build_baseline_candidate(_STABLE_SEARCH_PROFILE)
+        candidates = build_structured_candidates(baseline)
+        manifest = build_scenario_manifest(target_per_split=args.target_per_split)
+        campaign = _build_stable_search_campaign(manifest)
+        runner = KorvidReadonlyRunner(campaign=campaign)
+        extension = (
+            StableSearchExtension(
+                bounded_append_proposer=BoundedAppendProposer(
+                    _build_reflection_lm(args.reflection_model)
+                )
+            )
+            if args.enable_bounded_proposer
+            else None
+        )
+        artifacts = run_stable_search(
+            runner=runner,
+            baseline=baseline,
+            candidates=candidates,
+            manifest=manifest,
+            artifact_root=args.artifact_root,
+            extension=extension,
+        )
+    except ValueError as exc:
+        print(f"stable-search failed: {exc}", file=_stderr())
+        return 2
+    except BridgeSystemError as exc:
+        print(f"stable-search failed: systemic bridge error: {exc}", file=_stderr())
+        return 1
+    except OSError as exc:
+        print(f"stable-search failed: {exc}", file=_stderr())
+        return 1
+
+    summary = _load_json_file(artifacts.summary_path)
+    if args.json:
+        print(json.dumps(summary, sort_keys=True, ensure_ascii=False, indent=2))
+    else:
+        decision = summary["decision"]
+        print(
+            "stable-search status={status} candidate={candidate_id} summary={summary_path}".format(
+                status=decision["status"],
+                candidate_id=decision["candidate_id"] or "none",
+                summary_path=artifacts.summary_path,
+            )
+        )
+    return 0
+
+
 def _stderr() -> Any:
     import sys
 
@@ -473,6 +585,72 @@ def _build_runner(campaign: Campaign, *, model_endpoint: str | None) -> KorvidRu
         timeout_seconds=campaign.bridge_timeout_seconds,
         model_endpoint=model_endpoint,
     )
+
+
+def _build_stable_search_campaign(manifest: ScenarioManifest) -> Campaign:
+    return Campaign(
+        schema_version=1,
+        campaign_id=_STABLE_SEARCH_CAMPAIGN_ID,
+        repetitions=_STABLE_SEARCH_REPETITIONS,
+        models=(_STABLE_SEARCH_MODEL,),
+        cases=_stable_search_cases(manifest),
+        serving=KorvidReadonlyServing(
+            backend="korvid_readonly",
+            provider="ollama",
+            base_url=_require_env_url("KORVID_READONLY_BASE_URL"),
+            profile=_STABLE_SEARCH_PROFILE,
+            timeout_seconds=_STABLE_SEARCH_TIMEOUT_SECONDS,
+        ),
+    )
+
+
+def _stable_search_cases(manifest: ScenarioManifest) -> tuple[EvalCase, ...]:
+    catalog = _bundled_eval_cases()
+    cases: list[EvalCase] = []
+    seen: set[str] = set()
+    for assignment in manifest.assignments:
+        if assignment.scenario_id in seen:
+            continue
+        try:
+            scenario = catalog[assignment.scenario_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"installed Korvid scenario catalog is missing {assignment.scenario_id!r}"
+            ) from exc
+        cases.append(
+            EvalCase(
+                case_id=assignment.scenario_id,
+                template_id=f"stable-search-{assignment.split}",
+                prompt=scenario.question,
+                models=(_STABLE_SEARCH_MODEL,),
+            )
+        )
+        seen.add(assignment.scenario_id)
+    if not cases:
+        raise ValueError("stable-search scenario manifest must contain at least one case")
+    return tuple(cases)
+
+
+def _bundled_eval_cases() -> dict[str, Any]:
+    directory = bundled_scenarios_dir()
+    if not directory.is_dir():
+        raise ValueError(f"korvid bundled scenarios directory not found: {directory}")
+    catalog: dict[str, Any] = {}
+    for path in sorted(directory.glob("*.yaml")):
+        scenario = load_scenario(path)
+        if scenario.id in catalog:
+            raise ValueError(
+                f"installed Korvid scenario catalog contains duplicate id: {scenario.id}"
+            )
+        catalog[scenario.id] = scenario
+    return catalog
+
+
+def _require_env_url(name: str) -> str:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        raise ValueError(f"missing environment variable {name}")
+    return value
 
 
 def _load_candidate_campaign(

@@ -463,3 +463,58 @@ def test_stable_search_refuses_to_reuse_an_existing_artifact_root(tmp_path: Path
             manifest=_manifest(),
             artifact_root=artifact_root,
         )
+
+
+def test_stable_search_records_bounded_proposer_extension_after_stage_b_signal(
+    tmp_path: Path,
+) -> None:
+    from korvid_prompt_lab.stable_search import StableSearchExtension
+
+    requests: list[object] = []
+
+    class FakeProposer:
+        def __init__(self) -> None:
+            self.reflection_lm = {"model": "ollama_chat/qwen3:4b"}
+
+        def safe_propose(self, request_or_context: object, **kwargs: object) -> str | None:
+            del kwargs
+            requests.append(request_or_context)
+            return "inspect runtime evidence before stating a diagnosis.\nkorvid-tuned"
+
+    scripts = {
+        ("baseline", "train"): (_ScriptedRun(score=0.40, verification=0.60),),
+        ("baseline", "validation"): tuple(_ScriptedRun(score=0.40, verification=0.60) for _ in range(5)),
+        ("baseline", "milestone"): tuple(_ScriptedRun(score=0.40, verification=0.60) for _ in range(5)),
+        ("bounded-finalist", "train"): (_ScriptedRun(score=0.60, verification=0.60, tool_calls=4, resolvable_tool_calls=2),),
+        ("bounded-finalist", "validation"): tuple(
+            _ScriptedRun(score=0.55, verification=0.60, tool_calls=4, resolvable_tool_calls=2) for _ in range(5)
+        ),
+        ("bounded-finalist", "milestone"): tuple(
+            _ScriptedRun(score=0.45, verification=0.60, tool_calls=4, resolvable_tool_calls=2) for _ in range(5)
+        ),
+    }
+    candidate = _structured_candidate(
+        "bounded-finalist",
+        append="inspect runtime evidence before stating a diagnosis.",
+    )
+
+    artifacts = run_stable_search(
+        runner=_runner_for_scripts(case_splits=_SPLITS_BY_CASE, scripts=scripts),
+        baseline=_baseline(),
+        candidates=(candidate,),
+        manifest=_manifest(),
+        artifact_root=tmp_path / "campaign",
+        config=StableSearchConfig(screening_survivors=1, finalists=1),
+        extension=StableSearchExtension(bounded_append_proposer=FakeProposer()),
+    )
+
+    assert artifacts.decision.status == "no_stable_winner"
+    assert artifacts.extension is not None
+    assert len(artifacts.extension.bounded_proposals) == 1
+    proposal = artifacts.extension.bounded_proposals[0]
+    assert proposal.finalist_candidate_id == "bounded-finalist"
+    assert proposal.failure_axis == "one-tool-at-a-time"
+    assert proposal.status == "proposed"
+    assert proposal.proposed_append == "inspect runtime evidence before stating a diagnosis.\nkorvid-tuned"
+    assert proposal.proposed_candidate_id is not None
+    assert requests

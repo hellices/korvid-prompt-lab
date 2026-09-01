@@ -6,17 +6,19 @@ import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from .artifacts import write_json_artifact
 from .contracts import Candidate, EvalCase
 from .runner import BridgeStatusError, KorvidRunner
 from .scoring import BridgeResult, result_passed, score_result
-from .stable_candidates import StructuredCandidate
+from .stable_candidates import CandidateAxis, StructuredCandidate
+from .stable_proposer import build_proposal_request
 from .stable_ranking import (
     NormalizedRunRecord,
     QualificationCandidate,
     QualificationDecision,
+    RankedCandidate,
     StageDecision,
     measure_candidate,
     qualify_winner,
@@ -25,7 +27,14 @@ from .stable_ranking import (
 )
 from .stable_scenarios import ScenarioManifest
 
-__all__ = ["StableSearchArtifacts", "StableSearchConfig", "run_stable_search"]
+__all__ = [
+    "BoundedProposalArtifact",
+    "StableSearchArtifacts",
+    "StableSearchConfig",
+    "StableSearchExtension",
+    "StableSearchExtensionArtifacts",
+    "run_stable_search",
+]
 
 _SEARCH_SCHEMA_VERSION = 1
 _SCOREABLE_STATUSES = frozenset({"completed", "model_failure"})
@@ -67,6 +76,12 @@ _USAGE_BOOL_FIELDS = frozenset({"tokens_estimated"})
 _USAGE_FLOAT_FIELDS = frozenset({"wall_time_s", "wall_time_seconds"})
 
 
+class SupportsBoundedAppendProposer(Protocol):
+    reflection_lm: Any
+
+    def safe_propose(self, request_or_context: Any, **kwargs: Any) -> str | None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class StableSearchConfig:
     screening_repetitions: int = 1
@@ -95,6 +110,25 @@ class StableSearchConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class StableSearchExtension:
+    bounded_append_proposer: SupportsBoundedAppendProposer | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedProposalArtifact:
+    finalist_candidate_id: str
+    failure_axis: str | None
+    status: Literal["no_signal", "proposal_failed", "unchanged", "proposed"]
+    proposed_candidate_id: str | None = None
+    proposed_append: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StableSearchExtensionArtifacts:
+    bounded_proposals: tuple[BoundedProposalArtifact, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class StableSearchArtifacts:
     artifact_root: Path
     config: StableSearchConfig
@@ -102,6 +136,7 @@ class StableSearchArtifacts:
     validation: StageDecision
     qualification: tuple[QualificationCandidate, ...]
     decision: QualificationDecision
+    extension: StableSearchExtensionArtifacts | None
     baseline_manifest_path: Path
     candidate_manifest_path: Path
     scenario_manifest_path: Path
@@ -150,9 +185,12 @@ def run_stable_search(
     manifest: ScenarioManifest,
     artifact_root: Path | str,
     config: StableSearchConfig | None = None,
+    extension: StableSearchExtension | None = None,
 ) -> StableSearchArtifacts:
     if config is None:
         config = StableSearchConfig()
+    if extension is None:
+        extension = StableSearchExtension()
     artifact_root_path = Path(artifact_root)
     _prepare_artifact_root(artifact_root_path)
     _validate_candidates(baseline, candidates)
@@ -207,6 +245,11 @@ def run_stable_search(
         execution_modes=execution_modes,
     )
     finalists = tuple(candidate_index[item.candidate_id] for item in validation.decision.survivors)
+    extension_artifacts = _run_extension(
+        extension=extension,
+        validation=validation.decision,
+        candidate_index=candidate_index,
+    )
     qualification = _run_qualification_stage(
         runner=runner,
         baseline=baseline,
@@ -231,6 +274,7 @@ def run_stable_search(
             "repetitions": config.qualification_repetitions,
             "candidates": [asdict(candidate) for candidate in qualification.candidates],
             "decision": asdict(decision),
+            "extension": asdict(extension_artifacts) if extension_artifacts is not None else None,
             "execution_modes": list(execution_modes.modes),
         },
     )
@@ -243,6 +287,7 @@ def run_stable_search(
             "config": asdict(config),
             "decision": asdict(decision),
             "winner_append": _winner_append(candidate_index, decision),
+            "extension": asdict(extension_artifacts) if extension_artifacts is not None else None,
             "execution_modes": list(execution_modes.modes),
             "artifacts": {
                 "baseline_candidate": str(baseline_manifest_path.relative_to(artifact_root_path)),
@@ -261,6 +306,7 @@ def run_stable_search(
         validation=validation.decision,
         qualification=qualification.candidates,
         decision=decision,
+        extension=extension_artifacts,
         baseline_manifest_path=baseline_manifest_path,
         candidate_manifest_path=candidate_manifest_path,
         scenario_manifest_path=scenario_manifest_path,
@@ -411,6 +457,86 @@ def _run_qualification_stage(
     )
     return _QualificationStageArtifacts(candidates=candidates, summary_path=stage_dir / "qualification-summary.json")
 
+
+
+def _run_extension(
+    *,
+    extension: StableSearchExtension,
+    validation: StageDecision,
+    candidate_index: Mapping[str, StructuredCandidate],
+) -> StableSearchExtensionArtifacts | None:
+    proposer = extension.bounded_append_proposer
+    if proposer is None:
+        return None
+
+    proposals: list[BoundedProposalArtifact] = []
+    for ranked in validation.survivors:
+        proposals.append(_bounded_proposal_artifact(proposer, ranked, candidate_index[ranked.candidate_id]))
+    return StableSearchExtensionArtifacts(bounded_proposals=tuple(proposals))
+
+
+def _bounded_proposal_artifact(
+    proposer: SupportsBoundedAppendProposer,
+    ranked: RankedCandidate,
+    structured: StructuredCandidate,
+) -> BoundedProposalArtifact:
+    failure_axis = _structured_failure_axis(ranked)
+    if failure_axis is None:
+        return BoundedProposalArtifact(
+            finalist_candidate_id=ranked.candidate_id,
+            failure_axis=None,
+            status="no_signal",
+        )
+
+    finalist_append = structured.candidate.components.get("append")
+    if finalist_append is None:
+        return BoundedProposalArtifact(
+            finalist_candidate_id=ranked.candidate_id,
+            failure_axis=failure_axis.value,
+            status="proposal_failed",
+        )
+    request = build_proposal_request(
+        ranked.candidate,
+        finalist_append=finalist_append,
+        failure_axis=failure_axis,
+    )
+    proposed_append = proposer.safe_propose(request)
+    if proposed_append is None:
+        return BoundedProposalArtifact(
+            finalist_candidate_id=ranked.candidate_id,
+            failure_axis=failure_axis.value,
+            status="proposal_failed",
+        )
+    if proposed_append == finalist_append:
+        return BoundedProposalArtifact(
+            finalist_candidate_id=ranked.candidate_id,
+            failure_axis=failure_axis.value,
+            status="unchanged",
+            proposed_append=proposed_append,
+        )
+    return BoundedProposalArtifact(
+        finalist_candidate_id=ranked.candidate_id,
+        failure_axis=failure_axis.value,
+        status="proposed",
+        proposed_candidate_id=_proposal_candidate_id(ranked.candidate_id, proposed_append),
+        proposed_append=proposed_append,
+    )
+
+
+def _structured_failure_axis(ranked: RankedCandidate) -> CandidateAxis | None:
+    if ranked.verification_delta < 0.0:
+        return CandidateAxis.EVIDENCE_FIRST
+    if (
+        ranked.candidate.unresolvable_tool_calls > ranked.baseline.unresolvable_tool_calls
+        or ranked.candidate.malformed_tool_calls > ranked.baseline.malformed_tool_calls
+    ):
+        return CandidateAxis.ONE_TOOL_AT_A_TIME
+    return None
+
+
+def _proposal_candidate_id(candidate_id: str, proposed_append: str) -> str:
+    digest = hashlib.sha256(proposed_append.encode("utf-8")).hexdigest()[:8]
+    return f"{candidate_id}+proposal-{digest}"
 
 
 def _run_candidate(

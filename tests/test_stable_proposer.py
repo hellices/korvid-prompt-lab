@@ -7,6 +7,7 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from litellm.exceptions import (
@@ -73,7 +74,7 @@ class _MaliciousFeedback(BoundedAggregateFeedback):
 
 def _forged_feedback(**overrides: object) -> BoundedAggregateFeedback:
     feedback = object.__new__(BoundedAggregateFeedback)
-    base_fields = {
+    base_fields: dict[str, object] = {
         "mean_score": 0.61,
         "score_variance": 0.02,
         "worst_case_mean": 0.54,
@@ -131,13 +132,13 @@ def test_bounded_append_proposal_request_rejects_non_bounded_feedback_instances(
         BoundedAppendProposalRequest(
             finalist_append="inspect runtime evidence before stating a diagnosis.",
             failure_axis=CandidateAxis.EVIDENCE_FIRST,
-            bounded_feedback=measurement,
+            bounded_feedback=cast(Any, measurement),
         )
     with pytest.raises(ValueError, match="bounded_feedback"):
         BoundedAppendProposalRequest(
             finalist_append="inspect runtime evidence before stating a diagnosis.",
             failure_axis=CandidateAxis.EVIDENCE_FIRST,
-            bounded_feedback=payload,
+            bounded_feedback=cast(Any, payload),
         )
 
 
@@ -165,7 +166,7 @@ def test_bounded_append_proposal_request_rejects_bounded_feedback_subclasses() -
 def test_bounded_aggregate_feedback_validates_numeric_bounds(
     field: str, value: object, message: str
 ) -> None:
-    kwargs = {
+    kwargs: dict[str, object] = {
         "mean_score": 0.61,
         "score_variance": 0.02,
         "worst_case_mean": 0.54,
@@ -180,7 +181,7 @@ def test_bounded_aggregate_feedback_validates_numeric_bounds(
     kwargs[field] = value
 
     with pytest.raises((TypeError, ValueError), match=message):
-        BoundedAggregateFeedback(**kwargs)
+        BoundedAggregateFeedback(**cast(Any, kwargs))
 
 
 def test_bounded_aggregate_feedback_rejects_missing_or_nonfinite_mean_verification() -> None:
