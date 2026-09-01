@@ -1,0 +1,84 @@
+{
+  "schema": 1,
+  "date": "2026-09-02",
+  "decision": "no_stable_winner",
+  "model": {
+    "name": "qwen3:0.6b",
+    "digest": "sha256:7df6b6e09427a769808717c0a93cadc4ae99ed4eb8bf5ca557c90846becea435"
+  },
+  "versions": {
+    "ollama": "0.33.2",
+    "korvid": "0.3.0"
+  },
+  "v1": {
+    "status": "invalid",
+    "cause": "serving_collapse",
+    "stage_b": {
+      "model_failure": {
+        "count": 54,
+        "total": 54
+      }
+    },
+    "reviewed_fix": "9ceb5c4"
+  },
+  "v2": {
+    "finalist": {
+      "id": "cite-before-conclusion+stop-with-uncertainty",
+      "fingerprint": "3294162518f67fec2221923b2dd5c7ebdacb9ce355780fa3b50e319b52801c1e"
+    },
+    "stage_b": {
+      "baseline": 0.36666666666666664,
+      "finalist": 0.4888888888888888,
+      "delta": 0.12222222222222218
+    },
+    "stage_c": {
+      "validation_baseline": 0.33166666666666667,
+      "validation_finalist": 0.3333333333333333,
+      "validation_delta": 0.0016666666666666496
+    },
+    "milestone": {
+      "baseline": 0.4033333333333333,
+      "finalist": 0.2866666666666667,
+      "delta": -0.11666666666666664
+    },
+    "hard_failures": 0,
+    "systemic_failures": 0,
+    "no_winner": true
+  },
+  "aks": {
+    "modeleval": {
+      "count": 0,
+      "provisioning_state": "Succeeded"
+    }
+  },
+  "source_artifacts": [
+    {
+      "label": "v1 stage-b validation",
+      "sha256": "8e4644323681b9682513b51ad9342b6066d1afa01bdfca423c1be47a78036987"
+    },
+    {
+      "label": "v2 summary",
+      "sha256": "c463455fa7d13ed459dd62e8649e3c2269f016671e64f9a16b507d543f625483"
+    },
+    {
+      "label": "v2 stage-b",
+      "sha256": "eaa410f1ea4ca78c84ed2061f870f2097646ec63b056a991b6a0878b75872c55"
+    },
+    {
+      "label": "v2 stage-c",
+      "sha256": "bddf31fefe48b10437e64921218c131dedfca9bbece298136625ce846da3de4a"
+    },
+    {
+      "label": "v2 baseline",
+      "sha256": "9dc48e21199c0bbaa82ef5f399be73cd24468b8ce61c3f5d8409261e6a4718e6"
+    },
+    {
+      "label": "v2 candidates",
+      "sha256": "a62abe16db1334a0c3b8eb29f3d444acaba7f4a5e3b09a06bdd3813d0ec816a0"
+    },
+    {
+      "label": "v2 scenarios",
+      "sha256": "11842c338cb4425c75abc70e54049024d28e5299dc04e4522a09089f23592bd0"
+    }
+  ]
+}

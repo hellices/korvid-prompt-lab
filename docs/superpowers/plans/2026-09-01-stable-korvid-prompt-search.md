@@ -560,16 +560,19 @@ git commit -m "docs(search): record stable prompt campaign"
 
 ## Measured Results
 
+- Committed receipt:
+  `docs/evidence/2026-09-02-stable-search-v2.json`.
 - v1 was invalid due to a serving collapse in Stage B: `54/54` runs ended in
   `model_failure`, the affected responses were ~`5ms` with `0` input/output
   tokens, and the private port-forward stream timed out. The reviewed fix is
-  `9ceb5c4` (`fix(search): abort on serving collapse`).
+  `9ceb5c4` (`fix(search): abort on serving collapse`). v1 Stage C is not
+  evidence.
 - v2 completed Stage C and ended in `no_stable_winner`.
 - Stage B baseline `0.3666667` vs finalist `0.4888889` (`+0.1222222`).
 - Stage C validation baseline `0.3316667` vs finalist `0.3333333`
   (`+0.0016667`).
 - Milestone baseline `0.4033333` vs finalist `0.2866667` (`-0.1166667`).
-- Zero hard failures and zero systemic failures.
+- v2 hard/systemic failures: `0/0`.
 - No winner YAML was written.
 - Model metadata: `qwen3:0.6b`, digest `7df6…435d`, Ollama `0.33.2`,
   Korvid `0.3.0`.
