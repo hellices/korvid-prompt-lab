@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -40,7 +41,11 @@ from .scoring import RepetitionOutcome, pass_hat_k, result_passed, score_result
 from .stable_candidates import build_structured_candidates
 from .stable_proposer import BoundedAppendProposer
 from .stable_scenarios import ScenarioManifest, build_scenario_manifest
-from .stable_search import StableSearchExtension, run_stable_search
+from .stable_search import (
+    StableSearchExtension,
+    StableSearchSystemError,
+    run_stable_search,
+)
 
 _STABLE_SEARCH_CAMPAIGN_ID = "stable-search-korvid-small"
 _STABLE_SEARCH_MODEL = "qwen3:0.6b"
@@ -533,7 +538,21 @@ def command_stable_search(args: argparse.Namespace) -> int:
         print(f"stable-search failed: {exc}", file=_stderr())
         return 2
     except BridgeSystemError as exc:
-        print(f"stable-search failed: systemic bridge error: {exc}", file=_stderr())
+        error_label = _stable_search_system_error_label(exc)
+        if args.json:
+            print(
+                json.dumps(
+                    {"status": "system_error", "error_label": error_label},
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(
+                f"stable-search failed: systemic bridge error: {error_label}",
+                file=_stderr(),
+            )
         return 1
     except OSError as exc:
         print(f"stable-search failed: {exc}", file=_stderr())
@@ -552,6 +571,12 @@ def command_stable_search(args: argparse.Namespace) -> int:
             )
         )
     return 0
+
+
+def _stable_search_system_error_label(exc: BridgeSystemError) -> str:
+    if isinstance(exc, StableSearchSystemError):
+        return exc.error_label
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", type(exc).__name__).lower()
 
 
 def _stderr() -> Any:

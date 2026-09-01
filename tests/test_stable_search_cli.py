@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from korvid_prompt_lab.cli import main
 from korvid_prompt_lab.contracts import Candidate
+from korvid_prompt_lab.runner import BridgeProcessExitError
 from korvid_prompt_lab.stable_candidates import StructuredCandidate
 from korvid_prompt_lab.stable_scenarios import (
     ScenarioAssignment,
@@ -303,3 +304,50 @@ def test_stable_search_cli_passes_non_default_target_per_split_to_manifest_and_s
     assert json.loads(stdout)["decision"]["status"] == "no_stable_winner"
     assert captured["target_per_split"] == 4
     assert captured["manifest"] == _manifest()
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_stable_search_cli_redacts_systemic_bridge_error_details(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    json_output: bool,
+) -> None:
+    class FakeRunner:
+        def __init__(self, campaign: object) -> None:
+            self.campaign = campaign
+
+    def fake_run_stable_search(**kwargs: Any) -> _FakeArtifacts:
+        raise BridgeProcessExitError("TOKEN=TOP_SECRET raw-answer=LEAK")
+
+    monkeypatch.setattr("korvid_prompt_lab.cli.build_baseline_candidate", lambda profile: _baseline())
+    monkeypatch.setattr(
+        "korvid_prompt_lab.cli.build_structured_candidates",
+        lambda baseline: (_structured_candidate(),),
+    )
+    monkeypatch.setattr("korvid_prompt_lab.cli.build_scenario_manifest", lambda target_per_split=6: _manifest())
+    monkeypatch.setattr("korvid_prompt_lab.cli.KorvidReadonlyRunner", FakeRunner)
+    monkeypatch.setattr("korvid_prompt_lab.cli.run_stable_search", fake_run_stable_search)
+    monkeypatch.setenv("KORVID_READONLY_BASE_URL", "http://127.0.0.1:41001")
+
+    args = [
+        "stable-search",
+        "--artifact-root",
+        str(tmp_path / "artifacts"),
+    ]
+    if json_output:
+        args.append("--json")
+
+    exit_code, stdout, stderr = _run_cli(args)
+
+    assert exit_code == 1
+    assert "TOP_SECRET" not in stdout + stderr
+    assert "raw-answer" not in stdout + stderr
+    if json_output:
+        assert stderr == ""
+        assert json.loads(stdout) == {
+            "error_label": "bridge_process_exit_error",
+            "status": "system_error",
+        }
+    else:
+        assert stdout == ""
+        assert stderr == "stable-search failed: systemic bridge error: bridge_process_exit_error\n"

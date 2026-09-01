@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import shutil
 from collections.abc import Mapping, Sequence
@@ -1369,7 +1370,7 @@ def _require_non_negative_float(value: float, field_name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{field_name} must be a non-negative number")
     normalized = float(value)
-    if normalized < 0.0:
+    if not math.isfinite(normalized) or normalized < 0.0:
         raise ValueError(f"{field_name} must be a non-negative number")
     return normalized
 

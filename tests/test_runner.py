@@ -120,6 +120,16 @@ def test_write_json_artifact_replaces_files_atomically_without_temp_residue(
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_write_json_artifact_rejects_non_finite_numbers(tmp_path: Path, value: float) -> None:
+    artifact_path = tmp_path / "artifact.json"
+
+    with pytest.raises(ValueError, match="Out of range float values are not JSON compliant"):
+        write_json_artifact(artifact_path, {"value": value})
+
+    assert not artifact_path.exists()
+
+
 def test_runner_returns_completed_result_and_persists_json_artifacts(tmp_path: Path) -> None:
     case = _case("case[completed]")
     runner = _runner(case, campaign_repetitions=3)

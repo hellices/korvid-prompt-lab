@@ -34,6 +34,12 @@ from korvid_prompt_lab.stable_search import (
 )
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_stable_search_config_rejects_non_finite_minimum_delta(value: float) -> None:
+    with pytest.raises(ValueError, match="minimum_mean_delta must be a non-negative number"):
+        StableSearchConfig(minimum_mean_delta=value)
+
+
 @dataclass(frozen=True, slots=True)
 class _ScriptedRun:
     status: str = "completed"
