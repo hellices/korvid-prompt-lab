@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from korvid_prompt_lab.stable_candidates import CandidateAxis
 from korvid_prompt_lab.stable_proposer import (
+    BoundedAggregateFeedback,
     BoundedAppendProposalRequest,
     BoundedAppendProposer,
     build_proposal_request,
@@ -80,6 +81,59 @@ def test_build_proposal_request_keeps_only_bounded_aggregate_feedback() -> None:
         "malformed_tool_calls": 0,
         "unresolvable_tool_calls": 1,
     }
+
+
+def test_bounded_append_proposal_request_rejects_non_bounded_feedback_instances() -> None:
+    measurement = _measurement()
+    payload = asdict(measurement)
+
+    with pytest.raises(TypeError, match="bounded_feedback"):
+        BoundedAppendProposalRequest(
+            finalist_append="inspect runtime evidence before stating a diagnosis.",
+            failure_axis=CandidateAxis.EVIDENCE_FIRST,
+            bounded_feedback=measurement,
+        )
+    with pytest.raises(TypeError, match="bounded_feedback"):
+        BoundedAppendProposalRequest(
+            finalist_append="inspect runtime evidence before stating a diagnosis.",
+            failure_axis=CandidateAxis.EVIDENCE_FIRST,
+            bounded_feedback=payload,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("mean_score", float("nan"), "finite"),
+        ("score_variance", -0.1, "non-negative"),
+        ("worst_case_mean", float("inf"), "finite"),
+        ("pass_at_3", 1.1, "between 0.0 and 1.0"),
+        ("hard_safety_failures", -1, "non-negative integer"),
+        ("repetitions_per_case", -1, "non-negative integer"),
+        ("mean_verification", float("-inf"), "finite"),
+        ("malformed_tool_calls", -1, "non-negative integer"),
+        ("unresolvable_tool_calls", -1, "non-negative integer"),
+    ],
+)
+def test_bounded_aggregate_feedback_validates_numeric_bounds(
+    field: str, value: object, message: str
+) -> None:
+    kwargs = {
+        "mean_score": 0.61,
+        "score_variance": 0.02,
+        "worst_case_mean": 0.54,
+        "pass_at_3": 1.0,
+        "hard_safety_failures": 0,
+        "systemic_failures": 0,
+        "repetitions_per_case": 5,
+        "mean_verification": 0.82,
+        "malformed_tool_calls": 0,
+        "unresolvable_tool_calls": 1,
+    }
+    kwargs[field] = value
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        BoundedAggregateFeedback(**kwargs)
 
 
 def test_build_proposal_request_rejects_noncanonical_finalist_append_outer_whitespace() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
@@ -68,6 +69,18 @@ class BoundedAggregateFeedback:
     malformed_tool_calls: int
     unresolvable_tool_calls: int
 
+    def __post_init__(self) -> None:
+        _require_finite_float(self.mean_score, "mean_score")
+        _require_non_negative_float(self.score_variance, "score_variance")
+        _require_finite_float(self.worst_case_mean, "worst_case_mean")
+        _require_probability(self.pass_at_3, "pass_at_3")
+        _require_non_negative_int(self.hard_safety_failures, "hard_safety_failures")
+        _require_non_negative_int(self.systemic_failures, "systemic_failures")
+        _require_non_negative_int(self.repetitions_per_case, "repetitions_per_case")
+        _require_finite_float(self.mean_verification, "mean_verification")
+        _require_non_negative_int(self.malformed_tool_calls, "malformed_tool_calls")
+        _require_non_negative_int(self.unresolvable_tool_calls, "unresolvable_tool_calls")
+
 
 @dataclass(frozen=True, slots=True)
 class BoundedAppendProposalRequest:
@@ -79,6 +92,8 @@ class BoundedAppendProposalRequest:
         _require_canonical_text(self.finalist_append, "finalist_append")
         if not isinstance(self.failure_axis, CandidateAxis):
             raise ValueError("failure_axis must be a known failure axis")  # noqa: TRY004 - preserve validation API
+        if not isinstance(self.bounded_feedback, BoundedAggregateFeedback):
+            raise TypeError("bounded_feedback must be a BoundedAggregateFeedback instance")
 
 
 class BoundedAppendProposalSignature(dspy.Signature):
@@ -250,6 +265,39 @@ def _require_canonical_text(value: Any, context: str) -> str:
     if text != text.strip():
         raise ValueError(f"{context} must use canonical outer whitespace")
     return text
+
+
+def _require_finite_float(value: Any, context: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{context} must be a finite number")
+    normalized = float(value)
+    if not math.isfinite(normalized):
+        raise ValueError(f"{context} must be a finite number")
+    return normalized
+
+
+def _require_non_negative_float(value: Any, context: str) -> float:
+    normalized = _require_finite_float(value, context)
+    if normalized < 0.0:
+        raise ValueError(f"{context} must be a non-negative number")
+    return normalized
+
+
+def _require_probability(value: Any, context: str) -> float | None:
+    if value is None:
+        return None
+    normalized = _require_finite_float(value, context)
+    if not 0.0 <= normalized <= 1.0:
+        raise ValueError(f"{context} must be between 0.0 and 1.0")
+    return normalized
+
+
+def _require_non_negative_int(value: Any, context: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{context} must be a non-negative integer")
+    if value < 0:
+        raise ValueError(f"{context} must be a non-negative integer")
+    return value
 
 
 _MISSING = object()
