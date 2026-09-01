@@ -32,3 +32,17 @@ PASS — restored generic reflection rewrites above 480 chars, made bounded prop
 - `uv run --python 3.12 pytest -q tests/test_reflection.py tests/test_stable_proposer.py tests/test_optimize.py`
 - `uv run --python 3.12 ruff check src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py tests/test_reflection.py tests/test_stable_proposer.py`
 - `uv run --python 3.12 mypy src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py`
+
+## Review Fix 2
+
+PASS — safe_propose now isolates expected LM/runtime/transport failures without swallowing TypeError or other programming bugs.
+
+## Commit
+
+- `10d899d` — `fix(search): isolate bounded proposer failures`
+
+## Tests
+
+- `uv run --python 3.12 pytest -q tests/test_reflection.py tests/test_stable_proposer.py tests/test_optimize.py`
+- `uv run --python 3.12 ruff check src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py tests/test_reflection.py tests/test_stable_proposer.py`
+- `uv run --python 3.12 mypy src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py`
