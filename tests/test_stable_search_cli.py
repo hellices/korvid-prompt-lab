@@ -253,3 +253,53 @@ def test_stable_search_cli_builds_the_bounded_proposer_extension(
         captured["search_kwargs"]["extension"].bounded_append_proposer.reflection_lm
         == {"model": "ollama_chat/qwen3:4b"}
     )
+
+
+def test_stable_search_cli_passes_non_default_target_per_split_to_manifest_and_search(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, Any] = {}
+    summary_path = tmp_path / "stable-search-summary.json"
+    summary_path.write_text(
+        json.dumps({"decision": {"status": "no_stable_winner", "candidate_id": None, "reasons": ["no_finalists"]}}),
+        encoding="utf-8",
+    )
+
+    class FakeRunner:
+        def __init__(self, campaign: object) -> None:
+            self.campaign = campaign
+
+    def fake_build_scenario_manifest(*, target_per_split: int = 6) -> ScenarioManifest:
+        captured["target_per_split"] = target_per_split
+        return _manifest()
+
+    def fake_run_stable_search(**kwargs: Any) -> _FakeArtifacts:
+        captured["manifest"] = kwargs["manifest"]
+        return _FakeArtifacts(summary_path=summary_path)
+
+    monkeypatch.setattr("korvid_prompt_lab.cli.build_baseline_candidate", lambda profile: _baseline())
+    monkeypatch.setattr(
+        "korvid_prompt_lab.cli.build_structured_candidates",
+        lambda baseline: (_structured_candidate(),),
+    )
+    monkeypatch.setattr("korvid_prompt_lab.cli.build_scenario_manifest", fake_build_scenario_manifest)
+    monkeypatch.setattr("korvid_prompt_lab.cli.KorvidReadonlyRunner", FakeRunner)
+    monkeypatch.setattr("korvid_prompt_lab.cli.run_stable_search", fake_run_stable_search)
+    monkeypatch.setenv("KORVID_READONLY_BASE_URL", "http://127.0.0.1:41001")
+
+    exit_code, stdout, stderr = _run_cli(
+        [
+            "stable-search",
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--target-per-split",
+            "4",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0, stderr
+    assert stderr == ""
+    assert json.loads(stdout)["decision"]["status"] == "no_stable_winner"
+    assert captured["target_per_split"] == 4
+    assert captured["manifest"] == _manifest()

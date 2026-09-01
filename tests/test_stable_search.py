@@ -154,6 +154,12 @@ _PATHOLOGICAL_SPLITS_BY_CASE = {
     "milestone/../../../../escape|case": "milestone",
 }
 
+_MAX_PATH_SPLITS = {
+    **{f"train-{index}": "train" for index in range(1, 7)},
+    **{f"validation-{index}": "validation" for index in range(1, 7)},
+    **{f"milestone-{index}": "milestone" for index in range(1, 7)},
+}
+
 
 
 def _baseline() -> Candidate:
@@ -514,9 +520,10 @@ def test_stable_search_promotes_a_proposer_candidate_after_stage_b_replay(
         "bounded-finalist",
         append="inspect runtime evidence before stating a diagnosis.",
     )
+    runner = _runner_for_scripts(case_splits=_SPLITS_BY_CASE, scripts=scripts)
 
     artifacts = run_stable_search(
-        runner=_runner_for_scripts(case_splits=_SPLITS_BY_CASE, scripts=scripts),
+        runner=runner,
         baseline=_baseline(),
         candidates=(candidate,),
         manifest=_manifest(),
@@ -527,6 +534,7 @@ def test_stable_search_promotes_a_proposer_candidate_after_stage_b_replay(
 
     assert artifacts.decision.status == "promote"
     assert artifacts.decision.candidate_id == proposed_candidate_id
+    assert [item.candidate_id for item in artifacts.validation.survivors] == [proposed_candidate_id]
     assert artifacts.extension is not None
     assert len(artifacts.extension.bounded_proposals) == 1
     proposal = artifacts.extension.bounded_proposals[0]
@@ -538,6 +546,7 @@ def test_stable_search_promotes_a_proposer_candidate_after_stage_b_replay(
     assert proposal.validation_measurement is not None
     assert proposal.qualification is not None
     assert requests
+    assert all("stage-c-proposer" not in call[3].parts for call in runner.calls)
 
 
 def test_stable_search_records_proposer_validation_rejection_without_stage_c_replay(
@@ -587,6 +596,7 @@ def test_stable_search_records_proposer_validation_rejection_without_stage_c_rep
     )
 
     assert artifacts.decision.status == "no_stable_winner"
+    assert [item.candidate_id for item in artifacts.validation.survivors] == ["bounded-finalist"]
     assert artifacts.extension is not None
     proposal = artifacts.extension.bounded_proposals[0]
     assert proposal.proposed_candidate_id == proposed_candidate_id
@@ -663,3 +673,114 @@ def test_stable_search_catches_known_proposer_errors_without_invalidating_struct
     assert proposal.error_label == label
     written = "\n".join(path.read_text(encoding="utf-8") for path in (tmp_path / "campaign").rglob("*") if path.is_file())
     assert "TOP_SECRET_" not in written
+
+
+def test_stable_search_caps_proposer_flow_at_306_calls_with_one_integrated_stage_c(
+    tmp_path: Path,
+) -> None:
+    proposed_append = "inspect runtime evidence before stating a diagnosis.\nbounded-306"
+    proposed_candidate_id = _proposal_candidate_id("evidence-first", proposed_append)
+
+    class FakeProposer:
+        def __init__(self) -> None:
+            self.reflection_lm = {"model": "ollama_chat/qwen3:4b"}
+
+        def safe_propose(self, request_or_context: object, **kwargs: object) -> str | None:
+            del request_or_context, kwargs
+            return proposed_append
+
+    candidates = build_structured_candidates(_baseline())
+    baseline_scripts = {
+        ("baseline", "train"): (_ScriptedRun(score=0.40, verification=0.60),),
+        ("baseline", "validation"): tuple(_ScriptedRun(score=0.40, verification=0.60) for _ in range(5)),
+        ("baseline", "milestone"): tuple(_ScriptedRun(score=0.40, verification=0.60) for _ in range(5)),
+    }
+    candidate_scripts: dict[tuple[str, str], Sequence[_ScriptedRun]] = {}
+    for candidate in candidates:
+        candidate_id = candidate.candidate.candidate_id
+        train_score = 0.10
+        validation_score = 0.10
+        milestone_score = 0.10
+        validation_verification = 0.60
+        tool_calls = 2
+        resolvable_tool_calls = 2
+        if candidate_id == "evidence-first":
+            train_score = 0.72
+            validation_score = 0.58
+            milestone_score = 0.52
+            validation_verification = 0.50
+        elif candidate_id == "one-tool-at-a-time":
+            train_score = 0.69
+            validation_score = 0.56
+            milestone_score = 0.51
+        elif candidate_id == "cite-before-conclusion":
+            train_score = 0.67
+            validation_score = 0.54
+            milestone_score = 0.49
+        elif candidate_id == "evidence-first+one-tool-at-a-time":
+            train_score = 0.45
+            validation_score = 0.44
+            milestone_score = 0.44
+        candidate_scripts[(candidate_id, "train")] = (
+            _ScriptedRun(
+                score=train_score,
+                verification=0.60,
+                tool_calls=tool_calls,
+                resolvable_tool_calls=resolvable_tool_calls,
+            ),
+        )
+        candidate_scripts[(candidate_id, "validation")] = tuple(
+            _ScriptedRun(
+                score=validation_score,
+                verification=validation_verification,
+                tool_calls=tool_calls,
+                resolvable_tool_calls=resolvable_tool_calls,
+            )
+            for _ in range(5)
+        )
+        candidate_scripts[(candidate_id, "milestone")] = tuple(
+            _ScriptedRun(
+                score=milestone_score,
+                verification=0.60,
+                tool_calls=tool_calls,
+                resolvable_tool_calls=resolvable_tool_calls,
+            )
+            for _ in range(5)
+        )
+    candidate_scripts[(proposed_candidate_id, "validation")] = tuple(
+        _ScriptedRun(score=0.59, verification=0.70, tool_calls=2, resolvable_tool_calls=2) for _ in range(5)
+    )
+    candidate_scripts[(proposed_candidate_id, "milestone")] = tuple(
+        _ScriptedRun(score=0.55, verification=0.70, tool_calls=2, resolvable_tool_calls=2) for _ in range(5)
+    )
+
+    runner = _runner_for_scripts(
+        case_splits=_MAX_PATH_SPLITS,
+        scripts=baseline_scripts | candidate_scripts,
+    )
+    artifacts = run_stable_search(
+        runner=runner,
+        baseline=_baseline(),
+        candidates=candidates,
+        manifest=_manifest(_MAX_PATH_SPLITS),
+        artifact_root=tmp_path / "campaign",
+        extension=StableSearchExtension(bounded_append_proposer=FakeProposer()),
+    )
+
+    assert len(runner.calls) == 306
+    assert artifacts.decision.status == "promote"
+    assert artifacts.decision.candidate_id == proposed_candidate_id
+    assert [item.candidate_id for item in artifacts.screening.survivors] == [
+        "evidence-first",
+        "one-tool-at-a-time",
+        "cite-before-conclusion",
+    ]
+    assert [item.candidate_id for item in artifacts.validation.survivors] == [
+        proposed_candidate_id,
+        "one-tool-at-a-time",
+    ]
+    assert not (tmp_path / "campaign" / "stage-c-proposer").exists()
+    assert not (tmp_path / "campaign" / "stage-b-proposer").exists()
+    assert {"stage-a", "stage-b", "stage-c"} == {
+        call[3].relative_to(tmp_path / "campaign").parts[0] for call in runner.calls
+    }

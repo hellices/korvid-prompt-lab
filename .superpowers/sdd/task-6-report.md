@@ -55,3 +55,17 @@
 
 ### Updated Concerns
 - no additional functional concerns; proposer-enabled runs now have a higher documented target-model upper bound than structured-only runs
+
+## Rework Round (2026-09-01 23:56 JST)
+- reworked proposer integration so proposer-enabled searches still cap at the exact `306` target-model calls
+- Stage B now keeps the normal baseline measurement, evaluates only the top two structured candidates up front, and can add at most one proposed candidate on the same validation split before selecting the final top two finalists
+- Stage C is now a single integrated qualification flow under `stage-c`; the separate proposer qualification branch and duplicate baseline replay were removed
+- restored README/example/help text to the exact `306` upper bound and clarified that the proposer attempts at most one proposal total
+
+### Rework Verification
+- `uv run --python 3.12 pytest -q tests/test_stable_search.py tests/test_stable_search_cli.py`
+  - result: `17 passed`
+
+### Rework Self-Review
+- verified the maximum-path proposer regression covers 8 structured candidates, 18 cases, and exactly `306` runner calls
+- verified proposer validation runs land under the integrated `stage-b` directory and no `stage-c-proposer` directory is created

@@ -222,7 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     stable_search_parser = subparsers.add_parser(
         "stable-search",
-        help="Run the bounded stable-search campaign against installed Korvid read-only evals.",
+        help="Run the bounded 306-call stable-search campaign against installed Korvid read-only evals.",
     )
     stable_search_parser.add_argument(
         "--artifact-root",
@@ -243,7 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
     stable_search_parser.add_argument(
         "--enable-bounded-proposer",
         action="store_true",
-        help="Record one bounded proposer output per Stage B finalist when a structured failure axis exists.",
+        help="Attempt at most one bounded proposer candidate from the strongest eligible Stage B structured finalist.",
     )
     stable_search_parser.add_argument(
         "--json",

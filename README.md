@@ -122,14 +122,15 @@ builds the structured append matrix, and runs the staged search through
 - the final JSON decision is always `promote` or `no_stable_winner`; systemic
   runner failures abort instead of being normalized into a decision
 - `--enable-bounded-proposer --reflection-model ...` attempts at most one bounded
-  replay candidate after a structured Stage B signal and only when the structured
-  Stage C decision is still `no_stable_winner`
-- that replay uses the same Stage B 3-repetition gate and, if it survives, the same
-  Stage C validation+milestone 5-repetition gate; this adds at most `78` more
-  target-model runs, so the overall proposer-enabled upper bound is `384`
+  proposal from the strongest eligible Stage B structured candidate
+- proposer-enabled runs keep the same `306` bound by reserving one Stage B slot:
+  baseline + top2 structured run first, at most one proposed candidate reuses the
+  existing Stage B baseline for its own 3-repetition validation replay, then the
+  merged top2 finalists run through the normal single Stage C validation+milestone
+  gate once
 - proposer provider/configuration errors are recorded in the summary `extension`
   block as sanitized labels, never raw provider messages, and the structured
-  decision remains the fallback result
+  finalists continue through the normal Stage C flow
 
 Reference defaults live in `examples/stable-search/korvid-small.yaml`.
 
