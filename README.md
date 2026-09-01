@@ -118,12 +118,18 @@ builds the structured append matrix, and runs the staged search through
 `KorvidReadonlyRunner` against `KORVID_READONLY_BASE_URL`.
 
 - the artifact root is required and must be fresh; an existing directory is refused
-- the default live upper bound is `306` target-model runs (`54 + 72 + 180`)
+- the default structured-search upper bound is `306` target-model runs (`54 + 72 + 180`)
 - the final JSON decision is always `promote` or `no_stable_winner`; systemic
   runner failures abort instead of being normalized into a decision
-- `--enable-bounded-proposer --reflection-model ...` records one bounded Stage B
-  proposer result per finalist in the summary `extension` block without changing
-  the structured decision path, so the `306` target-model upper bound remains intact
+- `--enable-bounded-proposer --reflection-model ...` attempts at most one bounded
+  replay candidate after a structured Stage B signal and only when the structured
+  Stage C decision is still `no_stable_winner`
+- that replay uses the same Stage B 3-repetition gate and, if it survives, the same
+  Stage C validation+milestone 5-repetition gate; this adds at most `78` more
+  target-model runs, so the overall proposer-enabled upper bound is `384`
+- proposer provider/configuration errors are recorded in the summary `extension`
+  block as sanitized labels, never raw provider messages, and the structured
+  decision remains the fallback result
 
 Reference defaults live in `examples/stable-search/korvid-small.yaml`.
 

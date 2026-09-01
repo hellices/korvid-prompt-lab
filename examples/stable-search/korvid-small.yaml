@@ -4,7 +4,9 @@ campaign_id: stable-search-korvid-small
 profile: small
 model: qwen3:0.6b
 target_per_split: 6
-target_model_run_upper_bound: 306
+structured_target_model_run_upper_bound: 306
+optional_proposer_additional_target_model_runs: 78
+proposer_enabled_target_model_run_upper_bound: 384
 winner_gate:
   minimum_mean_delta: 0.10
   qualification_repetitions: 5
@@ -19,5 +21,8 @@ serving:
 optional_bounded_proposer:
   enabled_via_cli_flag: --enable-bounded-proposer
   reflection_model_flag: --reflection-model
-  runs_after_stage_b_signal: true
-  decision_impact: structured_decision_unchanged_without_target_model_replay
+  proposal_attempts_max: 1
+  runs_after_structured_stage_b_signal: true
+  requires_structured_no_stable_winner: true
+  replay_validation_repetitions: 3
+  replay_qualification_repetitions: 5

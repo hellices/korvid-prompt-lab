@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from collections.abc import Mapping, Sequence
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 import pytest
+from litellm.exceptions import APIError, AuthenticationError, BadRequestError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -24,7 +26,11 @@ from korvid_prompt_lab.stable_scenarios import (
     ScenarioManifest,
     ScenarioSplitSummary,
 )
-from korvid_prompt_lab.stable_search import StableSearchConfig, run_stable_search
+from korvid_prompt_lab.stable_search import (
+    StableSearchConfig,
+    StableSearchExtension,
+    run_stable_search,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -465,12 +471,17 @@ def test_stable_search_refuses_to_reuse_an_existing_artifact_root(tmp_path: Path
         )
 
 
-def test_stable_search_records_bounded_proposer_extension_after_stage_b_signal(
+def _proposal_candidate_id(candidate_id: str, proposed_append: str) -> str:
+    digest = hashlib.sha256(proposed_append.encode("utf-8")).hexdigest()[:8]
+    return f"{candidate_id}+proposal-{digest}"
+
+
+def test_stable_search_promotes_a_proposer_candidate_after_stage_b_replay(
     tmp_path: Path,
 ) -> None:
-    from korvid_prompt_lab.stable_search import StableSearchExtension
-
     requests: list[object] = []
+    proposed_append = "inspect runtime evidence before stating a diagnosis.\nkorvid-tuned"
+    proposed_candidate_id = _proposal_candidate_id("bounded-finalist", proposed_append)
 
     class FakeProposer:
         def __init__(self) -> None:
@@ -479,7 +490,7 @@ def test_stable_search_records_bounded_proposer_extension_after_stage_b_signal(
         def safe_propose(self, request_or_context: object, **kwargs: object) -> str | None:
             del kwargs
             requests.append(request_or_context)
-            return "inspect runtime evidence before stating a diagnosis.\nkorvid-tuned"
+            return proposed_append
 
     scripts = {
         ("baseline", "train"): (_ScriptedRun(score=0.40, verification=0.60),),
@@ -491,6 +502,12 @@ def test_stable_search_records_bounded_proposer_extension_after_stage_b_signal(
         ),
         ("bounded-finalist", "milestone"): tuple(
             _ScriptedRun(score=0.45, verification=0.60, tool_calls=4, resolvable_tool_calls=2) for _ in range(5)
+        ),
+        (proposed_candidate_id, "validation"): tuple(
+            _ScriptedRun(score=0.56, verification=0.70, tool_calls=2, resolvable_tool_calls=2) for _ in range(5)
+        ),
+        (proposed_candidate_id, "milestone"): tuple(
+            _ScriptedRun(score=0.55, verification=0.70, tool_calls=2, resolvable_tool_calls=2) for _ in range(5)
         ),
     }
     candidate = _structured_candidate(
@@ -508,13 +525,141 @@ def test_stable_search_records_bounded_proposer_extension_after_stage_b_signal(
         extension=StableSearchExtension(bounded_append_proposer=FakeProposer()),
     )
 
-    assert artifacts.decision.status == "no_stable_winner"
+    assert artifacts.decision.status == "promote"
+    assert artifacts.decision.candidate_id == proposed_candidate_id
     assert artifacts.extension is not None
     assert len(artifacts.extension.bounded_proposals) == 1
     proposal = artifacts.extension.bounded_proposals[0]
     assert proposal.finalist_candidate_id == "bounded-finalist"
     assert proposal.failure_axis == "one-tool-at-a-time"
-    assert proposal.status == "proposed"
-    assert proposal.proposed_append == "inspect runtime evidence before stating a diagnosis.\nkorvid-tuned"
-    assert proposal.proposed_candidate_id is not None
+    assert proposal.status == "promote"
+    assert proposal.proposed_append == proposed_append
+    assert proposal.proposed_candidate_id == proposed_candidate_id
+    assert proposal.validation_measurement is not None
+    assert proposal.qualification is not None
     assert requests
+
+
+def test_stable_search_records_proposer_validation_rejection_without_stage_c_replay(
+    tmp_path: Path,
+) -> None:
+    proposed_append = "inspect runtime evidence before stating a diagnosis.\nkorvid-rejected"
+    proposed_candidate_id = _proposal_candidate_id("bounded-finalist", proposed_append)
+
+    class FakeProposer:
+        def __init__(self) -> None:
+            self.reflection_lm = {"model": "ollama_chat/qwen3:4b"}
+
+        def safe_propose(self, request_or_context: object, **kwargs: object) -> str | None:
+            del request_or_context, kwargs
+            return proposed_append
+
+    scripts = {
+        ("baseline", "train"): (_ScriptedRun(score=0.40, verification=0.60),),
+        ("baseline", "validation"): tuple(_ScriptedRun(score=0.40, verification=0.60) for _ in range(5)),
+        ("baseline", "milestone"): tuple(_ScriptedRun(score=0.40, verification=0.60) for _ in range(5)),
+        ("bounded-finalist", "train"): (_ScriptedRun(score=0.60, verification=0.60, tool_calls=4, resolvable_tool_calls=2),),
+        ("bounded-finalist", "validation"): tuple(
+            _ScriptedRun(score=0.55, verification=0.60, tool_calls=4, resolvable_tool_calls=2) for _ in range(5)
+        ),
+        ("bounded-finalist", "milestone"): tuple(
+            _ScriptedRun(score=0.45, verification=0.60, tool_calls=4, resolvable_tool_calls=2) for _ in range(5)
+        ),
+        (proposed_candidate_id, "validation"): tuple(
+            _ScriptedRun(score=0.35, verification=0.70, tool_calls=2, resolvable_tool_calls=2) for _ in range(5)
+        ),
+    }
+
+    runner = _runner_for_scripts(case_splits=_SPLITS_BY_CASE, scripts=scripts)
+    artifacts = run_stable_search(
+        runner=runner,
+        baseline=_baseline(),
+        candidates=(
+            _structured_candidate(
+                "bounded-finalist",
+                append="inspect runtime evidence before stating a diagnosis.",
+            ),
+        ),
+        manifest=_manifest(),
+        artifact_root=tmp_path / "campaign",
+        config=StableSearchConfig(screening_survivors=1, finalists=1),
+        extension=StableSearchExtension(bounded_append_proposer=FakeProposer()),
+    )
+
+    assert artifacts.decision.status == "no_stable_winner"
+    assert artifacts.extension is not None
+    proposal = artifacts.extension.bounded_proposals[0]
+    assert proposal.proposed_candidate_id == proposed_candidate_id
+    assert proposal.status == "validation_rejected"
+    assert proposal.validation_measurement is not None
+    assert "mean_delta_not_positive" in proposal.validation_rejection_reasons
+    assert proposal.qualification is None
+    assert all(call[0] != proposed_candidate_id for call in _calls_for_stage(runner.calls, "stage-c"))
+
+
+@pytest.mark.parametrize(
+    ("error", "label"),
+    [
+        (
+            AuthenticationError("TOP_SECRET_AUTH", "openai", "model"),
+            "authentication_error",
+        ),
+        (
+            BadRequestError("TOP_SECRET_BAD_REQUEST", "model", "openai"),
+            "bad_request_error",
+        ),
+        (
+            APIError(500, "TOP_SECRET_API", "openai", "model"),
+            "api_error",
+        ),
+    ],
+)
+def test_stable_search_catches_known_proposer_errors_without_invalidating_structured_results(
+    tmp_path: Path,
+    error: BaseException,
+    label: str,
+) -> None:
+    class RaisingProposer:
+        def __init__(self) -> None:
+            self.reflection_lm = {"model": "ollama_chat/qwen3:4b"}
+
+        def safe_propose(self, request_or_context: object, **kwargs: object) -> str | None:
+            del request_or_context, kwargs
+            raise error
+
+    scripts = {
+        ("baseline", "train"): (_ScriptedRun(score=0.40, verification=0.60),),
+        ("baseline", "validation"): tuple(_ScriptedRun(score=0.40, verification=0.60) for _ in range(5)),
+        ("baseline", "milestone"): tuple(_ScriptedRun(score=0.40, verification=0.60) for _ in range(5)),
+        ("bounded-finalist", "train"): (_ScriptedRun(score=0.60, verification=0.60, tool_calls=4, resolvable_tool_calls=2),),
+        ("bounded-finalist", "validation"): tuple(
+            _ScriptedRun(score=0.55, verification=0.60, tool_calls=4, resolvable_tool_calls=2) for _ in range(5)
+        ),
+        ("bounded-finalist", "milestone"): tuple(
+            _ScriptedRun(score=0.45, verification=0.60, tool_calls=4, resolvable_tool_calls=2) for _ in range(5)
+        ),
+    }
+
+    artifacts = run_stable_search(
+        runner=_runner_for_scripts(case_splits=_SPLITS_BY_CASE, scripts=scripts),
+        baseline=_baseline(),
+        candidates=(
+            _structured_candidate(
+                "bounded-finalist",
+                append="inspect runtime evidence before stating a diagnosis.",
+            ),
+        ),
+        manifest=_manifest(),
+        artifact_root=tmp_path / "campaign",
+        config=StableSearchConfig(screening_survivors=1, finalists=1),
+        extension=StableSearchExtension(bounded_append_proposer=RaisingProposer()),
+    )
+
+    assert artifacts.decision.status == "no_stable_winner"
+    assert artifacts.decision.candidate_id is None
+    assert artifacts.extension is not None
+    proposal = artifacts.extension.bounded_proposals[0]
+    assert proposal.status == "proposal_error"
+    assert proposal.error_label == label
+    written = "\n".join(path.read_text(encoding="utf-8") for path in (tmp_path / "campaign").rglob("*") if path.is_file())
+    assert "TOP_SECRET_" not in written

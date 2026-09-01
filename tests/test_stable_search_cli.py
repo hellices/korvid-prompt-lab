@@ -156,6 +156,41 @@ def test_stable_search_cli_rejects_existing_artifact_root(tmp_path: Path) -> Non
     assert "already exists" in stderr
 
 
+def test_stable_search_cli_requires_reflection_model_when_proposer_is_enabled(
+    tmp_path: Path,
+) -> None:
+    exit_code, stdout, stderr = _run_cli(
+        [
+            "stable-search",
+            "--artifact-root",
+            str(tmp_path / "stable-search"),
+            "--enable-bounded-proposer",
+        ]
+    )
+
+    assert exit_code == 2
+    assert stdout == ""
+    assert "--reflection-model" in stderr
+
+
+def test_stable_search_cli_requires_enable_flag_when_reflection_model_is_set(
+    tmp_path: Path,
+) -> None:
+    exit_code, stdout, stderr = _run_cli(
+        [
+            "stable-search",
+            "--artifact-root",
+            str(tmp_path / "stable-search"),
+            "--reflection-model",
+            "ollama_chat/qwen3:4b",
+        ]
+    )
+
+    assert exit_code == 2
+    assert stdout == ""
+    assert "--enable-bounded-proposer" in stderr
+
+
 @dataclass(frozen=True, slots=True)
 class _FakeArtifacts:
     summary_path: Path
