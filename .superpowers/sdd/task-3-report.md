@@ -104,7 +104,11 @@ Latest results:
 
 ### Status
 
-Ready to commit.
+Complete.
+
+### Commit
+
+- `aa936cd` — `fix(search): enforce exact stable qualification counts`
 
 ### Findings addressed
 
