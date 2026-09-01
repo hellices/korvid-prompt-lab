@@ -33,11 +33,6 @@ from korvid_prompt_lab.stable_proposer import (
 from korvid_prompt_lab.stable_ranking import CandidateMeasurement
 
 
-@dataclass(frozen=True, slots=True)
-class _MaliciousFeedback(BoundedAggregateFeedback):
-    identifier: str = "identifier"
-
-
 def _measurement() -> CandidateMeasurement:
     return CandidateMeasurement(
         candidate_id="candidate-1",
@@ -54,6 +49,31 @@ def _measurement() -> CandidateMeasurement:
         malformed_tool_calls=0,
         unresolvable_tool_calls=1,
     )
+
+
+def _safe_feedback() -> BoundedAggregateFeedback:
+    return BoundedAggregateFeedback(
+        mean_score=0.61,
+        score_variance=0.02,
+        worst_case_mean=0.54,
+        pass_at_3=1.0,
+        hard_safety_failures=0,
+        systemic_failures=0,
+        repetitions_per_case=5,
+        mean_verification=0.82,
+        malformed_tool_calls=0,
+        unresolvable_tool_calls=1,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _MaliciousFeedback(BoundedAggregateFeedback):
+    identifier: str = "identifier"
+
+
+@dataclass(frozen=True, slots=True)
+class _ForgedRequest(BoundedAppendProposalRequest):
+    identifier: str = "identifier"
 
 
 def test_build_proposal_request_keeps_only_bounded_aggregate_feedback() -> None:
@@ -92,13 +112,13 @@ def test_bounded_append_proposal_request_rejects_non_bounded_feedback_instances(
     measurement = _measurement()
     payload = asdict(measurement)
 
-    with pytest.raises(TypeError, match="bounded_feedback"):
+    with pytest.raises(ValueError, match="bounded_feedback"):
         BoundedAppendProposalRequest(
             finalist_append="inspect runtime evidence before stating a diagnosis.",
             failure_axis=CandidateAxis.EVIDENCE_FIRST,
             bounded_feedback=measurement,
         )
-    with pytest.raises(TypeError, match="bounded_feedback"):
+    with pytest.raises(ValueError, match="bounded_feedback"):
         BoundedAppendProposalRequest(
             finalist_append="inspect runtime evidence before stating a diagnosis.",
             failure_axis=CandidateAxis.EVIDENCE_FIRST,
@@ -107,22 +127,11 @@ def test_bounded_append_proposal_request_rejects_non_bounded_feedback_instances(
 
 
 def test_bounded_append_proposal_request_rejects_bounded_feedback_subclasses() -> None:
-    malicious = _MaliciousFeedback(
-        mean_score=0.61,
-        score_variance=0.02,
-        worst_case_mean=0.54,
-        pass_at_3=1.0,
-        hard_safety_failures=0,
-        systemic_failures=0,
-        repetitions_per_case=5,
-        mean_verification=0.82,
-        malformed_tool_calls=0,
-        unresolvable_tool_calls=1,
-    )
+    malicious = _MaliciousFeedback(**asdict(_safe_feedback()))
 
     assert "identifier" in asdict(malicious)
 
-    with pytest.raises(TypeError, match="bounded_feedback"):
+    with pytest.raises(ValueError, match="bounded_feedback"):
         BoundedAppendProposalRequest(
             finalist_append="inspect runtime evidence before stating a diagnosis.",
             failure_axis=CandidateAxis.EVIDENCE_FIRST,
@@ -164,6 +173,71 @@ def test_bounded_aggregate_feedback_validates_numeric_bounds(
 
     with pytest.raises((TypeError, ValueError), match=message):
         BoundedAggregateFeedback(**kwargs)
+
+
+def test_bounded_aggregate_feedback_rejects_missing_or_nonfinite_mean_verification() -> None:
+    for value in (-0.1, 1.1):
+        kwargs = asdict(_safe_feedback())
+        kwargs["mean_verification"] = value
+        with pytest.raises(ValueError, match="between 0.0 and 1.0"):
+            BoundedAggregateFeedback(**kwargs)
+
+
+def test_bounded_append_proposer_propose_rejects_forged_request_before_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_asdict(_: object) -> object:
+        raise AssertionError("asdict should not be reached for forged requests")
+
+    monkeypatch.setattr("korvid_prompt_lab.stable_proposer.asdict", fail_asdict)
+
+    proposer = BoundedAppendProposer(reflection_lm=object())
+    forged = _ForgedRequest(
+        finalist_append="inspect runtime evidence before stating a diagnosis.",
+        failure_axis=CandidateAxis.EVIDENCE_FIRST,
+        bounded_feedback=_safe_feedback(),
+    )
+
+    with pytest.raises(ValueError, match="request must be a BoundedAppendProposalRequest instance"):
+        proposer.propose(forged)
+
+
+def test_bounded_append_proposer_propose_rejects_simple_namespace_before_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_asdict(_: object) -> object:
+        raise AssertionError("asdict should not be reached for forged requests")
+
+    monkeypatch.setattr("korvid_prompt_lab.stable_proposer.asdict", fail_asdict)
+
+    proposer = BoundedAppendProposer(reflection_lm=object())
+    forged = SimpleNamespace(
+        finalist_append="inspect runtime evidence before stating a diagnosis.",
+        failure_axis=CandidateAxis.EVIDENCE_FIRST,
+        bounded_feedback=_safe_feedback(),
+        identifier="leak",
+    )
+
+    with pytest.raises(ValueError, match="request must be a BoundedAppendProposalRequest instance"):
+        proposer.propose(forged)
+
+
+def test_bounded_append_proposer_safe_propose_converts_validation_errors_to_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_asdict(_: object) -> object:
+        raise AssertionError("asdict should not be reached for forged requests")
+
+    monkeypatch.setattr("korvid_prompt_lab.stable_proposer.asdict", fail_asdict)
+
+    proposer = BoundedAppendProposer(reflection_lm=object())
+    forged = _ForgedRequest(
+        finalist_append="inspect runtime evidence before stating a diagnosis.",
+        failure_axis=CandidateAxis.EVIDENCE_FIRST,
+        bounded_feedback=_safe_feedback(),
+    )
+
+    assert proposer.safe_propose(forged) is None
 
 
 def test_build_proposal_request_rejects_noncanonical_finalist_append_outer_whitespace() -> None:

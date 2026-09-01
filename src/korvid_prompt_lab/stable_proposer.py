@@ -95,7 +95,7 @@ class BoundedAppendProposalRequest:
         if not isinstance(self.failure_axis, CandidateAxis):
             raise ValueError("failure_axis must be a known failure axis")  # noqa: TRY004 - preserve validation API
         if type(self.bounded_feedback) is not BoundedAggregateFeedback:
-            raise TypeError("bounded_feedback must be a BoundedAggregateFeedback instance")
+            raise ValueError("bounded_feedback must be a BoundedAggregateFeedback instance")
 
 
 class BoundedAppendProposalSignature(dspy.Signature):
@@ -115,6 +115,10 @@ class BoundedAppendProposer:
         self._predictor: dspy.Predict | None = None
 
     def propose(self, request: BoundedAppendProposalRequest) -> str:
+        if type(request) is not BoundedAppendProposalRequest:
+            raise ValueError("request must be a BoundedAppendProposalRequest instance")
+        if type(request.bounded_feedback) is not BoundedAggregateFeedback:
+            raise ValueError("bounded_feedback must be a BoundedAggregateFeedback instance")
         prediction = self._predictor_or_raise()(
             current_append=request.finalist_append,
             failure_axis=request.failure_axis.value,
