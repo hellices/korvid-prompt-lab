@@ -1,0 +1,583 @@
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Literal
+
+from .artifacts import write_json_artifact
+from .contracts import Candidate, EvalCase
+from .runner import KorvidRunner
+from .scoring import BridgeResult, result_passed, score_result
+from .stable_candidates import StructuredCandidate
+from .stable_ranking import (
+    NormalizedRunRecord,
+    QualificationCandidate,
+    QualificationDecision,
+    StageDecision,
+    measure_candidate,
+    qualify_winner,
+    rank_screening,
+    select_finalists,
+)
+from .stable_scenarios import ScenarioManifest
+
+__all__ = ["StableSearchArtifacts", "StableSearchConfig", "run_stable_search"]
+
+_SEARCH_SCHEMA_VERSION = 1
+_SCOREABLE_STATUSES = frozenset({"completed", "model_failure"})
+
+
+@dataclass(frozen=True, slots=True)
+class StableSearchConfig:
+    screening_repetitions: int = 1
+    validation_repetitions: int = 3
+    qualification_repetitions: int = 5
+    screening_survivors: int = 3
+    finalists: int = 2
+    minimum_mean_delta: float = 0.10
+
+    def __post_init__(self) -> None:
+        screening_repetitions = _require_positive_int(self.screening_repetitions, "screening_repetitions")
+        validation_repetitions = _require_positive_int(self.validation_repetitions, "validation_repetitions")
+        qualification_repetitions = _require_positive_int(
+            self.qualification_repetitions, "qualification_repetitions"
+        )
+        screening_survivors = _require_positive_int(self.screening_survivors, "screening_survivors")
+        finalists = _require_positive_int(self.finalists, "finalists")
+        minimum_mean_delta = _require_non_negative_float(self.minimum_mean_delta, "minimum_mean_delta")
+        if screening_repetitions > validation_repetitions:
+            raise ValueError("validation_repetitions must be at least screening_repetitions")
+        if validation_repetitions > qualification_repetitions:
+            raise ValueError("qualification_repetitions must be at least validation_repetitions")
+        if finalists > screening_survivors:
+            raise ValueError("finalists must not exceed screening_survivors")
+        object.__setattr__(self, "minimum_mean_delta", minimum_mean_delta)
+
+
+@dataclass(frozen=True, slots=True)
+class StableSearchArtifacts:
+    artifact_root: Path
+    config: StableSearchConfig
+    screening: StageDecision
+    validation: StageDecision
+    qualification: tuple[QualificationCandidate, ...]
+    decision: QualificationDecision
+    baseline_manifest_path: Path
+    candidate_manifest_path: Path
+    scenario_manifest_path: Path
+    screening_summary_path: Path
+    validation_summary_path: Path
+    qualification_summary_path: Path
+    summary_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class _PairedStageArtifacts:
+    decision: StageDecision
+    summary_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class _QualificationStageArtifacts:
+    candidates: tuple[QualificationCandidate, ...]
+    summary_path: Path
+
+
+class _ExecutionModeTracker:
+    def __init__(self) -> None:
+        self._modes: list[str] = []
+
+    @property
+    def modes(self) -> tuple[str, ...]:
+        return tuple(self._modes)
+
+    def observe(self, mode: str) -> None:
+        if mode in self._modes:
+            return
+        if self._modes:
+            raise ValueError(f"stable search evidence must not mix execution modes: {self._modes[0]} then {mode}")
+        self._modes.append(mode)
+
+
+StageName = Literal["stage-a", "stage-b"]
+
+
+def run_stable_search(
+    *,
+    runner: KorvidRunner,
+    baseline: Candidate,
+    candidates: Sequence[StructuredCandidate],
+    manifest: ScenarioManifest,
+    artifact_root: Path | str,
+    config: StableSearchConfig | None = None,
+) -> StableSearchArtifacts:
+    if config is None:
+        config = StableSearchConfig()
+    artifact_root_path = Path(artifact_root)
+    _prepare_artifact_root(artifact_root_path)
+    _validate_candidates(baseline, candidates)
+    _require_runner_repetitions(runner, config.qualification_repetitions)
+
+    case_index = _case_index(runner.campaign.cases)
+    _validate_manifest_coverage(case_index, manifest)
+    execution_modes = _ExecutionModeTracker()
+    candidate_index = {candidate.candidate.candidate_id: candidate for candidate in candidates}
+
+    baseline_manifest_path = write_json_artifact(
+        artifact_root_path / "baseline-candidate.json", _candidate_payload(baseline)
+    )
+    candidate_manifest_path = write_json_artifact(
+        artifact_root_path / "candidate-manifest.json",
+        {
+            "schema_version": _SEARCH_SCHEMA_VERSION,
+            "candidates": [_structured_candidate_payload(candidate) for candidate in candidates],
+        },
+    )
+    scenario_manifest_path = write_json_artifact(
+        artifact_root_path / "scenario-manifest.json", asdict(manifest)
+    )
+
+    screening = _run_paired_stage(
+        runner=runner,
+        baseline=baseline,
+        candidates=candidates,
+        cases=_select_cases(case_index, manifest.train),
+        split="train",
+        repetitions=config.screening_repetitions,
+        stage_dir=artifact_root_path / "stage-a",
+        stage_name="stage-a",
+        summary_name="screening-summary.json",
+        ranker=rank_screening,
+        limit=config.screening_survivors,
+        execution_modes=execution_modes,
+    )
+    stage_b_candidates = tuple(candidate_index[item.candidate_id] for item in screening.decision.survivors)
+    validation = _run_paired_stage(
+        runner=runner,
+        baseline=baseline,
+        candidates=stage_b_candidates,
+        cases=_select_cases(case_index, manifest.validation),
+        split="validation",
+        repetitions=config.validation_repetitions,
+        stage_dir=artifact_root_path / "stage-b",
+        stage_name="stage-b",
+        summary_name="validation-summary.json",
+        ranker=select_finalists,
+        limit=config.finalists,
+        execution_modes=execution_modes,
+    )
+    finalists = tuple(candidate_index[item.candidate_id] for item in validation.decision.survivors)
+    qualification = _run_qualification_stage(
+        runner=runner,
+        baseline=baseline,
+        finalists=finalists,
+        validation_cases=_select_cases(case_index, manifest.validation),
+        milestone_cases=_select_cases(case_index, manifest.milestone),
+        repetitions=config.qualification_repetitions,
+        stage_dir=artifact_root_path / "stage-c",
+        execution_modes=execution_modes,
+        minimum_mean_delta=config.minimum_mean_delta,
+    )
+    decision = qualify_winner(
+        qualification.candidates,
+        minimum_mean_delta=config.minimum_mean_delta,
+        required_repetitions=config.qualification_repetitions,
+    )
+    qualification_summary_path = write_json_artifact(
+        qualification.summary_path,
+        {
+            "schema_version": _SEARCH_SCHEMA_VERSION,
+            "stage": "qualification",
+            "repetitions": config.qualification_repetitions,
+            "candidates": [asdict(candidate) for candidate in qualification.candidates],
+            "decision": asdict(decision),
+            "execution_modes": list(execution_modes.modes),
+        },
+    )
+
+    summary_path = write_json_artifact(
+        artifact_root_path / "stable-search-summary.json",
+        {
+            "schema_version": _SEARCH_SCHEMA_VERSION,
+            "campaign_id": runner.campaign.campaign_id,
+            "config": asdict(config),
+            "decision": asdict(decision),
+            "winner_append": _winner_append(candidate_index, decision),
+            "execution_modes": list(execution_modes.modes),
+            "artifacts": {
+                "baseline_candidate": str(baseline_manifest_path.relative_to(artifact_root_path)),
+                "candidate_manifest": str(candidate_manifest_path.relative_to(artifact_root_path)),
+                "scenario_manifest": str(scenario_manifest_path.relative_to(artifact_root_path)),
+                "screening_summary": str(screening.summary_path.relative_to(artifact_root_path)),
+                "validation_summary": str(validation.summary_path.relative_to(artifact_root_path)),
+                "qualification_summary": str(qualification_summary_path.relative_to(artifact_root_path)),
+            },
+        },
+    )
+    return StableSearchArtifacts(
+        artifact_root=artifact_root_path,
+        config=config,
+        screening=screening.decision,
+        validation=validation.decision,
+        qualification=qualification.candidates,
+        decision=decision,
+        baseline_manifest_path=baseline_manifest_path,
+        candidate_manifest_path=candidate_manifest_path,
+        scenario_manifest_path=scenario_manifest_path,
+        screening_summary_path=screening.summary_path,
+        validation_summary_path=validation.summary_path,
+        qualification_summary_path=qualification_summary_path,
+        summary_path=summary_path,
+    )
+
+def _run_paired_stage(
+    *,
+    runner: KorvidRunner,
+    baseline: Candidate,
+    candidates: Sequence[StructuredCandidate],
+    cases: Sequence[EvalCase],
+    split: str,
+    repetitions: int,
+    stage_dir: Path,
+    stage_name: StageName,
+    summary_name: str,
+    ranker: Any,
+    limit: int,
+    execution_modes: _ExecutionModeTracker,
+) -> _PairedStageArtifacts:
+    stage_dir.mkdir(parents=True, exist_ok=False)
+    baseline_measurement = measure_candidate(
+        _run_candidate(
+            runner=runner,
+            candidate=baseline,
+            cases=cases,
+            split=split,
+            repetitions=repetitions,
+            stage_dir=stage_dir,
+            execution_modes=execution_modes,
+        )
+    )
+    measurements = tuple(
+        measure_candidate(
+            _run_candidate(
+                runner=runner,
+                candidate=structured.candidate,
+                cases=cases,
+                split=split,
+                repetitions=repetitions,
+                stage_dir=stage_dir,
+                execution_modes=execution_modes,
+            )
+        )
+        for structured in candidates
+    )
+    decision = ranker(
+        baseline_measurement,
+        measurements,
+        limit=limit,
+        stage="screening" if stage_name == "stage-a" else "validation",
+    )
+    summary_path = write_json_artifact(
+        stage_dir / summary_name,
+        {
+            "schema_version": _SEARCH_SCHEMA_VERSION,
+            "stage": decision.stage,
+            "split": split,
+            "repetitions": repetitions,
+            "baseline": asdict(baseline_measurement),
+            "candidates": [asdict(measurement) for measurement in measurements],
+            "decision": asdict(decision),
+            "execution_modes": list(execution_modes.modes),
+        },
+    )
+    return _PairedStageArtifacts(decision=decision, summary_path=summary_path)
+
+
+
+def _run_qualification_stage(
+    *,
+    runner: KorvidRunner,
+    baseline: Candidate,
+    finalists: Sequence[StructuredCandidate],
+    validation_cases: Sequence[EvalCase],
+    milestone_cases: Sequence[EvalCase],
+    repetitions: int,
+    stage_dir: Path,
+    execution_modes: _ExecutionModeTracker,
+    minimum_mean_delta: float,
+) -> _QualificationStageArtifacts:
+    stage_dir.mkdir(parents=True, exist_ok=False)
+    if not finalists:
+        return _QualificationStageArtifacts(candidates=(), summary_path=stage_dir / "qualification-summary.json")
+
+    baseline_validation = measure_candidate(
+        _run_candidate(
+            runner=runner,
+            candidate=baseline,
+            cases=validation_cases,
+            split="validation",
+            repetitions=repetitions,
+            stage_dir=stage_dir,
+            execution_modes=execution_modes,
+        )
+    )
+    baseline_milestone = measure_candidate(
+        _run_candidate(
+            runner=runner,
+            candidate=baseline,
+            cases=milestone_cases,
+            split="milestone",
+            repetitions=repetitions,
+            stage_dir=stage_dir,
+            execution_modes=execution_modes,
+        )
+    )
+    candidates = tuple(
+        QualificationCandidate(
+            candidate_id=structured.candidate.candidate_id,
+            baseline_validation=baseline_validation,
+            candidate_validation=measure_candidate(
+                _run_candidate(
+                    runner=runner,
+                    candidate=structured.candidate,
+                    cases=validation_cases,
+                    split="validation",
+                    repetitions=repetitions,
+                    stage_dir=stage_dir,
+                    execution_modes=execution_modes,
+                )
+            ),
+            baseline_milestone=baseline_milestone,
+            candidate_milestone=measure_candidate(
+                _run_candidate(
+                    runner=runner,
+                    candidate=structured.candidate,
+                    cases=milestone_cases,
+                    split="milestone",
+                    repetitions=repetitions,
+                    stage_dir=stage_dir,
+                    execution_modes=execution_modes,
+                )
+            ),
+        )
+        for structured in finalists
+    )
+    # Ensure the stage payload is written with the exact qualification decision the
+    # caller will return; the temporary call here only validates finalist evidence.
+    qualify_winner(
+        candidates,
+        minimum_mean_delta=minimum_mean_delta,
+        required_repetitions=repetitions,
+    )
+    return _QualificationStageArtifacts(candidates=candidates, summary_path=stage_dir / "qualification-summary.json")
+
+
+
+def _run_candidate(
+    *,
+    runner: KorvidRunner,
+    candidate: Candidate,
+    cases: Sequence[EvalCase],
+    split: str,
+    repetitions: int,
+    stage_dir: Path,
+    execution_modes: _ExecutionModeTracker,
+) -> tuple[NormalizedRunRecord, ...]:
+    records: list[NormalizedRunRecord] = []
+    for case in cases:
+        for repetition in range(1, repetitions + 1):
+            run_dir = stage_dir / "runs" / candidate.candidate_id / split / case.case_id / f"r{repetition:02d}"
+            try:
+                result = runner.run(candidate, case, run_dir, repetition=repetition, seed=repetition - 1)
+            finally:
+                _remove_request_artifact(run_dir)
+            execution_modes.observe(result.execution_mode)
+            record = _normalize_result(candidate, split, case.case_id, repetition, result)
+            records.append(record)
+            if _should_stop_early(record):
+                return tuple(records)
+    return tuple(records)
+
+
+
+def _normalize_result(
+    candidate: Candidate,
+    split: str,
+    case_id: str,
+    repetition: int,
+    result: BridgeResult,
+) -> NormalizedRunRecord:
+    if result.candidate_fingerprint != candidate.fingerprint:
+        raise ValueError("runner result fingerprint does not match the requested candidate")
+    if result.status == "completed":
+        scored = score_result(result)
+        grade = result.grade
+        if grade is None:  # pragma: no cover - score_result rejects this first
+            raise ValueError("completed results must carry a grade")
+        score = scored.score
+        verification = grade.verification
+        passed = result_passed(scored)
+        hard_safety_failures = len(grade.hard_failures)
+    elif result.status == "model_failure":
+        score = 0.0
+        verification = 0.0
+        passed = False
+        hard_safety_failures = 0
+    else:
+        score = 0.0
+        verification = 0.0
+        passed = False
+        hard_safety_failures = 0 if result.grade is None else len(result.grade.hard_failures)
+
+    tool_calls = _journal_count(result.journal, "tool_calls")
+    resolvable_tool_calls = _journal_count(result.journal, "resolvable_tool_calls")
+    malformed_tool_calls = _journal_count(result.journal, "malformed_tool_calls")
+    if resolvable_tool_calls > tool_calls:
+        raise ValueError("journal resolvable_tool_calls must not exceed tool_calls")
+    if malformed_tool_calls > tool_calls:
+        raise ValueError("journal malformed_tool_calls must not exceed tool_calls")
+
+    return NormalizedRunRecord(
+        candidate_id=candidate.candidate_id,
+        split=split,
+        case_id=case_id,
+        repetition=repetition,
+        status=result.status,
+        score=score,
+        verification=verification,
+        passed=passed,
+        hard_safety_failures=hard_safety_failures,
+        malformed_tool_calls=malformed_tool_calls,
+        unresolvable_tool_calls=tool_calls - resolvable_tool_calls,
+    )
+
+
+
+def _should_stop_early(record: NormalizedRunRecord) -> bool:
+    return record.hard_safety_failures > 0 or record.status not in _SCOREABLE_STATUSES
+
+
+
+def _prepare_artifact_root(path: Path) -> None:
+    if path.exists() or path.is_symlink():
+        raise ValueError(f"stable search artifact root already exists: {path}")
+    path.mkdir(parents=True)
+
+
+
+def _require_runner_repetitions(runner: KorvidRunner, repetitions: int) -> None:
+    if runner.campaign.repetitions < repetitions:
+        raise ValueError(
+            "runner campaign repetitions must cover the qualification stage: "
+            f"{runner.campaign.repetitions} < {repetitions}"
+        )
+
+
+
+def _validate_candidates(baseline: Candidate, candidates: Sequence[StructuredCandidate]) -> None:
+    baseline_components = set(baseline.components)
+    if baseline_components != {"system"}:
+        raise ValueError("baseline components must be exactly {'system'}")
+    if not candidates:
+        raise ValueError("candidates must not be empty")
+    candidate_ids: set[str] = set()
+    baseline_system = baseline.components["system"]
+    for structured in candidates:
+        candidate = structured.candidate
+        if candidate.candidate_id == baseline.candidate_id:
+            raise ValueError("candidate_id must differ from the baseline candidate_id")
+        if candidate.candidate_id in candidate_ids:
+            raise ValueError(f"duplicate candidate_id: {candidate.candidate_id}")
+        candidate_ids.add(candidate.candidate_id)
+        components = candidate.components
+        if components.get("system") != baseline_system:
+            raise ValueError("candidate system component must match the exact baseline system prompt")
+
+
+
+def _case_index(cases: Sequence[EvalCase]) -> dict[str, EvalCase]:
+    index: dict[str, EvalCase] = {}
+    for case in cases:
+        if case.case_id in index:
+            raise ValueError(f"runner campaign declares duplicate case_id: {case.case_id}")
+        index[case.case_id] = case
+    return index
+
+
+
+def _validate_manifest_coverage(case_index: Mapping[str, EvalCase], manifest: ScenarioManifest) -> None:
+    requested = (*manifest.train, *manifest.validation, *manifest.milestone)
+    if not requested:
+        raise ValueError("scenario manifest must contain at least one case")
+    missing = sorted(case_id for case_id in requested if case_id not in case_index)
+    if missing:
+        raise ValueError(f"runner campaign is missing manifest case(s): {', '.join(missing)}")
+
+
+
+def _select_cases(case_index: Mapping[str, EvalCase], case_ids: Sequence[str]) -> tuple[EvalCase, ...]:
+    if not case_ids:
+        raise ValueError("stage case set must not be empty")
+    return tuple(case_index[case_id] for case_id in case_ids)
+
+
+
+def _journal_count(journal: Mapping[str, Any], field_name: str) -> int:
+    value = journal.get(field_name, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"journal {field_name} must be a non-negative integer")
+    return value
+
+
+def _remove_request_artifact(run_dir: Path) -> None:
+    request_path = run_dir / "request.json"
+    if request_path.is_symlink():
+        raise ValueError(f"stable search request artifact must not be a symlink: {request_path}")
+    if request_path.exists():
+        request_path.unlink()
+
+
+
+def _require_positive_int(value: int, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field_name} must be a positive integer")
+    return value
+
+
+
+def _require_non_negative_float(value: float, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{field_name} must be a non-negative number")
+    normalized = float(value)
+    if normalized < 0.0:
+        raise ValueError(f"{field_name} must be a non-negative number")
+    return normalized
+
+
+
+def _candidate_payload(candidate: Candidate) -> dict[str, Any]:
+    return {
+        "schema_version": candidate.schema_version,
+        "candidate_id": candidate.candidate_id,
+        "candidate_fingerprint": candidate.fingerprint,
+        "components": candidate.components,
+        "metadata": candidate.metadata,
+    }
+
+
+
+def _structured_candidate_payload(candidate: StructuredCandidate) -> dict[str, Any]:
+    return {
+        "axes": [axis.value for axis in candidate.axes],
+        **_candidate_payload(candidate.candidate),
+    }
+
+
+
+def _winner_append(
+    candidate_index: Mapping[str, StructuredCandidate], decision: QualificationDecision
+) -> str | None:
+    if decision.candidate_id is None:
+        return None
+    return candidate_index[decision.candidate_id].candidate.components.get("append")
