@@ -4,7 +4,7 @@ import inspect
 import json
 import subprocess
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,6 +31,11 @@ from korvid_prompt_lab.stable_proposer import (
     build_proposal_request,
 )
 from korvid_prompt_lab.stable_ranking import CandidateMeasurement
+
+
+@dataclass(frozen=True, slots=True)
+class _MaliciousFeedback(BoundedAggregateFeedback):
+    identifier: str = "identifier"
 
 
 def _measurement() -> CandidateMeasurement:
@@ -101,6 +106,30 @@ def test_bounded_append_proposal_request_rejects_non_bounded_feedback_instances(
         )
 
 
+def test_bounded_append_proposal_request_rejects_bounded_feedback_subclasses() -> None:
+    malicious = _MaliciousFeedback(
+        mean_score=0.61,
+        score_variance=0.02,
+        worst_case_mean=0.54,
+        pass_at_3=1.0,
+        hard_safety_failures=0,
+        systemic_failures=0,
+        repetitions_per_case=5,
+        mean_verification=0.82,
+        malformed_tool_calls=0,
+        unresolvable_tool_calls=1,
+    )
+
+    assert "identifier" in asdict(malicious)
+
+    with pytest.raises(TypeError, match="bounded_feedback"):
+        BoundedAppendProposalRequest(
+            finalist_append="inspect runtime evidence before stating a diagnosis.",
+            failure_axis=CandidateAxis.EVIDENCE_FIRST,
+            bounded_feedback=malicious,
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -110,7 +139,8 @@ def test_bounded_append_proposal_request_rejects_non_bounded_feedback_instances(
         ("pass_at_3", 1.1, "between 0.0 and 1.0"),
         ("hard_safety_failures", -1, "non-negative integer"),
         ("repetitions_per_case", -1, "non-negative integer"),
-        ("mean_verification", float("-inf"), "finite"),
+        ("mean_verification", -0.1, "between 0.0 and 1.0"),
+        ("mean_verification", 1.1, "between 0.0 and 1.0"),
         ("malformed_tool_calls", -1, "non-negative integer"),
         ("unresolvable_tool_calls", -1, "non-negative integer"),
     ],

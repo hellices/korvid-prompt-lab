@@ -77,7 +77,9 @@ class BoundedAggregateFeedback:
         _require_non_negative_int(self.hard_safety_failures, "hard_safety_failures")
         _require_non_negative_int(self.systemic_failures, "systemic_failures")
         _require_non_negative_int(self.repetitions_per_case, "repetitions_per_case")
-        _require_finite_float(self.mean_verification, "mean_verification")
+        mean_verification = _require_probability(self.mean_verification, "mean_verification")
+        if mean_verification is None:
+            raise TypeError("mean_verification must be a probability")
         _require_non_negative_int(self.malformed_tool_calls, "malformed_tool_calls")
         _require_non_negative_int(self.unresolvable_tool_calls, "unresolvable_tool_calls")
 
@@ -92,7 +94,7 @@ class BoundedAppendProposalRequest:
         _require_canonical_text(self.finalist_append, "finalist_append")
         if not isinstance(self.failure_axis, CandidateAxis):
             raise ValueError("failure_axis must be a known failure axis")  # noqa: TRY004 - preserve validation API
-        if not isinstance(self.bounded_feedback, BoundedAggregateFeedback):
+        if type(self.bounded_feedback) is not BoundedAggregateFeedback:
             raise TypeError("bounded_feedback must be a BoundedAggregateFeedback instance")
 
 
