@@ -100,6 +100,32 @@ def _qualification_candidate(
     )
 
 
+def _records_for_counts(
+    *,
+    candidate_id: str,
+    split: str,
+    counts_by_case: dict[str, int],
+    score: float,
+    verification: float = 1.0,
+) -> list[NormalizedRunRecord]:
+    records: list[NormalizedRunRecord] = []
+    for case_id, count in counts_by_case.items():
+        for repetition in range(1, count + 1):
+            records.append(
+                NormalizedRunRecord(
+                    candidate_id=candidate_id,
+                    split=split,
+                    case_id=case_id,
+                    repetition=repetition,
+                    status="completed",
+                    score=score,
+                    verification=verification,
+                    passed=True,
+                )
+            )
+    return records
+
+
 def test_screening_rejects_safety_and_systemic_failures() -> None:
     decision = rank_screening(
         _baseline(split="train"),
@@ -198,6 +224,18 @@ def test_measure_candidate_summarizes_normalized_runs() -> None:
     assert measurement.unresolvable_tool_calls == 2
 
 
+def test_measure_candidate_rejects_uneven_case_repetition_counts() -> None:
+    with pytest.raises(ValueError, match=r"\[5, 6, 6\]"):
+        measure_candidate(
+            _records_for_counts(
+                candidate_id="candidate",
+                split="validation",
+                counts_by_case={"case-a": 5, "case-b": 6, "case-c": 6},
+                score=0.8,
+            )
+        )
+
+
 def test_screening_ranks_by_worst_case_then_verification_then_problem_tool_calls() -> None:
     decision = rank_screening(
         _baseline(split="train"),
@@ -244,6 +282,21 @@ def test_screening_ranks_by_worst_case_then_verification_then_problem_tool_calls
         "fewest-problems",
         "more-problems",
     ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("hard_safety_failures", 1),
+        ("systemic_failures", 1),
+    ],
+)
+def test_screening_rejects_invalid_baseline(field: str, value: int) -> None:
+    with pytest.raises(ValueError, match="baseline must not have hard-safety or systemic failures"):
+        rank_screening(
+            _measurement(candidate_id="baseline", split="train", **{field: value}),
+            [_measurement(candidate_id="safe-gain", split="train", mean=0.55, worst_case=0.48)],
+        )
 
 
 def test_select_finalists_filters_non_positive_mean_regressions_and_failures() -> None:
@@ -303,6 +356,21 @@ def test_select_finalists_breaks_ties_by_lower_variance_then_higher_pass_at_3() 
     ]
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("hard_safety_failures", 1),
+        ("systemic_failures", 1),
+    ],
+)
+def test_select_finalists_rejects_invalid_baseline(field: str, value: int) -> None:
+    with pytest.raises(ValueError, match="baseline must not have hard-safety or systemic failures"):
+        select_finalists(
+            _measurement(candidate_id="baseline", split="validation", **{field: value}),
+            [_measurement(candidate_id="qualified", split="validation", mean=0.55, worst_case=0.55)],
+        )
+
+
 def test_qualification_requires_both_split_deltas() -> None:
     decision = qualify_winner(
         baseline_validation=_measurement(candidate_id="baseline", split="validation", mean=0.40, worst_case=0.40),
@@ -355,6 +423,56 @@ def test_qualification_requires_five_repetitions_per_case_on_all_measurements() 
     assert decision.reasons == (
         "baseline_validation_repetitions_below_5",
         "candidate_milestone_repetitions_below_5",
+    )
+
+
+def test_qualification_rejects_more_than_five_repetitions_per_case() -> None:
+    baseline_validation = measure_candidate(
+        _records_for_counts(
+            candidate_id="baseline",
+            split="validation",
+            counts_by_case={"case-a": 6, "case-b": 6},
+            score=0.40,
+        )
+    )
+    candidate_validation = measure_candidate(
+        _records_for_counts(
+            candidate_id="candidate",
+            split="validation",
+            counts_by_case={"case-a": 6, "case-b": 6},
+            score=0.55,
+        )
+    )
+    baseline_milestone = measure_candidate(
+        _records_for_counts(
+            candidate_id="baseline",
+            split="milestone",
+            counts_by_case={"case-a": 6, "case-b": 6},
+            score=0.50,
+        )
+    )
+    candidate_milestone = measure_candidate(
+        _records_for_counts(
+            candidate_id="candidate",
+            split="milestone",
+            counts_by_case={"case-a": 6, "case-b": 6},
+            score=0.65,
+        )
+    )
+
+    decision = qualify_winner(
+        baseline_validation=baseline_validation,
+        candidate_validation=candidate_validation,
+        baseline_milestone=baseline_milestone,
+        candidate_milestone=candidate_milestone,
+    )
+
+    assert decision.status == "no_stable_winner"
+    assert decision.reasons == (
+        "baseline_validation_repetitions_not_exactly_5",
+        "candidate_validation_repetitions_not_exactly_5",
+        "baseline_milestone_repetitions_not_exactly_5",
+        "candidate_milestone_repetitions_not_exactly_5",
     )
 
 

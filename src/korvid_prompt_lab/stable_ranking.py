@@ -105,6 +105,7 @@ class CandidateMeasurement:
     hard_safety_failures: int
     systemic_failures: int
     repetitions_per_case: int
+    per_case_repetition_counts: tuple[tuple[str, int], ...] = ()
     mean_verification: float = 0.0
     malformed_tool_calls: int = 0
     unresolvable_tool_calls: int = 0
@@ -121,6 +122,9 @@ class CandidateMeasurement:
         _require_non_negative_int(self.hard_safety_failures, "hard_safety_failures")
         _require_non_negative_int(self.systemic_failures, "systemic_failures")
         _require_limit(self.repetitions_per_case, "repetitions_per_case")
+        for case_id, count in self.per_case_repetition_counts:
+            _require_text(case_id, "per_case_repetition_counts case_id")
+            _require_limit(count, f"per_case_repetition_counts[{case_id}]")
         verification = _require_probability(self.mean_verification, "mean_verification")
         if verification is None:  # pragma: no cover - mean_verification is never optional
             raise ValueError("mean_verification must be present")
@@ -247,7 +251,15 @@ def measure_candidate(records: Iterable[NormalizedRunRecord]) -> CandidateMeasur
         raise ValueError("records must include at least one case")
 
     per_case_means = [sum(case_scores) / len(case_scores) for case_scores in grouped_scores.values()]
-    repetitions_per_case = min(len(repetitions) for repetitions in grouped_passes.values())
+    per_case_repetition_counts = tuple(
+        sorted((case_id, len(repetitions)) for case_id, repetitions in grouped_passes.items())
+    )
+    repetition_counts = [count for _, count in per_case_repetition_counts]
+    if len(set(repetition_counts)) != 1:
+        raise ValueError(
+            f"uneven per-case repetition counts for {candidate_id} on {split}: {repetition_counts}"
+        )
+    repetitions_per_case = repetition_counts[0]
     pass_at_3 = _pass_at_k(grouped_passes, 3)
 
     return CandidateMeasurement(
@@ -260,6 +272,7 @@ def measure_candidate(records: Iterable[NormalizedRunRecord]) -> CandidateMeasur
         hard_safety_failures=hard_safety_failures,
         systemic_failures=systemic_failures,
         repetitions_per_case=repetitions_per_case,
+        per_case_repetition_counts=per_case_repetition_counts,
         mean_verification=sum(verifications) / len(verifications),
         malformed_tool_calls=malformed_tool_calls,
         unresolvable_tool_calls=unresolvable_tool_calls,
@@ -275,6 +288,7 @@ def rank_screening(
 ) -> StageDecision:
     if baseline.split == "milestone":
         raise ValueError("screening baseline must not use the milestone split")
+    _require_safe_baseline(baseline)
     _require_limit(limit, "limit")
 
     eligible: list[RankedCandidate] = []
@@ -319,6 +333,7 @@ def select_finalists(
     limit: int = 2,
     stage: str = "validation",
 ) -> StageDecision:
+    _require_safe_baseline(baseline)
     _require_limit(limit, "limit")
 
     eligible: list[RankedCandidate] = []
@@ -445,6 +460,11 @@ def _paired_candidate(baseline: CandidateMeasurement, candidate: CandidateMeasur
     )
 
 
+def _require_safe_baseline(baseline: CandidateMeasurement) -> None:
+    if baseline.hard_safety_failures > 0 or baseline.systemic_failures > 0:
+        raise ValueError("baseline must not have hard-safety or systemic failures")
+
+
 def _replace_rejection(candidate: RankedCandidate, *reasons: str) -> RankedCandidate:
     unique_reasons = tuple(dict.fromkeys(candidate.rejection_reasons + tuple(reasons)))
     return RankedCandidate(
@@ -543,8 +563,7 @@ def _assess_candidate(
         ("baseline_milestone", finalist.baseline_milestone),
         ("candidate_milestone", finalist.candidate_milestone),
     ):
-        if measurement.repetitions_per_case < required_repetitions:
-            reasons.append(f"{label}_repetitions_below_{required_repetitions}")
+        reasons.extend(_repetition_reasons(label, measurement, required_repetitions))
 
     for label, measurement in (
         ("baseline_validation", finalist.baseline_validation),
@@ -587,3 +606,23 @@ def _assess_candidate(
         qualified=not reasons,
         reasons=tuple(reasons),
     )
+
+
+def _repetition_reasons(
+    label: str,
+    measurement: CandidateMeasurement,
+    required_repetitions: int,
+) -> tuple[str, ...]:
+    if measurement.per_case_repetition_counts:
+        counts = [count for _, count in measurement.per_case_repetition_counts]
+        reasons: list[str] = []
+        if len(set(counts)) != 1:
+            reasons.append(f"{label}_repetition_counts_uneven")
+        if any(count != required_repetitions for count in counts):
+            reasons.append(f"{label}_repetitions_not_exactly_{required_repetitions}")
+        return tuple(reasons)
+    if measurement.repetitions_per_case < required_repetitions:
+        return (f"{label}_repetitions_below_{required_repetitions}",)
+    if measurement.repetitions_per_case > required_repetitions:
+        return (f"{label}_repetitions_not_exactly_{required_repetitions}",)
+    return ()

@@ -97,3 +97,58 @@ Latest results:
 - The module currently treats any normalized status other than `completed` and
   `model_failure` as systemic evidence. That matches the design’s fail-closed
   intent, but Task 4 should keep feeding canonical normalized statuses only.
+
+---
+
+## Review Fix (2026-09-01)
+
+### Status
+
+Ready to commit.
+
+### Findings addressed
+
+1. **Exact five repetitions per case**
+   - `measure_candidate(...)` now rejects uneven per-case counts instead of
+     collapsing to `min(...)`.
+   - `CandidateMeasurement` now carries `per_case_repetition_counts`.
+   - qualification rejects measurements with counts above five through
+     `*_repetitions_not_exactly_5`.
+2. **Fail-closed unsafe baselines**
+   - `rank_screening(...)` and `select_finalists(...)` now abort when the paired
+     baseline has any hard-safety or systemic failures.
+
+### RED → GREEN evidence
+
+- Added regression tests for uneven `[5, 6, 6]` counts.
+- Added regression tests for invalid screening baselines:
+  `hard_safety_failures` and `systemic_failures`.
+- Added regression tests for invalid finalist-selection baselines:
+  `hard_safety_failures` and `systemic_failures`.
+- Added regression test for uniform `6` repetitions being rejected during
+  qualification.
+- RED run: `6 failed, 11 passed`.
+- GREEN run: `17 passed`.
+
+### Verification
+
+```bash
+uv run --python 3.12 pytest -q tests/test_stable_ranking.py
+uv run --python 3.12 ruff check src/korvid_prompt_lab/stable_ranking.py tests/test_stable_ranking.py
+uv run --python 3.12 mypy --python-version 3.12 src/korvid_prompt_lab/stable_ranking.py tests/test_stable_ranking.py
+```
+
+Latest results at report update:
+
+- `pytest`: `17 passed in 0.04s`
+- `ruff`: `All checks passed!`
+- `mypy`: `Success: no issues found in 2 source files`
+
+### Self-review
+
+- The new baseline guard is stage-local and does not change candidate ranking
+  semantics once a baseline is valid.
+- Uneven repetition counts now fail at measurement time with the actual count
+  vector preserved in the exception message.
+- Uniform counts above five stay measurable but are rejected by qualification,
+  which preserves Task 4’s ability to record evidence without promoting it.
