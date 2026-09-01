@@ -7,6 +7,18 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 import dspy  # type: ignore[import-untyped]
+from litellm.exceptions import (
+    APIConnectionError,
+    APIError,
+    AuthenticationError,
+    BadRequestError,
+    InternalServerError,
+    RateLimitError,
+    ServiceUnavailableError,
+)
+from litellm.exceptions import (
+    Timeout as LiteLLMTimeout,
+)
 
 from .reflection import canonicalize_proposal_text
 from .stable_candidates import CandidateAxis
@@ -21,7 +33,20 @@ __all__ = [
 ]
 
 _MAX_BOUNDED_APPEND_LENGTH = 480
-_SAFE_PROPOSE_FAILURES = (ValueError, TimeoutError, subprocess.TimeoutExpired, RuntimeError, OSError)
+_SAFE_PROPOSE_FAILURES = (
+    ValueError,
+    TimeoutError,
+    ConnectionError,
+    subprocess.TimeoutExpired,
+    APIConnectionError,
+    APIError,
+    AuthenticationError,
+    BadRequestError,
+    InternalServerError,
+    RateLimitError,
+    ServiceUnavailableError,
+    LiteLLMTimeout,
+)
 _AGGREGATE_FIELD_NAMES = (
     "mean_score",
     "score_variance",

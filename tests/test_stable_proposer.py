@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import subprocess
 import sys
@@ -8,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from litellm.exceptions import APIConnectionError, RateLimitError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -168,7 +170,6 @@ def test_bounded_append_proposer_rejects_blank_or_overlong_output(
     [
         TimeoutError("slow"),
         subprocess.TimeoutExpired("dspy", 1.0),
-        RuntimeError("lm runtime exploded"),
         ConnectionError("transport broke"),
     ],
 )
@@ -196,21 +197,60 @@ def test_bounded_append_proposer_safe_propose_returns_none_on_expected_failures(
     )
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        APIConnectionError("api connection failed", "openai", "model"),
+        RateLimitError("rate limited", "openai", "model"),
+    ],
+)
+def test_bounded_append_proposer_safe_propose_returns_none_on_litellm_errors(
+    monkeypatch: pytest.MonkeyPatch, error: BaseException
+) -> None:
+    assert inspect.signature(APIConnectionError).parameters["llm_provider"].name == "llm_provider"
+    assert inspect.signature(RateLimitError).parameters["llm_provider"].name == "llm_provider"
+
+    class FakePredict:
+        def __init__(self, signature: object) -> None:
+            self.signature = signature
+
+        def __call__(self, **kwargs: object) -> SimpleNamespace:
+            raise error
+
+    monkeypatch.setattr("korvid_prompt_lab.stable_proposer.dspy.Predict", FakePredict)
+
+    proposer = BoundedAppendProposer(reflection_lm=object())
+
+    assert (
+        proposer.safe_propose(
+            object(),
+            finalist_append="inspect runtime evidence before stating a diagnosis.",
+            failure_axis=CandidateAxis.EVIDENCE_FIRST.value,
+            bounded_feedback=_measurement(),
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("boom"), PermissionError("denied"), TypeError("bug")],
+)
 def test_bounded_append_proposer_safe_propose_does_not_swallow_programming_errors(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, error: BaseException
 ) -> None:
     class FakePredict:
         def __init__(self, signature: object) -> None:
             self.signature = signature
 
         def __call__(self, **kwargs: object) -> SimpleNamespace:
-            raise TypeError("bug")
+            raise error
 
     monkeypatch.setattr("korvid_prompt_lab.stable_proposer.dspy.Predict", FakePredict)
 
     proposer = BoundedAppendProposer(reflection_lm=object())
 
-    with pytest.raises(TypeError, match="bug"):
+    with pytest.raises(type(error), match=str(error)):
         proposer.safe_propose(
             object(),
             finalist_append="inspect runtime evidence before stating a diagnosis.",
