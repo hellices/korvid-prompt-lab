@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import StrEnum
 from functools import lru_cache
-from pathlib import Path
 from typing import Literal
 
+import yaml  # type: ignore[import-untyped]
 from korvid.evals.scenario import Scenario, bundled_scenarios_dir, load_scenario
 
 from .baseline import korvid_distribution_version
@@ -62,8 +62,7 @@ class ScenarioManifest:
 
 @dataclass(frozen=True, slots=True)
 class _ScenarioRecord:
-    scenario: Scenario
-    path: Path
+    scenario_id: str
     scenario_class: ScenarioClass
     sort_key: str
     question_sha256: str
@@ -145,8 +144,11 @@ def build_scenario_manifest(target_per_split: int = 6) -> ScenarioManifest:
     split_buckets: dict[ScenarioSplit, list[_ScenarioRecord]] = {split: [] for split in _SPLITS}
     for scenario_class in _CLASS_ORDER:
         items = grouped[scenario_class]
+        split_order: tuple[ScenarioSplit, ...] = _SPLITS
+        if scenario_class is ScenarioClass.HEALTHY_CONTROL and items:
+            split_order = ("validation", "milestone", "train")
         for index, record in enumerate(items):
-            split_buckets[_SPLITS[index % len(_SPLITS)]].append(record)
+            split_buckets[split_order[index % len(split_order)]].append(record)
 
     split_size = min(target_per_split, *(len(split_buckets[split]) for split in _SPLITS))
     if split_size < 4:
@@ -159,10 +161,10 @@ def build_scenario_manifest(target_per_split: int = 6) -> ScenarioManifest:
 
     for split in _SPLITS:
         selected = split_buckets[split][:split_size]
-        split_ids[split] = tuple(record.scenario.id for record in selected)
+        split_ids[split] = tuple(record.scenario_id for record in selected)
         split_assignments[split] = tuple(
             ScenarioAssignment(
-                scenario_id=record.scenario.id,
+                scenario_id=record.scenario_id,
                 scenario_class=record.scenario_class,
                 split=split,
                 question_sha256=record.question_sha256,
@@ -202,13 +204,11 @@ def _load_catalog(korvid_version: str) -> tuple[_ScenarioRecord, ...]:
         scenario_class = _scenario_class(scenario)
         if scenario_class is None:
             continue
-        question_sha256 = hashlib.sha256(scenario.question.encode("utf-8")).hexdigest()
-        fixture_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+        question_sha256, fixture_sha256 = _scenario_hashes(scenario)
         sort_key = hashlib.sha256(f"{korvid_version}:{scenario.id}".encode()).hexdigest()
         records.append(
             _ScenarioRecord(
-                scenario=scenario,
-                path=path,
+                scenario_id=scenario.id,
                 scenario_class=scenario_class,
                 sort_key=sort_key,
                 question_sha256=question_sha256,
@@ -216,6 +216,15 @@ def _load_catalog(korvid_version: str) -> tuple[_ScenarioRecord, ...]:
             )
         )
     return tuple(records)
+
+
+def _scenario_hashes(scenario: Scenario) -> tuple[str, str]:
+    question_sha256 = hashlib.sha256(scenario.question.encode("utf-8")).hexdigest()
+    canonical_fixture = asdict(scenario)
+    canonical_fixture.pop("question", None)
+    fixture_payload = yaml.safe_dump(canonical_fixture, sort_keys=True, allow_unicode=True)
+    fixture_sha256 = hashlib.sha256(fixture_payload.encode("utf-8")).hexdigest()
+    return question_sha256, fixture_sha256
 
 
 def _scenario_class(scenario: Scenario) -> ScenarioClass | None:
@@ -232,13 +241,6 @@ def _scenario_class(scenario: Scenario) -> ScenarioClass | None:
     for prefix, scenario_class in _ID_PREFIX_TO_CLASS:
         if scenario_id.startswith(prefix):
             return scenario_class
-
-    if scenario_id.startswith("missing-configmap-") or scenario_id == "missing-configmap-mount":
-        return ScenarioClass.STORAGE
-    if scenario_id == "crashloop-dependency-unreachable":
-        return ScenarioClass.WORKLOAD_HEALTH
-    if scenario_id == "healthy-service-endpoints":
-        return ScenarioClass.HEALTHY_CONTROL
     return None
 
 
