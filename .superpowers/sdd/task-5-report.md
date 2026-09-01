@@ -33,6 +33,24 @@ PASS — restored generic reflection rewrites above 480 chars, made bounded prop
 - `uv run --python 3.12 ruff check src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py tests/test_reflection.py tests/test_stable_proposer.py`
 - `uv run --python 3.12 mypy src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py`
 
+## Review Fix 8
+
+PASS — entrypoint revalidation now rejects forged exact-type requests before serialization, and malformed bounded_feedback inputs surface as ValueError so safe_propose returns None.
+
+## Commit
+
+- `55877a5` — `fix(search): tighten bounded entry validation`
+
+## Tests
+
+- `uv run pytest tests/test_reflection.py tests/test_optimize.py tests/test_stable_proposer.py`
+- `uv run ruff check src tests`
+- `uv run mypy src`
+
+## Concerns
+
+- None.
+
 ## Review Fix 4
 
 PASS — narrowed safe_propose to concrete LiteLLM transient failures only; AuthenticationError and BadRequestError now propagate.
