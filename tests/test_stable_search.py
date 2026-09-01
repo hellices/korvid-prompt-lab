@@ -29,6 +29,7 @@ from korvid_prompt_lab.stable_scenarios import (
 from korvid_prompt_lab.stable_search import (
     StableSearchConfig,
     StableSearchExtension,
+    StableSearchSystemError,
     run_stable_search,
 )
 
@@ -403,6 +404,119 @@ def test_stable_search_aborts_on_bridge_system_error_without_writing_a_success_d
     assert not (artifact_root / "stage-a" / "screening-summary.json").exists()
     assert not (artifact_root / "stable-search-summary.json").exists()
 
+
+def test_stable_search_raises_system_error_when_stage_b_collapses_to_all_model_failures(
+    tmp_path: Path,
+) -> None:
+    candidates = (
+        _structured_candidate("evidence-first"),
+        _structured_candidate("one-tool-at-a-time"),
+    )
+    scripts = {
+        ("baseline", "train"): (_ScriptedRun(score=0.40, verification=0.50),),
+        ("baseline", "validation"): tuple(
+            _ScriptedRun(
+                status="model_failure",
+                error="PORT_FORWARD_TIMEOUT_WITH_SECRET",
+                answer="LEAKED_STAGE_B_BASELINE",
+            )
+            for _ in range(3)
+        ),
+        ("baseline", "milestone"): tuple(_ScriptedRun(score=0.50, verification=0.50) for _ in range(5)),
+        ("evidence-first", "train"): (_ScriptedRun(score=0.72, verification=0.80),),
+        ("evidence-first", "validation"): tuple(
+            _ScriptedRun(
+                status="model_failure",
+                error="PORT_FORWARD_TIMEOUT_WITH_SECRET",
+                answer="LEAKED_STAGE_B_CANDIDATE",
+            )
+            for _ in range(3)
+        ),
+        ("evidence-first", "milestone"): tuple(_ScriptedRun(score=0.74, verification=0.80) for _ in range(5)),
+        ("one-tool-at-a-time", "train"): (_ScriptedRun(score=0.70, verification=0.78),),
+        ("one-tool-at-a-time", "validation"): tuple(
+            _ScriptedRun(
+                status="model_failure",
+                error="PORT_FORWARD_TIMEOUT_WITH_SECRET",
+                answer="LEAKED_STAGE_B_CANDIDATE",
+            )
+            for _ in range(3)
+        ),
+        ("one-tool-at-a-time", "milestone"): tuple(_ScriptedRun(score=0.73, verification=0.79) for _ in range(5)),
+    }
+    artifact_root = tmp_path / "campaign"
+
+    with pytest.raises(StableSearchSystemError, match="serving_collapse_all_model_failure") as exc_info:
+        run_stable_search(
+            runner=_runner_for_scripts(case_splits=_SPLITS_BY_CASE, scripts=scripts),
+            baseline=_baseline(),
+            candidates=candidates,
+            manifest=_manifest(),
+            artifact_root=artifact_root,
+            config=StableSearchConfig(screening_survivors=2, finalists=2),
+        )
+
+    assert exc_info.value.stage == "validation"
+    assert exc_info.value.split == "validation"
+
+    screening_summary = json.loads((artifact_root / "stage-a" / "screening-summary.json").read_text(encoding="utf-8"))
+    assert screening_summary["decision"]["stage"] == "screening"
+
+    validation_summary_path = artifact_root / "stage-b" / "validation-summary.json"
+    validation_summary = json.loads(validation_summary_path.read_text(encoding="utf-8"))
+    assert validation_summary["status"] == "system_error"
+    assert validation_summary["error_label"] == "serving_collapse_all_model_failure"
+    assert "decision" not in validation_summary
+
+    root_summary = json.loads((artifact_root / "stable-search-summary.json").read_text(encoding="utf-8"))
+    assert root_summary["status"] == "system_error"
+    assert root_summary["error_label"] == "serving_collapse_all_model_failure"
+    assert root_summary["stage"] == "validation"
+    assert root_summary["split"] == "validation"
+    assert "decision" not in root_summary
+
+    written = "\n".join(path.read_text(encoding="utf-8") for path in artifact_root.rglob("*") if path.is_file())
+    assert "PORT_FORWARD_TIMEOUT_WITH_SECRET" not in written
+    assert "LEAKED_STAGE_B_BASELINE" not in written
+    assert "LEAKED_STAGE_B_CANDIDATE" not in written
+
+
+def test_stable_search_continues_ranking_when_stage_b_has_mixed_completed_and_model_failure_runs(
+    tmp_path: Path,
+) -> None:
+    candidates = (
+        _structured_candidate("evidence-first"),
+        _structured_candidate("one-tool-at-a-time"),
+    )
+    scripts = {
+        ("baseline", "train"): (_ScriptedRun(score=0.40, verification=0.50),),
+        ("baseline", "validation"): tuple(_ScriptedRun(score=0.40, verification=0.50) for _ in range(5)),
+        ("baseline", "milestone"): tuple(_ScriptedRun(score=0.50, verification=0.50) for _ in range(5)),
+        ("evidence-first", "train"): (_ScriptedRun(score=0.72, verification=0.80),),
+        ("evidence-first", "validation"): tuple(_ScriptedRun(score=0.78, verification=0.82) for _ in range(5)),
+        ("evidence-first", "milestone"): tuple(_ScriptedRun(score=0.80, verification=0.84) for _ in range(5)),
+        ("one-tool-at-a-time", "train"): (_ScriptedRun(score=0.70, verification=0.78),),
+        ("one-tool-at-a-time", "validation"): tuple(
+            _ScriptedRun(status="model_failure", error="TRANSIENT_FAILURE", answer="LEAKED_RAW_ANSWER")
+            for _ in range(5)
+        ),
+        ("one-tool-at-a-time", "milestone"): tuple(
+            _ScriptedRun(status="model_failure", error="TRANSIENT_FAILURE", answer="LEAKED_RAW_ANSWER")
+            for _ in range(5)
+        ),
+    }
+
+    artifacts = run_stable_search(
+        runner=_runner_for_scripts(case_splits=_SPLITS_BY_CASE, scripts=scripts),
+        baseline=_baseline(),
+        candidates=candidates,
+        manifest=_manifest(),
+        artifact_root=tmp_path / "campaign",
+        config=StableSearchConfig(screening_survivors=2, finalists=2),
+    )
+
+    assert artifacts.decision.status == "promote"
+    assert artifacts.decision.candidate_id == "evidence-first"
 
 
 def test_stable_search_persists_only_normalized_run_artifacts_and_sanitizes_paths(tmp_path: Path) -> None:

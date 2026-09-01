@@ -12,7 +12,7 @@ from litellm.exceptions import APIError, AuthenticationError, BadRequestError
 
 from .artifacts import write_json_artifact
 from .contracts import Candidate, EvalCase
-from .runner import BridgeStatusError, KorvidRunner
+from .runner import BridgeStatusError, BridgeSystemError, KorvidRunner
 from .scoring import BridgeResult, result_passed, score_result
 from .stable_candidates import CandidateAxis, StructuredCandidate
 from .stable_proposer import build_proposal_request
@@ -36,6 +36,7 @@ __all__ = [
     "StableSearchConfig",
     "StableSearchExtension",
     "StableSearchExtensionArtifacts",
+    "StableSearchSystemError",
     "run_stable_search",
 ]
 
@@ -83,6 +84,22 @@ class SupportsBoundedAppendProposer(Protocol):
     reflection_lm: Any
 
     def safe_propose(self, request_or_context: Any, **kwargs: Any) -> str | None: ...
+
+
+class StableSearchSystemError(BridgeSystemError):
+    def __init__(
+        self,
+        *,
+        stage: str,
+        split: str,
+        error_label: str,
+        summary_path: Path,
+    ) -> None:
+        self.stage = stage
+        self.split = split
+        self.error_label = error_label
+        self.summary_path = summary_path
+        super().__init__(f"stable search {stage} stage failed on {split}: {error_label}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,121 +264,134 @@ def run_stable_search(
     scenario_manifest_path = write_json_artifact(
         artifact_root_path / "scenario-manifest.json", asdict(manifest)
     )
-
-    screening = _run_paired_stage(
-        runner=runner,
-        baseline=baseline,
-        candidates=candidates,
-        cases=_select_cases(case_index, manifest.train),
-        split="train",
-        repetitions=config.screening_repetitions,
-        stage_dir=artifact_root_path / "stage-a",
-        stage_name="stage-a",
-        summary_name="screening-summary.json",
-        ranker=rank_screening,
-        limit=config.screening_survivors,
-        execution_modes=execution_modes,
-    )
-    stage_b_candidates = tuple(
-        candidate_index[item.candidate_id]
-        for item in screening.decision.survivors[: _structured_stage_b_candidate_limit(extension, config)]
-    )
-    structured_validation = _run_paired_stage(
-        runner=runner,
-        baseline=baseline,
-        candidates=stage_b_candidates,
-        cases=_select_cases(case_index, manifest.validation),
-        split="validation",
-        repetitions=config.validation_repetitions,
-        stage_dir=artifact_root_path / "stage-b",
-        stage_name="stage-b",
-        summary_name="validation-summary.json",
-        ranker=select_finalists,
-        limit=config.finalists,
-        execution_modes=execution_modes,
-    )
-    extension_result = _run_extension(
-        extension=extension,
-        runner=runner,
-        baseline=baseline,
-        validation=structured_validation.decision,
-        candidate_index=candidate_index,
-        validation_cases=_select_cases(case_index, manifest.validation),
-        validation_repetitions=config.validation_repetitions,
-        stage_dir=artifact_root_path / "stage-b",
-        execution_modes=execution_modes,
-    )
-    validation_decision = extension_result.validation or structured_validation.decision
-    final_candidate_index = dict(candidate_index)
-    if extension_result.proposed_candidate is not None:
-        final_candidate_index[extension_result.proposed_candidate.candidate.candidate_id] = (
-            extension_result.proposed_candidate
+    try:
+        screening = _run_paired_stage(
+            runner=runner,
+            baseline=baseline,
+            candidates=candidates,
+            cases=_select_cases(case_index, manifest.train),
+            split="train",
+            repetitions=config.screening_repetitions,
+            stage_dir=artifact_root_path / "stage-a",
+            stage_name="stage-a",
+            summary_name="screening-summary.json",
+            ranker=rank_screening,
+            limit=config.screening_survivors,
+            execution_modes=execution_modes,
         )
-    finalists = tuple(final_candidate_index[item.candidate_id] for item in validation_decision.survivors)
-    qualification = _run_qualification_stage(
-        runner=runner,
-        baseline=baseline,
-        finalists=finalists,
-        validation_cases=_select_cases(case_index, manifest.validation),
-        milestone_cases=_select_cases(case_index, manifest.milestone),
-        repetitions=config.qualification_repetitions,
-        stage_dir=artifact_root_path / "stage-c",
-        execution_modes=execution_modes,
-        minimum_mean_delta=config.minimum_mean_delta,
-    )
-    decision = qualify_winner(
-        qualification.candidates,
-        minimum_mean_delta=config.minimum_mean_delta,
-        required_repetitions=config.qualification_repetitions,
-    )
-    extension_artifacts = _finalize_extension_artifacts(
-        result=extension_result,
-        qualification=qualification.candidates,
-        decision=decision,
-        minimum_mean_delta=config.minimum_mean_delta,
-        qualification_repetitions=config.qualification_repetitions,
-    )
-    validation_summary_path = _write_paired_stage_summary(
-        structured_validation.summary_path,
-        decision=validation_decision,
-        split="validation",
-        repetitions=config.validation_repetitions,
-        execution_modes=execution_modes,
-        extension=extension_artifacts,
-    )
-    qualification_summary_path = write_json_artifact(
-        qualification.summary_path,
-        {
-            "schema_version": _SEARCH_SCHEMA_VERSION,
-            "stage": "qualification",
-            "repetitions": config.qualification_repetitions,
-            "candidates": [asdict(candidate) for candidate in qualification.candidates],
-            "decision": asdict(decision),
-            "extension": asdict(extension_artifacts) if extension_artifacts is not None else None,
-            "execution_modes": list(execution_modes.modes),
-        },
-    )
-
-    summary_path = write_json_artifact(
-        artifact_root_path / "stable-search-summary.json",
-        {
-            "schema_version": _SEARCH_SCHEMA_VERSION,
-            "campaign_id": runner.campaign.campaign_id,
-            "config": asdict(config),
-            "decision": asdict(decision),
-            "winner_append": _winner_append(candidate_index, extension_artifacts, decision),
-            "extension": asdict(extension_artifacts) if extension_artifacts is not None else None,
-            "execution_modes": list(execution_modes.modes),
-            "artifacts": {
-                "baseline_candidate": str(baseline_manifest_path.relative_to(artifact_root_path)),
-                "candidate_manifest": str(candidate_manifest_path.relative_to(artifact_root_path)),
-                "scenario_manifest": str(scenario_manifest_path.relative_to(artifact_root_path)),
-                "screening_summary": str(screening.summary_path.relative_to(artifact_root_path)),
-                "validation_summary": str(validation_summary_path.relative_to(artifact_root_path)),
-                "qualification_summary": str(qualification_summary_path.relative_to(artifact_root_path)),
+        stage_b_candidates = tuple(
+            candidate_index[item.candidate_id]
+            for item in screening.decision.survivors[: _structured_stage_b_candidate_limit(extension, config)]
+        )
+        structured_validation = _run_paired_stage(
+            runner=runner,
+            baseline=baseline,
+            candidates=stage_b_candidates,
+            cases=_select_cases(case_index, manifest.validation),
+            split="validation",
+            repetitions=config.validation_repetitions,
+            stage_dir=artifact_root_path / "stage-b",
+            stage_name="stage-b",
+            summary_name="validation-summary.json",
+            ranker=select_finalists,
+            limit=config.finalists,
+            execution_modes=execution_modes,
+        )
+        extension_result = _run_extension(
+            extension=extension,
+            runner=runner,
+            baseline=baseline,
+            validation=structured_validation.decision,
+            candidate_index=candidate_index,
+            validation_cases=_select_cases(case_index, manifest.validation),
+            validation_repetitions=config.validation_repetitions,
+            stage_dir=artifact_root_path / "stage-b",
+            execution_modes=execution_modes,
+        )
+        validation_decision = extension_result.validation or structured_validation.decision
+        final_candidate_index = dict(candidate_index)
+        if extension_result.proposed_candidate is not None:
+            final_candidate_index[extension_result.proposed_candidate.candidate.candidate_id] = (
+                extension_result.proposed_candidate
+            )
+        finalists = tuple(final_candidate_index[item.candidate_id] for item in validation_decision.survivors)
+        qualification = _run_qualification_stage(
+            runner=runner,
+            baseline=baseline,
+            finalists=finalists,
+            validation_cases=_select_cases(case_index, manifest.validation),
+            milestone_cases=_select_cases(case_index, manifest.milestone),
+            repetitions=config.qualification_repetitions,
+            stage_dir=artifact_root_path / "stage-c",
+            execution_modes=execution_modes,
+            minimum_mean_delta=config.minimum_mean_delta,
+        )
+        decision = qualify_winner(
+            qualification.candidates,
+            minimum_mean_delta=config.minimum_mean_delta,
+            required_repetitions=config.qualification_repetitions,
+        )
+        extension_artifacts = _finalize_extension_artifacts(
+            result=extension_result,
+            qualification=qualification.candidates,
+            decision=decision,
+            minimum_mean_delta=config.minimum_mean_delta,
+            qualification_repetitions=config.qualification_repetitions,
+        )
+        validation_summary_path = _write_paired_stage_summary(
+            structured_validation.summary_path,
+            decision=validation_decision,
+            split="validation",
+            repetitions=config.validation_repetitions,
+            execution_modes=execution_modes,
+            extension=extension_artifacts,
+        )
+        qualification_summary_path = write_json_artifact(
+            qualification.summary_path,
+            {
+                "schema_version": _SEARCH_SCHEMA_VERSION,
+                "stage": "qualification",
+                "repetitions": config.qualification_repetitions,
+                "candidates": [asdict(candidate) for candidate in qualification.candidates],
+                "decision": asdict(decision),
+                "extension": asdict(extension_artifacts) if extension_artifacts is not None else None,
+                "execution_modes": list(execution_modes.modes),
             },
-        },
-    )
+        )
+        summary_path = _write_success_summary(
+            artifact_root=artifact_root_path,
+            campaign_id=runner.campaign.campaign_id,
+            config=config,
+            decision=decision,
+            extension=extension_artifacts,
+            execution_modes=execution_modes,
+            artifact_refs={
+                "baseline_candidate": baseline_manifest_path,
+                "candidate_manifest": candidate_manifest_path,
+                "scenario_manifest": scenario_manifest_path,
+                "screening_summary": screening.summary_path,
+                "validation_summary": validation_summary_path,
+                "qualification_summary": qualification_summary_path,
+            },
+            winner_append=_winner_append(candidate_index, extension_artifacts, decision),
+        )
+    except StableSearchSystemError as exc:
+        _write_failure_summary(
+            artifact_root=artifact_root_path,
+            campaign_id=runner.campaign.campaign_id,
+            config=config,
+            execution_modes=execution_modes,
+            artifact_refs={
+                "baseline_candidate": baseline_manifest_path,
+                "candidate_manifest": candidate_manifest_path,
+                "scenario_manifest": scenario_manifest_path,
+                "stage_summary": exc.summary_path,
+            },
+            stage=exc.stage,
+            split=exc.split,
+            error_label=exc.error_label,
+        )
+        raise
     return StableSearchArtifacts(
         artifact_root=artifact_root_path,
         config=config,
@@ -395,19 +425,19 @@ def _run_paired_stage(
     execution_modes: _ExecutionModeTracker,
 ) -> _PairedStageArtifacts:
     stage_dir.mkdir(parents=True, exist_ok=False)
-    baseline_measurement = measure_candidate(
-        _run_candidate(
-            runner=runner,
-            candidate=baseline,
-            cases=cases,
-            split=split,
-            repetitions=repetitions,
-            stage_dir=stage_dir,
-            execution_modes=execution_modes,
-        )
+    baseline_records = _run_candidate(
+        runner=runner,
+        candidate=baseline,
+        cases=cases,
+        split=split,
+        repetitions=repetitions,
+        stage_dir=stage_dir,
+        execution_modes=execution_modes,
     )
-    measurements = tuple(
-        measure_candidate(
+    baseline_measurement = measure_candidate(baseline_records)
+    candidate_runs = tuple(
+        (
+            structured,
             _run_candidate(
                 runner=runner,
                 candidate=structured.candidate,
@@ -416,9 +446,20 @@ def _run_paired_stage(
                 repetitions=repetitions,
                 stage_dir=stage_dir,
                 execution_modes=execution_modes,
-            )
+            ),
         )
         for structured in candidates
+    )
+    measurements = tuple(measure_candidate(records) for _, records in candidate_runs)
+    _raise_if_stage_model_failures(
+        stage="screening" if stage_name == "stage-a" else "validation",
+        split=split,
+        repetitions=repetitions,
+        baseline_records=baseline_records,
+        baseline_measurement=baseline_measurement,
+        candidate_runs=candidate_runs,
+        summary_path=stage_dir / summary_name,
+        execution_modes=execution_modes,
     )
     decision = ranker(
         baseline_measurement,
@@ -469,6 +510,112 @@ def _write_paired_stage_summary(
     )
 
 
+def _raise_if_stage_model_failures(
+    *,
+    stage: str,
+    split: str,
+    repetitions: int,
+    baseline_records: Sequence[NormalizedRunRecord],
+    baseline_measurement: CandidateMeasurement,
+    candidate_runs: Sequence[tuple[StructuredCandidate, Sequence[NormalizedRunRecord]]],
+    summary_path: Path,
+    execution_modes: _ExecutionModeTracker,
+) -> None:
+    if not candidate_runs:
+        return
+    candidate_measurements = tuple(
+        (structured.candidate.candidate_id, measure_candidate(records))
+        for structured, records in candidate_runs
+    )
+    if _completed_run_count(baseline_records) != 0:
+        return
+    if any(_completed_run_count(records) != 0 for _, records in candidate_runs):
+        return
+    failure_summary_path = write_json_artifact(
+        summary_path,
+        {
+            "schema_version": _SEARCH_SCHEMA_VERSION,
+            "stage": stage,
+            "split": split,
+            "repetitions": repetitions,
+            "status": "system_error",
+            "error_label": "serving_collapse_all_model_failure",
+            "baseline": asdict(baseline_measurement),
+            "candidates": [
+                {"candidate_id": candidate_id, "measurement": asdict(measurement)}
+                for candidate_id, measurement in candidate_measurements
+            ],
+            "execution_modes": list(execution_modes.modes),
+        },
+    )
+    raise StableSearchSystemError(
+        stage=stage,
+        split=split,
+        error_label="serving_collapse_all_model_failure",
+        summary_path=failure_summary_path,
+    )
+
+
+def _completed_run_count(records: Sequence[NormalizedRunRecord]) -> int:
+    return sum(1 for record in records if record.status == "completed")
+
+
+def _write_success_summary(
+    *,
+    artifact_root: Path,
+    campaign_id: str,
+    config: StableSearchConfig,
+    decision: QualificationDecision,
+    extension: StableSearchExtensionArtifacts | None,
+    execution_modes: _ExecutionModeTracker,
+    artifact_refs: Mapping[str, Path],
+    winner_append: str | None,
+) -> Path:
+    return write_json_artifact(
+        artifact_root / "stable-search-summary.json",
+        {
+            "schema_version": _SEARCH_SCHEMA_VERSION,
+            "campaign_id": campaign_id,
+            "config": asdict(config),
+            "decision": asdict(decision),
+            "winner_append": winner_append,
+            "extension": asdict(extension) if extension is not None else None,
+            "execution_modes": list(execution_modes.modes),
+            "artifacts": {
+                name: str(path.relative_to(artifact_root)) for name, path in artifact_refs.items()
+            },
+        },
+    )
+
+
+def _write_failure_summary(
+    *,
+    artifact_root: Path,
+    campaign_id: str,
+    config: StableSearchConfig,
+    execution_modes: _ExecutionModeTracker,
+    artifact_refs: Mapping[str, Path],
+    stage: str,
+    split: str,
+    error_label: str,
+) -> Path:
+    return write_json_artifact(
+        artifact_root / "stable-search-summary.json",
+        {
+            "schema_version": _SEARCH_SCHEMA_VERSION,
+            "campaign_id": campaign_id,
+            "config": asdict(config),
+            "status": "system_error",
+            "error_label": error_label,
+            "stage": stage,
+            "split": split,
+            "execution_modes": list(execution_modes.modes),
+            "artifacts": {
+                name: str(path.relative_to(artifact_root)) for name, path in artifact_refs.items()
+            },
+        },
+    )
+
 
 def _run_qualification_stage(
     *,
@@ -486,55 +633,91 @@ def _run_qualification_stage(
     if not finalists:
         return _QualificationStageArtifacts(candidates=(), summary_path=stage_dir / "qualification-summary.json")
 
-    baseline_validation = measure_candidate(
-        _run_candidate(
-            runner=runner,
-            candidate=baseline,
-            cases=validation_cases,
-            split="validation",
-            repetitions=repetitions,
-            stage_dir=stage_dir,
-            execution_modes=execution_modes,
-        )
+    baseline_validation_records = _run_candidate(
+        runner=runner,
+        candidate=baseline,
+        cases=validation_cases,
+        split="validation",
+        repetitions=repetitions,
+        stage_dir=stage_dir,
+        execution_modes=execution_modes,
     )
-    baseline_milestone = measure_candidate(
-        _run_candidate(
-            runner=runner,
-            candidate=baseline,
-            cases=milestone_cases,
-            split="milestone",
-            repetitions=repetitions,
-            stage_dir=stage_dir,
-            execution_modes=execution_modes,
+    baseline_validation = measure_candidate(baseline_validation_records)
+    candidate_validation_runs = tuple(
+        (
+            structured,
+            _run_candidate(
+                runner=runner,
+                candidate=structured.candidate,
+                cases=validation_cases,
+                split="validation",
+                repetitions=repetitions,
+                stage_dir=stage_dir,
+                execution_modes=execution_modes,
+            ),
         )
+        for structured in finalists
+    )
+    candidate_validation_measurements = {
+        structured.candidate.candidate_id: measure_candidate(records)
+        for structured, records in candidate_validation_runs
+    }
+    _raise_if_stage_model_failures(
+        stage="qualification",
+        split="validation",
+        repetitions=repetitions,
+        baseline_records=baseline_validation_records,
+        baseline_measurement=baseline_validation,
+        candidate_runs=candidate_validation_runs,
+        summary_path=stage_dir / "qualification-summary.json",
+        execution_modes=execution_modes,
+    )
+    baseline_milestone_records = _run_candidate(
+        runner=runner,
+        candidate=baseline,
+        cases=milestone_cases,
+        split="milestone",
+        repetitions=repetitions,
+        stage_dir=stage_dir,
+        execution_modes=execution_modes,
+    )
+    baseline_milestone = measure_candidate(baseline_milestone_records)
+    candidate_milestone_runs = tuple(
+        (
+            structured,
+            _run_candidate(
+                runner=runner,
+                candidate=structured.candidate,
+                cases=milestone_cases,
+                split="milestone",
+                repetitions=repetitions,
+                stage_dir=stage_dir,
+                execution_modes=execution_modes,
+            ),
+        )
+        for structured in finalists
+    )
+    candidate_milestone_measurements = {
+        structured.candidate.candidate_id: measure_candidate(records)
+        for structured, records in candidate_milestone_runs
+    }
+    _raise_if_stage_model_failures(
+        stage="qualification",
+        split="milestone",
+        repetitions=repetitions,
+        baseline_records=baseline_milestone_records,
+        baseline_measurement=baseline_milestone,
+        candidate_runs=candidate_milestone_runs,
+        summary_path=stage_dir / "qualification-summary.json",
+        execution_modes=execution_modes,
     )
     candidates = tuple(
         QualificationCandidate(
             candidate_id=structured.candidate.candidate_id,
             baseline_validation=baseline_validation,
-            candidate_validation=measure_candidate(
-                _run_candidate(
-                    runner=runner,
-                    candidate=structured.candidate,
-                    cases=validation_cases,
-                    split="validation",
-                    repetitions=repetitions,
-                    stage_dir=stage_dir,
-                    execution_modes=execution_modes,
-                )
-            ),
+            candidate_validation=candidate_validation_measurements[structured.candidate.candidate_id],
             baseline_milestone=baseline_milestone,
-            candidate_milestone=measure_candidate(
-                _run_candidate(
-                    runner=runner,
-                    candidate=structured.candidate,
-                    cases=milestone_cases,
-                    split="milestone",
-                    repetitions=repetitions,
-                    stage_dir=stage_dir,
-                    execution_modes=execution_modes,
-                )
-            ),
+            candidate_milestone=candidate_milestone_measurements[structured.candidate.candidate_id],
         )
         for structured in finalists
     )
