@@ -295,6 +295,13 @@ def _require_non_negative_int(value: Any, context: str) -> int:
     return value
 
 
+def _require_positive_int(value: Any, context: str) -> int:
+    normalized = _require_non_negative_int(value, context)
+    if normalized == 0:
+        raise ValueError(f"{context} must be a positive integer")
+    return normalized
+
+
 def _validate_bounded_feedback(feedback: BoundedAggregateFeedback) -> BoundedAggregateFeedback:
     if type(feedback) is not BoundedAggregateFeedback:
         raise TypeError("bounded_feedback must be a BoundedAggregateFeedback instance")
@@ -304,7 +311,7 @@ def _validate_bounded_feedback(feedback: BoundedAggregateFeedback) -> BoundedAgg
     _require_probability(feedback.pass_at_3, "pass_at_3")
     _require_non_negative_int(feedback.hard_safety_failures, "hard_safety_failures")
     _require_non_negative_int(feedback.systemic_failures, "systemic_failures")
-    _require_non_negative_int(feedback.repetitions_per_case, "repetitions_per_case")
+    _require_positive_int(feedback.repetitions_per_case, "repetitions_per_case")
     if _require_probability(feedback.mean_verification, "mean_verification") is None:
         raise TypeError("mean_verification must be a probability")
     _require_non_negative_int(feedback.malformed_tool_calls, "malformed_tool_calls")

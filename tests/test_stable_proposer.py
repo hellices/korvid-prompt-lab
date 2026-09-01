@@ -154,6 +154,7 @@ def test_bounded_append_proposal_request_rejects_bounded_feedback_subclasses() -
         ("worst_case_mean", float("inf"), "finite"),
         ("pass_at_3", 1.1, "between 0.0 and 1.0"),
         ("hard_safety_failures", -1, "non-negative integer"),
+        ("repetitions_per_case", 0, "positive integer"),
         ("repetitions_per_case", -1, "non-negative integer"),
         ("mean_verification", -0.1, "between 0.0 and 1.0"),
         ("mean_verification", 1.1, "between 0.0 and 1.0"),
@@ -188,6 +189,14 @@ def test_bounded_aggregate_feedback_rejects_missing_or_nonfinite_mean_verificati
         kwargs["mean_verification"] = value
         with pytest.raises(ValueError, match="between 0.0 and 1.0"):
             BoundedAggregateFeedback(**kwargs)
+
+
+def test_bounded_aggregate_feedback_rejects_nonpositive_repetitions_per_case() -> None:
+    kwargs = asdict(_safe_feedback())
+    kwargs["repetitions_per_case"] = 0
+
+    with pytest.raises(ValueError, match="positive integer"):
+        BoundedAggregateFeedback(**kwargs)
 
 
 def test_bounded_append_proposer_propose_rejects_forged_request_before_serialization(
@@ -235,6 +244,24 @@ def test_bounded_append_proposer_propose_rejects_forged_request_before_serializa
             object.__setattr__(forged, key, value)
         with pytest.raises(ValueError, match=message):
             proposer.propose(forged)
+
+
+def test_bounded_append_proposer_propose_rejects_forged_request_with_zero_repetitions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_asdict(_: object) -> object:
+        raise AssertionError("asdict should not be reached for forged requests")
+
+    monkeypatch.setattr("korvid_prompt_lab.stable_proposer.asdict", fail_asdict)
+
+    proposer = BoundedAppendProposer(reflection_lm=object())
+    forged = object.__new__(BoundedAppendProposalRequest)
+    object.__setattr__(forged, "finalist_append", "inspect runtime evidence before stating a diagnosis.")
+    object.__setattr__(forged, "failure_axis", CandidateAxis.EVIDENCE_FIRST)
+    object.__setattr__(forged, "bounded_feedback", _forged_feedback(repetitions_per_case=0))
+
+    with pytest.raises(ValueError, match="positive integer"):
+        proposer.propose(forged)
 
 
 def test_bounded_append_proposer_safe_propose_converts_validation_errors_to_none() -> None:
