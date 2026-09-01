@@ -62,9 +62,9 @@ def _render_append(axes: tuple[CandidateAxis, ...]) -> str:
 
 
 def build_structured_candidates(baseline: Candidate) -> tuple[StructuredCandidate, ...]:
-    system = baseline.components.get("system")
-    if system is None:
-        raise ValueError("baseline candidate must include a system component")
+    if set(baseline.components) != {"system"}:
+        raise ValueError("baseline components must be exactly {'system'}")
+    system = baseline.components["system"]
 
     candidates: list[StructuredCandidate] = []
     for axes in _MATRIX:
@@ -76,6 +76,7 @@ def build_structured_candidates(baseline: Candidate) -> tuple[StructuredCandidat
                     "system": system,
                     "append": _render_append(axes),
                 },
+                "metadata": baseline.metadata,
             }
         )
         candidates.append(StructuredCandidate(axes=axes, candidate=candidate))
