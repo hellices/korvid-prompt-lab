@@ -12,12 +12,14 @@ import yaml  # type: ignore[import-untyped]
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from korvid_prompt_lab import cli as cli_module
 from korvid_prompt_lab.aks import (
     AKSMissingToolError,
     AKSPortForwardError,
     AKSPreflightTransientError,
 )
 from korvid_prompt_lab.cli import main
+from korvid_prompt_lab.korvid_readonly import _eval_request_timeout_seconds
 from korvid_prompt_lab.rounds import build_round_report
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +31,15 @@ REAL_SCENARIO_QUESTION = "Why does the worker pod in namespace jobs keep dying?"
 REAL_SCENARIO_ID_2 = "image-pull-typo"
 REAL_SCENARIO_QUESTION_2 = "Pod web-1 in namespace front is stuck in ImagePullBackOff. What is the cause?"
 FAKE_KORVID_EVALS = ROOT / "tests" / "fixtures" / "fake_korvid_evals.py"
+
+
+def test_stable_search_allows_a_full_small_model_request_timeout() -> None:
+    request_timeout = _eval_request_timeout_seconds(
+        cli_module._STABLE_SEARCH_TIMEOUT_SECONDS,
+        cli_module._STABLE_SEARCH_PROFILE,
+    )
+
+    assert request_timeout >= 120.0
 
 
 def _run_cli(args: list[str]) -> tuple[int, str, str]:

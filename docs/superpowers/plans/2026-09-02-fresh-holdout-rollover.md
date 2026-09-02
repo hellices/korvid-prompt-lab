@@ -800,3 +800,7 @@ a valid stable winner.
 - Model metadata: `qwen3:0.6b`, digest `sha256:7df6b6e09427a769808717c0a93cadc4ae99ed4eb8bf5ca557c90846becea435`, Ollama `0.33.2`, Korvid `0.3.0`.
 - AKS `modeleval` restored to `count=0` / `Succeeded`; temporary kubeconfig removed and recorded port-forward processes exited.
 - No Stage B or Stage C aggregates exist because the run stopped in Stage A.
+- A non-holdout diagnostic reproduced the failure at the derived 5-second model request timeout, while the same neutral request completed in 13.784 seconds with a 120-second timeout. Model, pod, node, and port-forward health remained stable with no restarts or OOM events.
+- Root cause: the 160-second whole-process budget reserved 120 seconds for worst-case serving probes and divided the remainder across six small-profile iterations, leaving only 5 seconds per model request.
+- The stable-search whole-process budget is now 850 seconds, which preserves the existing probe and process-overhead reservations while allowing 120 seconds for each of the six model iterations.
+- Because the aborted attempt stopped in Stage A before any valid qualification result and never evaluated the fresh milestone, a full retry may use the same untouched milestone under a new immutable artifact root. The aborted root remains immutable evidence and must not be resumed or overwritten.

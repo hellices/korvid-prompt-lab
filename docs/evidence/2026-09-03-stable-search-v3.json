@@ -87,6 +87,26 @@
   },
   "date": "2026-09-03",
   "decision": "system_error",
+  "diagnosis": {
+    "confirmed_root_cause": "model_request_timeout_too_short",
+    "five_second_probe": {
+      "elapsed_seconds": 5.007,
+      "status": "timeout"
+    },
+    "serving_health": {
+      "forward_restarts": 0,
+      "node_ready": true,
+      "pod_oom_count": 0,
+      "pod_ready": true,
+      "pod_restart_count": 0,
+      "probes_succeeded_after_each_request": true
+    },
+    "successful_probe": {
+      "elapsed_seconds": 13.784,
+      "request_timeout_seconds": 120.0,
+      "status": "completed"
+    }
+  },
   "failures": {
     "hard": 0,
     "systemic": 1
