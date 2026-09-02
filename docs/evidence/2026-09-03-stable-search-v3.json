@@ -1,0 +1,108 @@
+{
+  "aggregates": {
+    "leading_qualification": null,
+    "stage_b": null
+  },
+  "aks_restored": {
+    "count": 0,
+    "provisioningState": "Succeeded"
+  },
+  "artifact_hashes": [
+    {
+      "path": "baseline-candidate.json",
+      "sha256": "9dc48e21199c0bbaa82ef5f399be73cd24468b8ce61c3f5d8409261e6a4718e6"
+    },
+    {
+      "path": "candidate-manifest.json",
+      "sha256": "3210f65e5ee8813b2f6fb89fe0d536c0fdce3f34c112feb31909925fc80debd3"
+    },
+    {
+      "path": "rollover-lineage.json",
+      "sha256": "16c2c61164cd93a2b0ce4ac6e54b8939106807f9c7f56cb7bf560f0a50d4f069"
+    },
+    {
+      "path": "scenario-manifest.json",
+      "sha256": "715fb3db6df3e50e20242d3ff8ceb9f4c6b532ad25ec150986324b5208af73c9"
+    },
+    {
+      "path": "stage-a/runs/continue-before-uncertainty-10b58a9c/train-116f54c4/healthy-deployment-4b49533c/r01/response.json",
+      "sha256": "8e82d194d545b8a877b4e9a8cd3e683071c6349a743924e1ae6fd6019a934898"
+    },
+    {
+      "path": "stage-a/runs/continue-before-uncertainty-10b58a9c/train-116f54c4/oom-killed-5f5fbbfa/r01/response.json",
+      "sha256": "047f93fa568d1bc197ca678ff4926b9ec27f22d5af63790501b215ef8dac7d6e"
+    },
+    {
+      "path": "stage-a/runs/decisive-read-first-a1a292c8/train-116f54c4/crashloop-dependency-unreachable-cdbd748c/r01/response.json",
+      "sha256": "b974f3cfa2ef0e55c9b665f48e4926eea1ca79319ae228ca7e99821b131ee2bb"
+    },
+    {
+      "path": "stage-a/runs/decisive-read-first-a1a292c8/train-116f54c4/healthy-deployment-4b49533c/r01/response.json",
+      "sha256": "4011f4fc526ed2acbc7b0b35fa7af2ec119b63ac139e84390b640bf85888bf20"
+    },
+    {
+      "path": "stage-a/runs/decisive-read-first-a1a292c8/train-116f54c4/healthy-service-endpoints-631b0a78/r01/response.json",
+      "sha256": "360f9ff23d7ff95caaa6baccf191d0f7af18484681b296b3aad3444fec4a4d19"
+    },
+    {
+      "path": "stage-a/runs/decisive-read-first-a1a292c8/train-116f54c4/oom-killed-5f5fbbfa/r01/response.json",
+      "sha256": "71fc0ea9003e18258d393e8bd5bbc1324f52d61f74d996d0cdf026e029fd6c10"
+    },
+    {
+      "path": "stage-a/runs/decisive-read-first-a1a292c8/train-116f54c4/pending-node-selector-2a4105d4/r01/response.json",
+      "sha256": "41b54bb51c5c054347871783ee3d885626c20bec70787b0f08253664d4710eab"
+    },
+    {
+      "path": "stage-a/runs/decisive-read-first-a1a292c8/train-116f54c4/stuck-rollout-3083b5a3/r01/response.json",
+      "sha256": "a3da291c04f74734cf81ad40c02be57d3ee56c14adc18edb8774eae8261f9ab3"
+    },
+    {
+      "path": "stage-a/runs/korvid-baseline-small-9640ce8e/train-116f54c4/crashloop-dependency-unreachable-cdbd748c/r01/response.json",
+      "sha256": "febf5012e75fa66ceb1c14ca7333911221d0537edcf242c9930c1ff062f5aecc"
+    },
+    {
+      "path": "stage-a/runs/korvid-baseline-small-9640ce8e/train-116f54c4/healthy-deployment-4b49533c/r01/response.json",
+      "sha256": "9e514a33816a844fa560ebc75a6602976efed0afb82516aadab2a2544468aa28"
+    },
+    {
+      "path": "stage-a/runs/korvid-baseline-small-9640ce8e/train-116f54c4/healthy-service-endpoints-631b0a78/r01/response.json",
+      "sha256": "13b846827a72a4a7c2c1f9c829b2a411ee58641375dcee397885e2f268b68c66"
+    },
+    {
+      "path": "stage-a/runs/korvid-baseline-small-9640ce8e/train-116f54c4/oom-killed-5f5fbbfa/r01/response.json",
+      "sha256": "1d700821aa2f350020004d1417761b94ff81a37691ac9fb6ee89f1e5b6f1c209"
+    },
+    {
+      "path": "stage-a/runs/korvid-baseline-small-9640ce8e/train-116f54c4/pending-node-selector-2a4105d4/r01/response.json",
+      "sha256": "a65e44f6ad4496dfa27ca3073ee9a2490de331fd2580b5f71abfd21e7f3825d5"
+    },
+    {
+      "path": "stage-a/runs/korvid-baseline-small-9640ce8e/train-116f54c4/stuck-rollout-3083b5a3/r01/response.json",
+      "sha256": "0ab87c760e256227ad4e5c644dcd6cd3475117ac8c641e345894dbaface82549"
+    }
+  ],
+  "call_count": {
+    "actual": 14,
+    "budget": 306
+  },
+  "date": "2026-09-03",
+  "decision": "system_error",
+  "failures": {
+    "hard": 0,
+    "systemic": 1
+  },
+  "model": {
+    "digest": "sha256:7df6b6e09427a769808717c0a93cadc4ae99ed4eb8bf5ca557c90846becea435",
+    "name": "qwen3:0.6b"
+  },
+  "prior": {
+    "scenario_manifest_sha256": "11842c338cb4425c75abc70e54049024d28e5299dc04e4522a09089f23592bd0",
+    "summary_sha256": "c463455fa7d13ed459dd62e8649e3c2269f016671e64f9a16b507d543f625483"
+  },
+  "schema": 1,
+  "terminal_reason": "bridge_timeout_error",
+  "versions": {
+    "korvid": "0.3.0",
+    "ollama": "0.33.2"
+  }
+}

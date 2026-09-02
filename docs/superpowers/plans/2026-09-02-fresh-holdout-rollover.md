@@ -789,3 +789,14 @@ Push the branch and update the PR body with:
 
 Never change the PR title/body to claim prompt improvement unless v3 produces
 a valid stable winner.
+
+## Measured Results
+
+- Committed receipt: `docs/evidence/2026-09-03-stable-search-v3.json`.
+- v3 aborted with decision `system_error` and terminal reason `bridge_timeout_error` before any valid qualification result.
+- Recorded Stage A partial metrics before abort: `continue-before-uncertainty` calls `2` mean `0.0000000`; `decisive-read-first` calls `6` mean `0.1333333`; `korvid-baseline-small` calls `6` mean `0.0166667`.
+- Target-model calls observed before abort: `14` / `306` budget.
+- No winner YAML was written.
+- Model metadata: `qwen3:0.6b`, digest `sha256:7df6b6e09427a769808717c0a93cadc4ae99ed4eb8bf5ca557c90846becea435`, Ollama `0.33.2`, Korvid `0.3.0`.
+- AKS `modeleval` restored to `count=0` / `Succeeded`; temporary kubeconfig removed and recorded port-forward processes exited.
+- No Stage B or Stage C aggregates exist because the run stopped in Stage A.
