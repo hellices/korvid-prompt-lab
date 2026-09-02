@@ -13,6 +13,7 @@ import yaml  # type: ignore[import-untyped]
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import korvid_prompt_lab.cli as stable_search_cli
 from korvid_prompt_lab import stable_rollover
 from korvid_prompt_lab.cli import main
 from korvid_prompt_lab.contracts import Candidate
@@ -867,6 +868,42 @@ def test_stable_search_rollover_cli_writes_winner_yaml_once(
         "components": candidates[2].candidate.components,
         "metadata": candidates[2].candidate.metadata,
     }
+
+
+def test_materialize_rollover_lineage_keeps_draft_when_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    artifact_root = tmp_path / "rollover-artifacts"
+    draft_path = tmp_path / ".rollover-artifacts.rollover-lineage.json"
+    lineage_path = artifact_root / "rollover-lineage.json"
+    draft_path.write_text("draft-lineage", encoding="utf-8")
+
+    prior = _prior_evidence(tmp_path / "prior-root")
+    rollover = _rollover_manifest()
+
+    def fail_write_rollover_lineage(*args: object, **kwargs: object) -> Path:
+        raise RuntimeError("authoritative write failed")
+
+    monkeypatch.setattr(
+        stable_search_cli,
+        "write_rollover_lineage",
+        fail_write_rollover_lineage,
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="authoritative write failed"):
+        stable_search_cli._materialize_rollover_lineage(
+            artifact_root=artifact_root,
+            draft_path=draft_path,
+            prior=prior,
+            rollover=rollover,
+            terminal_reason="stable_winner",
+        )
+
+    assert draft_path.exists()
+    assert draft_path.read_text(encoding="utf-8") == "draft-lineage"
+    assert not lineage_path.exists()
 
 
 def test_stable_search_rollover_cli_skips_winner_yaml_when_no_stable_winner(

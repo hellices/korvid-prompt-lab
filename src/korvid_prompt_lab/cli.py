@@ -765,8 +765,6 @@ def _materialize_rollover_lineage(
 ) -> Path:
     artifact_root.mkdir(parents=True, exist_ok=True)
     lineage_path = _rollover_lineage_path(artifact_root)
-    if draft_path is not None and draft_path.exists():
-        os.replace(draft_path, lineage_path)
     return write_rollover_lineage(lineage_path, prior, rollover, terminal_reason=terminal_reason)
 
 
