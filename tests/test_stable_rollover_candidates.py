@@ -16,6 +16,11 @@ from korvid_prompt_lab.stable_rollover_candidates import (
 )
 from korvid_prompt_lab.stable_scenarios import ScenarioAssignment, ScenarioClass
 
+_REAL_V2_FINALIST_APPEND = (
+    "name the observed evidence and its source before the final conclusion.\n"
+    "when evidence is insufficient, state what is missing and stop instead of guessing."
+)
+
 
 def _baseline(*, system: str = "You are korvid's bounded Kubernetes operator.") -> Candidate:
     return Candidate.from_mapping(
@@ -83,11 +88,15 @@ class _PriorProxy:
         raise AssertionError("fixtures should not be accessed")
 
 
-def _prior(*, consumed_assignments: tuple[ScenarioAssignment, ...]) -> _PriorProxy:
+def _prior(
+    *,
+    consumed_assignments: tuple[ScenarioAssignment, ...],
+    append: str = "tie each conclusion to observed evidence and avoid unsupported remediation.",
+) -> _PriorProxy:
     finalist = PriorFinalistEvidence(
         candidate_id="finalist-v2",
         candidate_fingerprint="f" * 64,
-        append="tie each conclusion to observed evidence and avoid unsupported remediation.",
+        append=append,
         validation_delta=0.11,
         milestone_delta=0.09,
     )
@@ -211,3 +220,31 @@ def test_rollover_matrix_is_deterministic_for_unrelated_prior_reordering() -> No
 
     assert [item.candidate.candidate_id for item in candidates] == [item.candidate.candidate_id for item in repeated]
     assert [item.candidate.fingerprint for item in candidates] == [item.candidate.fingerprint for item in repeated]
+
+
+def test_rollover_matrix_uses_only_fixed_evidence_seed_from_real_v2_append() -> None:
+    baseline = _baseline()
+    prior = _prior(
+        consumed_assignments=(
+            _assignment("used-a"),
+            _assignment("used-b"),
+        ),
+        append=_REAL_V2_FINALIST_APPEND,
+    )
+
+    candidates = build_rollover_candidates(baseline, cast(Any, prior))
+
+    carried_seed = "name the observed evidence and its source before the final conclusion."
+    dropped_line = "when evidence is insufficient, state what is missing and stop instead of guessing."
+
+    assert len(candidates) == 8
+    assert all(len(item.candidate.components["append"]) <= 480 for item in candidates)
+    assert all(item.candidate.components["append"].splitlines()[0] == carried_seed for item in candidates)
+    assert all(dropped_line not in item.candidate.components["append"] for item in candidates)
+    assert candidates[-1].candidate.components["append"] == (
+        "name the observed evidence and its source before the final conclusion.\n"
+        "gather the smallest relevant read-only evidence needed to distinguish likely causes before concluding.\n"
+        "when initial evidence is insufficient, inspect the next highest-value source before stopping.\n"
+        "after relevant read-only evidence is exhausted, state exactly what remains unknown and stop instead of guessing.\n"
+        "tie each conclusion to observed evidence and avoid unsupported remediation."
+    )

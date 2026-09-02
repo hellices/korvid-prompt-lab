@@ -38,6 +38,8 @@ _AXIS_APPEND_TEXT: dict[RolloverCandidateAxis, str] = {
     ),
 }
 
+_ROLLOVER_SEED_LINE = "name the observed evidence and its source before the final conclusion."
+
 _MATRIX: tuple[_RolloverCandidateSpec, ...] = (
     _RolloverCandidateSpec((RolloverCandidateAxis.DECISIVE_READ_FIRST,)),
     _RolloverCandidateSpec((RolloverCandidateAxis.CONTINUE_BEFORE_UNCERTAINTY,)),
@@ -69,10 +71,22 @@ def _candidate_id(axes: tuple[RolloverCandidateAxis, ...]) -> str:
     return "+".join(axis.value for axis in axes)
 
 
-def _render_append(prior_append: str, axes: tuple[RolloverCandidateAxis, ...]) -> str:
+def _extract_rollover_seed(prior_append: str) -> str:
+    if prior_append != prior_append.strip():
+        raise ValueError("prior finalist append must use canonical outer whitespace")
+
+    lines = tuple(line.strip() for line in prior_append.splitlines() if line.strip())
+    if _ROLLOVER_SEED_LINE in lines:
+        return _ROLLOVER_SEED_LINE
+    if len(lines) == 1:
+        return lines[0]
+    raise ValueError("prior finalist append must contain the rollover seed line")
+
+
+def _render_append(prior_seed: str, axes: tuple[RolloverCandidateAxis, ...]) -> str:
     lines: list[str] = []
     seen: set[str] = set()
-    for raw_line in (prior_append, *(_AXIS_APPEND_TEXT[axis] for axis in axes)):
+    for raw_line in (prior_seed, *(_AXIS_APPEND_TEXT[axis] for axis in axes)):
         line = raw_line.strip()
         if not line or line in seen:
             continue
@@ -94,6 +108,7 @@ def build_rollover_candidates(
         raise ValueError("baseline components must be exactly {'system'}")
 
     system = baseline.components["system"]
+    prior_seed = _extract_rollover_seed(prior.finalist.append)
     metadata = {
         **baseline.metadata,
         "rollover_from": prior.summary_sha256,
@@ -108,7 +123,7 @@ def build_rollover_candidates(
                 "candidate_id": _candidate_id(spec.axes),
                 "components": {
                     "system": system,
-                    "append": _render_append(prior.finalist.append, spec.axes),
+                    "append": _render_append(prior_seed, spec.axes),
                 },
                 "metadata": metadata,
             }
