@@ -7,6 +7,15 @@ from typing import Any
 import dspy  # type: ignore[import-untyped]
 
 
+def canonicalize_proposal_text(text: Any, *, context: str) -> str:
+    if not isinstance(text, str):
+        raise ValueError(f"{context} must be a string")  # noqa: TRY004 - preserve validation API
+    normalized = text.strip()
+    if not normalized:
+        raise ValueError(f"{context} must not be blank")
+    return normalized
+
+
 class ReflectionProposalSignature(dspy.Signature):
     current_component_text: str = dspy.InputField(desc="Current prompt component text.")
     reflection_records_json: str = dspy.InputField(desc="Compact reflection records encoded as JSON.")
@@ -35,9 +44,9 @@ class DSPyInstructionProposer:
                 lm=self.reflection_lm,
             )
             revised = getattr(prediction, "revised_component_text", None)
-            if not isinstance(revised, str) or not revised.strip():
-                raise ValueError(f"blank proposal for component: {component_name}")
-            proposals[component_name] = revised.strip()
+            proposals[component_name] = canonicalize_proposal_text(
+                revised, context=f"blank proposal for component: {component_name}"
+            )
         return proposals
 
     def _get_predictor(self) -> dspy.Predict:

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import dspy  # type: ignore[import-untyped]
+from korvid.evals.scenario import bundled_scenarios_dir, load_scenario
 
 from .aks import (
     AKSMissingToolError,
@@ -35,6 +38,35 @@ from .optimize import (
 from .publish import DEFAULT_MINIMUM_MODEL_IMPROVEMENT, publish_bundle
 from .runner import BridgeSystemError, KorvidProcessRunner, KorvidRunner
 from .scoring import RepetitionOutcome, pass_hat_k, result_passed, score_result
+from .stable_candidates import build_structured_candidates
+from .stable_proposer import BoundedAppendProposer
+from .stable_rollover import (
+    PriorCampaignEvidence,
+    load_prior_campaign_evidence,
+    write_rollover_lineage,
+    write_rollover_winner,
+)
+from .stable_rollover_candidates import build_rollover_candidates
+from .stable_scenarios import (
+    FreshHoldoutExhaustedError,
+    RolloverScenarioManifest,
+    ScenarioManifest,
+    build_rollover_scenario_manifest,
+    build_scenario_manifest,
+)
+from .stable_search import (
+    StableSearchConfig,
+    StableSearchExtension,
+    StableSearchSystemError,
+    run_stable_search,
+)
+
+_STABLE_SEARCH_CAMPAIGN_ID = "stable-search-korvid-small"
+_STABLE_SEARCH_MODEL = "qwen3:0.6b"
+_STABLE_SEARCH_PROFILE = "small"
+_STABLE_SEARCH_TIMEOUT_SECONDS = 850.0
+_STABLE_SEARCH_REPETITIONS = 5
+_POST_CAMPAIGN_ARTIFACT_ERROR_LABEL = "post_campaign_artifact_error"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -207,6 +239,66 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to write the immutable baseline candidate YAML to; must not already exist.",
     )
     baseline_parser.set_defaults(func=command_korvid_baseline)
+
+    stable_search_parser = subparsers.add_parser(
+        "stable-search",
+        help="Run the bounded 306-call stable-search campaign against installed Korvid read-only evals.",
+    )
+    stable_search_parser.add_argument(
+        "--artifact-root",
+        type=Path,
+        required=True,
+        help="Fresh directory for immutable stable-search artifacts; must not already exist.",
+    )
+    stable_search_parser.add_argument(
+        "--target-per-split",
+        type=int,
+        default=6,
+        help="Requested scenario count per train/validation/milestone split before fail-closed reduction.",
+    )
+    stable_search_parser.add_argument(
+        "--reflection-model",
+        help="DSPy LM spec for the optional bounded proposer, for example ollama_chat/qwen3:4b.",
+    )
+    stable_search_parser.add_argument(
+        "--enable-bounded-proposer",
+        action="store_true",
+        help="Attempt at most one bounded proposer candidate from the strongest eligible Stage B structured finalist.",
+    )
+    stable_search_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Write the stable-search summary JSON to stdout.",
+    )
+    stable_search_parser.set_defaults(func=command_stable_search)
+
+    rollover_parser = subparsers.add_parser(
+        "stable-search-rollover",
+        help="Run the bounded v3 rollover campaign from prior no-winner stable-search evidence.",
+    )
+    rollover_parser.add_argument(
+        "--prior-artifact-root",
+        type=Path,
+        required=True,
+        help="Prior immutable stable-search artifact root whose decision must be no_stable_winner.",
+    )
+    rollover_parser.add_argument(
+        "--artifact-root",
+        type=Path,
+        required=True,
+        help="Fresh directory for immutable rollover artifacts; must not already exist.",
+    )
+    rollover_parser.add_argument(
+        "--winner-output",
+        type=Path,
+        help="Optional path to write the exact winning append candidate YAML when rollout qualifies.",
+    )
+    rollover_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Write the stable-search rollover summary JSON to stdout.",
+    )
+    rollover_parser.set_defaults(func=command_stable_search_rollover)
 
     return parser
 
@@ -442,6 +534,329 @@ def command_korvid_baseline(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_stable_search(args: argparse.Namespace) -> int:
+    if Path(args.artifact_root).exists() or Path(args.artifact_root).is_symlink():
+        print(
+            f"stable-search failed: stable search artifact root already exists: {args.artifact_root}",
+            file=_stderr(),
+        )
+        return 2
+    if args.enable_bounded_proposer and not args.reflection_model:
+        print(
+            "stable-search failed: --enable-bounded-proposer requires --reflection-model",
+            file=_stderr(),
+        )
+        return 2
+    if args.reflection_model and not args.enable_bounded_proposer:
+        print(
+            "stable-search failed: --reflection-model requires --enable-bounded-proposer",
+            file=_stderr(),
+        )
+        return 2
+
+    try:
+        baseline = build_baseline_candidate(_STABLE_SEARCH_PROFILE)
+        candidates = build_structured_candidates(baseline)
+        manifest = build_scenario_manifest(target_per_split=args.target_per_split)
+        campaign = _build_stable_search_campaign(manifest)
+        runner = KorvidReadonlyRunner(campaign=campaign)
+        extension = (
+            StableSearchExtension(
+                bounded_append_proposer=BoundedAppendProposer(
+                    _build_reflection_lm(args.reflection_model)
+                )
+            )
+            if args.enable_bounded_proposer
+            else None
+        )
+        artifacts = run_stable_search(
+            runner=runner,
+            baseline=baseline,
+            candidates=candidates,
+            manifest=manifest,
+            artifact_root=args.artifact_root,
+            extension=extension,
+        )
+    except ValueError as exc:
+        print(f"stable-search failed: {exc}", file=_stderr())
+        return 2
+    except BridgeSystemError as exc:
+        error_label = _stable_search_system_error_label(exc)
+        if args.json:
+            print(
+                json.dumps(
+                    {"status": "system_error", "error_label": error_label},
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(
+                f"stable-search failed: systemic bridge error: {error_label}",
+                file=_stderr(),
+            )
+        return 1
+    except OSError as exc:
+        print(f"stable-search failed: {exc}", file=_stderr())
+        return 1
+
+    try:
+        summary = _load_json_file(artifacts.summary_path)
+    except (OSError, ValueError, FileExistsError):
+        return _emit_bounded_cli_error(
+            "stable-search",
+            json_output=args.json,
+            status="artifact_error",
+            error_label=_POST_CAMPAIGN_ARTIFACT_ERROR_LABEL,
+            stderr_detail="bounded post-campaign error",
+        )
+    if args.json:
+        print(json.dumps(summary, sort_keys=True, ensure_ascii=False, indent=2))
+    else:
+        decision = summary["decision"]
+        print(
+            "stable-search status={status} candidate={candidate_id} summary={summary_path}".format(
+                status=decision["status"],
+                candidate_id=decision["candidate_id"] or "none",
+                summary_path=artifacts.summary_path,
+            )
+        )
+    return 0
+
+
+def command_stable_search_rollover(args: argparse.Namespace) -> int:
+    artifact_root = Path(args.artifact_root)
+    if artifact_root.exists() or artifact_root.is_symlink():
+        print(
+            f"stable-search-rollover failed: stable search artifact root already exists: {artifact_root}",
+            file=_stderr(),
+        )
+        return 2
+
+    winner_output = Path(args.winner_output) if args.winner_output is not None else None
+    if winner_output is not None and (winner_output.exists() or winner_output.is_symlink()):
+        print(
+            f"stable-search-rollover failed: rollover winner output already exists: {winner_output}",
+            file=_stderr(),
+        )
+        return 2
+
+    prior: PriorCampaignEvidence | None = None
+    rollover: RolloverScenarioManifest | None = None
+    lineage_draft_path: Path | None = None
+
+    try:
+        prior = load_prior_campaign_evidence(args.prior_artifact_root)
+        baseline = build_baseline_candidate(_STABLE_SEARCH_PROFILE)
+        candidates = build_rollover_candidates(baseline, prior)
+        rollover = build_rollover_scenario_manifest(prior.consumed_assignments)
+        campaign = _build_stable_search_campaign(rollover.manifest)
+        runner = KorvidReadonlyRunner(campaign=campaign)
+        config = StableSearchConfig()
+        lineage_draft_path = _rollover_lineage_draft_path(artifact_root)
+        if lineage_draft_path.exists() or lineage_draft_path.is_symlink():
+            raise ValueError(f"rollover lineage draft already exists: {lineage_draft_path}")
+        write_rollover_lineage(lineage_draft_path, prior, rollover)
+        artifacts = run_stable_search(
+            runner=runner,
+            baseline=baseline,
+            candidates=candidates,
+            manifest=rollover.manifest,
+            artifact_root=artifact_root,
+            config=config,
+        )
+    except FreshHoldoutExhaustedError:
+        _cleanup_rollover_lineage_draft(lineage_draft_path)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "status": "no_stable_winner",
+                        "terminal_reason": "fresh_holdout_exhausted",
+                    },
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(
+                "stable-search-rollover status=no_stable_winner terminal_reason=fresh_holdout_exhausted"
+            )
+        return 0
+    except ValueError as exc:
+        _cleanup_rollover_lineage_draft(lineage_draft_path)
+        print(f"stable-search-rollover failed: {exc}", file=_stderr())
+        return 2
+    except BridgeSystemError as exc:
+        error_label = _stable_search_system_error_label(exc)
+        if prior is not None and rollover is not None:
+            try:
+                _materialize_rollover_lineage(
+                    artifact_root=artifact_root,
+                    draft_path=lineage_draft_path,
+                    prior=prior,
+                    rollover=rollover,
+                    terminal_reason=error_label,
+                )
+            except (OSError, ValueError, FileExistsError):
+                pass
+        _best_effort_cleanup_rollover_lineage_draft(lineage_draft_path)
+        return _emit_bounded_cli_error(
+            "stable-search-rollover",
+            json_output=args.json,
+            status="system_error",
+            error_label=error_label,
+            stderr_detail="systemic bridge error",
+        )
+    except OSError as exc:
+        _cleanup_rollover_lineage_draft(lineage_draft_path)
+        print(f"stable-search-rollover failed: {exc}", file=_stderr())
+        return 1
+
+    try:
+        summary = _load_json_file(artifacts.summary_path)
+        terminal_reason = _rollover_terminal_reason(summary)
+        assert prior is not None
+        assert rollover is not None
+        _materialize_rollover_lineage(
+            artifact_root=artifact_root,
+            draft_path=lineage_draft_path,
+            prior=prior,
+            rollover=rollover,
+            terminal_reason=terminal_reason,
+        )
+        _cleanup_rollover_lineage_draft(lineage_draft_path)
+
+        winning_candidate = _rollover_winner_candidate(summary, candidates)
+        if winner_output is not None and winning_candidate is not None:
+            write_rollover_winner(winner_output, winning_candidate)
+    except (OSError, ValueError, FileExistsError):
+        _best_effort_cleanup_rollover_lineage_draft(lineage_draft_path)
+        return _emit_bounded_cli_error(
+            "stable-search-rollover",
+            json_output=args.json,
+            status="artifact_error",
+            error_label=_POST_CAMPAIGN_ARTIFACT_ERROR_LABEL,
+            stderr_detail="bounded post-campaign error",
+        )
+
+    if args.json:
+        print(json.dumps(summary, sort_keys=True, ensure_ascii=False, indent=2))
+    else:
+        decision = summary["decision"]
+        print(
+            "stable-search-rollover status={status} candidate={candidate_id} summary={summary_path}".format(
+                status=decision["status"],
+                candidate_id=decision["candidate_id"] or "none",
+                summary_path=artifacts.summary_path,
+            )
+        )
+    return 0
+
+
+def _stable_search_system_error_label(exc: BridgeSystemError) -> str:
+    if isinstance(exc, StableSearchSystemError):
+        return exc.error_label
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", type(exc).__name__).lower()
+
+
+def _emit_bounded_cli_error(
+    command: str,
+    *,
+    json_output: bool,
+    status: str,
+    error_label: str,
+    stderr_detail: str,
+) -> int:
+    if json_output:
+        print(
+            json.dumps(
+                {"status": status, "error_label": error_label},
+                sort_keys=True,
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        print(f"{command} failed: {stderr_detail}: {error_label}", file=_stderr())
+    return 1
+
+
+def _rollover_lineage_draft_path(artifact_root: Path) -> Path:
+    return artifact_root.parent / f".{artifact_root.name}.rollover-lineage.json"
+
+
+def _rollover_lineage_path(artifact_root: Path) -> Path:
+    return artifact_root / "rollover-lineage.json"
+
+
+def _materialize_rollover_lineage(
+    *,
+    artifact_root: Path,
+    draft_path: Path | None,
+    prior: PriorCampaignEvidence,
+    rollover: RolloverScenarioManifest,
+    terminal_reason: str | None,
+) -> Path:
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    lineage_path = _rollover_lineage_path(artifact_root)
+    return write_rollover_lineage(lineage_path, prior, rollover, terminal_reason=terminal_reason)
+
+
+def _cleanup_rollover_lineage_draft(draft_path: Path | None) -> None:
+    if draft_path is not None and draft_path.exists():
+        draft_path.unlink()
+
+
+def _best_effort_cleanup_rollover_lineage_draft(draft_path: Path | None) -> None:
+    try:
+        _cleanup_rollover_lineage_draft(draft_path)
+    except OSError:
+        pass
+
+
+def _rollover_terminal_reason(summary: Mapping[str, Any]) -> str | None:
+    status = _rollover_decision_status(summary)
+    if status == "promote":
+        return "stable_winner"
+    return status
+
+
+def _rollover_winner_candidate(
+    summary: Mapping[str, Any],
+    candidates: Sequence[Any],
+) -> Candidate | None:
+    status = _rollover_decision_status(summary)
+    if status not in {"promote", "stable_winner"}:
+        return None
+    decision = summary["decision"]
+    if not isinstance(decision, Mapping):
+        raise ValueError("stable-search summary decision must be a mapping")  # noqa: TRY004 - preserve validation API
+    candidate_id = decision.get("candidate_id")
+    if not isinstance(candidate_id, str) or not candidate_id.strip():
+        raise ValueError("stable-search summary winner must provide candidate_id")
+    candidate_index = {
+        structured.candidate.candidate_id: structured.candidate
+        for structured in candidates
+    }
+    try:
+        return candidate_index[candidate_id]
+    except KeyError as exc:
+        raise ValueError(f"stable-search summary winner is not a rollover candidate: {candidate_id}") from exc
+
+
+def _rollover_decision_status(summary: Mapping[str, Any]) -> str:
+    decision = summary.get("decision")
+    if not isinstance(decision, Mapping):
+        raise ValueError("stable-search summary decision must be a mapping")  # noqa: TRY004 - preserve validation API
+    status = decision.get("status")
+    if not isinstance(status, str) or not status.strip():
+        raise ValueError("stable-search summary decision.status must be a non-empty string")
+    return status
+
+
 def _stderr() -> Any:
     import sys
 
@@ -473,6 +888,72 @@ def _build_runner(campaign: Campaign, *, model_endpoint: str | None) -> KorvidRu
         timeout_seconds=campaign.bridge_timeout_seconds,
         model_endpoint=model_endpoint,
     )
+
+
+def _build_stable_search_campaign(manifest: ScenarioManifest) -> Campaign:
+    return Campaign(
+        schema_version=1,
+        campaign_id=_STABLE_SEARCH_CAMPAIGN_ID,
+        repetitions=_STABLE_SEARCH_REPETITIONS,
+        models=(_STABLE_SEARCH_MODEL,),
+        cases=_stable_search_cases(manifest),
+        serving=KorvidReadonlyServing(
+            backend="korvid_readonly",
+            provider="ollama",
+            base_url=_require_env_url("KORVID_READONLY_BASE_URL"),
+            profile=_STABLE_SEARCH_PROFILE,
+            timeout_seconds=_STABLE_SEARCH_TIMEOUT_SECONDS,
+        ),
+    )
+
+
+def _stable_search_cases(manifest: ScenarioManifest) -> tuple[EvalCase, ...]:
+    catalog = _bundled_eval_cases()
+    cases: list[EvalCase] = []
+    seen: set[str] = set()
+    for assignment in manifest.assignments:
+        if assignment.scenario_id in seen:
+            continue
+        try:
+            scenario = catalog[assignment.scenario_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"installed Korvid scenario catalog is missing {assignment.scenario_id!r}"
+            ) from exc
+        cases.append(
+            EvalCase(
+                case_id=assignment.scenario_id,
+                template_id=f"stable-search-{assignment.split}",
+                prompt=scenario.question,
+                models=(_STABLE_SEARCH_MODEL,),
+            )
+        )
+        seen.add(assignment.scenario_id)
+    if not cases:
+        raise ValueError("stable-search scenario manifest must contain at least one case")
+    return tuple(cases)
+
+
+def _bundled_eval_cases() -> dict[str, Any]:
+    directory = bundled_scenarios_dir()
+    if not directory.is_dir():
+        raise ValueError(f"korvid bundled scenarios directory not found: {directory}")
+    catalog: dict[str, Any] = {}
+    for path in sorted(directory.glob("*.yaml")):
+        scenario = load_scenario(path)
+        if scenario.id in catalog:
+            raise ValueError(
+                f"installed Korvid scenario catalog contains duplicate id: {scenario.id}"
+            )
+        catalog[scenario.id] = scenario
+    return catalog
+
+
+def _require_env_url(name: str) -> str:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        raise ValueError(f"missing environment variable {name}")
+    return value
 
 
 def _load_candidate_campaign(

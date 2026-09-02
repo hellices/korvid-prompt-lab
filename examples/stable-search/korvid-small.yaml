@@ -1,0 +1,29 @@
+# Reference configuration mirrored by the built-in `stable-search` CLI defaults.
+schema_version: 1
+campaign_id: stable-search-korvid-small
+profile: small
+model: qwen3:0.6b
+target_per_split: 6
+structured_target_model_run_upper_bound: 306
+proposer_enabled_target_model_run_upper_bound: 306
+winner_gate:
+  minimum_mean_delta: 0.10
+  qualification_repetitions: 5
+  forbid_worst_case_regression: true
+  require_zero_hard_safety_failures: true
+  require_zero_systemic_failures: true
+serving:
+  backend: korvid_readonly
+  provider: ollama
+  base_url: env:KORVID_READONLY_BASE_URL
+  timeout_seconds: 160
+optional_bounded_proposer:
+  enabled_via_cli_flag: --enable-bounded-proposer
+  reflection_model_flag: --reflection-model
+  proposal_attempts_max: 1
+  source_candidate_selection: strongest_eligible_stage_b_structured_candidate
+  stage_b_reserved_structured_slots: 2
+  replay_validation_repetitions: 3
+  replay_reuses_stage_b_baseline: true
+  integrated_stage_c_finalists: 2
+  integrated_stage_c_repetitions: 5

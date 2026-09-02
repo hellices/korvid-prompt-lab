@@ -109,6 +109,86 @@ uv run --python 3.12 korvid-prompt-lab optimize \
 seed fingerprint, and `best_candidate_differs_from_seed` so a silent no-op search
 is visible in the artifact.
 
+### Stable search
+
+`stable-search` is the bounded read-only campaign for the installed Korvid
+`small` prompt. It materializes the installed `korvid-baseline-small` candidate,
+discovers train/validation/milestone splits from the installed scenario catalog,
+builds the structured append matrix, and runs the staged search through
+`KorvidReadonlyRunner` against `KORVID_READONLY_BASE_URL`.
+
+- the artifact root is required and must be fresh; an existing directory is refused
+- the default structured-search upper bound is `306` target-model runs (`54 + 72 + 180`)
+- the final JSON decision is always `promote` or `no_stable_winner`; systemic
+  runner failures abort instead of being normalized into a decision
+- `--enable-bounded-proposer --reflection-model ...` attempts at most one bounded
+  proposal from the strongest eligible Stage B structured candidate
+- proposer-enabled runs keep the same `306` bound by reserving one Stage B slot:
+  baseline + top2 structured run first, at most one proposed candidate reuses the
+  existing Stage B baseline for its own 3-repetition validation replay, then the
+  merged top2 finalists run through the normal single Stage C validation+milestone
+  gate once
+- proposer provider/configuration errors are recorded in the summary `extension`
+  block as sanitized labels, never raw provider messages, and the structured
+  finalists continue through the normal Stage C flow
+
+Reference defaults live in `examples/stable-search/korvid-small.yaml`.
+
+Local endpoint:
+
+```bash
+export KORVID_READONLY_BASE_URL=http://127.0.0.1:11434
+
+uv run --python 3.12 korvid-prompt-lab stable-search \
+  --artifact-root artifacts/stable-search/local-qwen3-0.6b \
+  --target-per-split 6 \
+  --json
+```
+
+AKS shared-runner endpoint:
+
+```bash
+az aks get-credentials --resource-group rg-pension-guard --name aks-shared-runners
+kubectl -n ollama port-forward svc/ollama 41001:11434
+
+export KORVID_READONLY_BASE_URL=http://127.0.0.1:41001
+
+uv run --python 3.12 korvid-prompt-lab stable-search \
+  --artifact-root artifacts/stable-search/aks-qwen3-0.6b \
+  --target-per-split 6 \
+  --enable-bounded-proposer \
+  --reflection-model ollama_chat/qwen3:4b \
+  --json
+```
+
+### Stable search rollover
+
+`stable-search-rollover` continues from a reviewed `no_stable_winner`
+stable-search artifact root without ever feeding fresh milestone data back into
+candidate generation. The v2 milestone becomes development evidence; v3 draws a
+fresh six-scenario milestone from the untouched catalog and leaves one
+additional untouched scenario as audit reserve.
+
+```bash
+uv run korvid-prompt-lab stable-search-rollover \
+  --prior-artifact-root artifacts/stable-search-v2 \
+  --artifact-root artifacts/stable-search-v3 \
+  --winner-output artifacts/korvid-small-v3-winner.yaml \
+  --json
+```
+
+The rollover output root writes the normal stable-search artifacts plus a
+bounded `rollover-lineage.json` with only digests, counts, and terminal reason.
+It never stores raw answers, raw errors, scenario questions, fixture state, or
+endpoint values. After v3, another qualification campaign is forbidden unless
+the Korvid scenario bank expands: v2 has already consumed the old milestone and
+v3 consumes six of the seven remaining untouched scenarios.
+
+Promotion requires both validation and milestone mean deltas `>= 0.10`, five
+repetitions per case, no worst-case regression, and zero safety/systemic
+failures. If no finalist clears that gate, the correct outcome is
+`no_stable_winner`.
+
 #### Run identity, seeds, and contamination safety
 
 GEPA resumes any `gepa_state.bin` it finds in its `run_dir`. A shared, stable

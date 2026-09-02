@@ -215,3 +215,50 @@ SELF-REVIEW:
 - `sanitize_import_error()` now scrubs secret-bearing structured captures and the `error.name` fallback path while preserving the safe `module: missing-name` shape.
 - Default-branch provenance now has its own invariant: successful default-branch compare status and no PR-only fields. Open-PR provenance is validated to require its route-specific fields.
 - The verifier no longer assumes PR data exists for default-branch provenance, but still fails closed if an open-PR route ever needs a missing `pull_request` declaration.
+
+---
+
+## Task 1: Stable Candidate Matrix
+
+### RED
+- Command: `uv run --python 3.12 pytest -q tests/test_stable_candidates.py`
+- Output: `ModuleNotFoundError: No module named 'korvid_prompt_lab.stable_candidates'`
+
+### GREEN
+- Command: `uv run --python 3.12 pytest -q tests/test_stable_candidates.py`
+- Output: `2 passed in 0.05s`
+- Lint: `uv run --python 3.12 ruff check src/korvid_prompt_lab/stable_candidates.py tests/test_stable_candidates.py` → passed
+
+### Files Changed
+- `src/korvid_prompt_lab/stable_candidates.py`
+- `tests/test_stable_candidates.py`
+
+### Commit SHA
+- `6367f45`
+
+### Self-Review Concerns
+- Candidate IDs are readable and deterministic, but a later stage could prefer a different naming prefix.
+- Baseline system text is preserved byte-for-byte; append text is canonical and stays under 480 chars.
+
+## Task 1 Review Fixes
+
+### RED
+- Command: `uv run --python 3.12 pytest -q tests/test_stable_candidates.py`
+- Output: 4 failures (`metadata` not preserved; baselines with `append`/`tool.*` not rejected)
+
+### GREEN
+- Command: `uv run --python 3.12 pytest -q tests/test_stable_candidates.py`
+- Output: `5 passed in 0.03s`
+- Lint: `uv run --python 3.12 ruff check src/korvid_prompt_lab/stable_candidates.py tests/test_stable_candidates.py` → passed
+
+### Files Changed
+- `src/korvid_prompt_lab/stable_candidates.py`
+- `tests/test_stable_candidates.py`
+- `.superpowers/sdd/task-1-report.md`
+
+### Commit SHA
+- `c809d659bf83f34c5046153987f9bfde0b532b4f`
+
+### Self-Review Concerns
+- The matrix is intentionally closed over the four documented axes; any future axis expansion will need a matching spec/test update.
+- The fail-closed guard now rejects any non-system baseline component, including historical append/tool additions.

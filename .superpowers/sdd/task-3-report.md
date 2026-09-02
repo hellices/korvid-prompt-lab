@@ -1,159 +1,158 @@
-# Task 3 Report: Deterministic Campaign State Transitions
+# Task 3 Report: Stable Ranking and Qualification
 
-## Status: COMPLETE ✅
+## Status
+
+Complete.
 
 ## Commits
-- `ee923fc` — feat(campaigns): add bounded campaign state machine
 
-## Files Modified
-- `src/korvid_prompt_lab/campaigns.py` — Added state machine types and functions
-- `tests/test_campaign_state.py` — 17 focused tests (new file)
+- `de4912d` — `feat(search): add stable winner qualification`
 
-## RED/GREEN Evidence
+## Summary
 
-**RED phase:** Tests initially failed with `ImportError` for missing `CampaignStatus`, `ActionKind`, etc.
+Implemented the pure stable-ranking layer in
+`src/korvid_prompt_lab/stable_ranking.py` and covered it with focused TDD in
+`tests/test_stable_ranking.py`.
 
-**GREEN phase:**
+## Files
+
+- Added `src/korvid_prompt_lab/stable_ranking.py`
+- Added `tests/test_stable_ranking.py`
+
+## Implemented interfaces
+
+- `NormalizedRunRecord`
+- `CandidateMeasurement`
+- `RankedCandidate`
+- `StageDecision`
+- `QualificationCandidate`
+- `QualificationAssessment`
+- `QualificationDecision`
+- `measure_candidate(...)`
+- `rank_screening(...)`
+- `select_finalists(...)`
+- `qualify_winner(...)`
+
+## TDD evidence
+
+1. Wrote `tests/test_stable_ranking.py` before the module existed.
+2. Ran `uv run --python 3.12 pytest -q tests/test_stable_ranking.py`.
+3. Observed RED: `ModuleNotFoundError: No module named 'korvid_prompt_lab.stable_ranking'`.
+4. Implemented the minimal pure module.
+5. Re-ran the focused suite, fixed three real failures:
+   - population variance expectation mismatch;
+   - baseline worst-case fixture needed to match the validation gate intent;
+   - exact `0.10` threshold needed float-safe comparison.
+6. Re-ran the focused suite to GREEN.
+
+## Behavior covered
+
+- Stage A rejects hard-safety and systemic failures.
+- Stage A ranks by mean delta, worst-case delta, verification delta, then fewer
+  malformed/unresolvable tool-call problems.
+- `measure_candidate(...)` aggregates normalized per-run records into the exact
+  summary Task 4 needs.
+- Stage B rejects non-positive mean delta, worst-case regression, and any
+  safety/systemic failure.
+- Stage B tie-breaks on lower variance, then higher `pass_at_3`.
+- Qualification requires five repetitions per case on all paired measurements.
+- Qualification rejects any worst-case regression.
+- Qualification accepts the exact `+0.10` mean-delta boundary.
+- Qualification reports explicit `no_stable_winner` reasons, including
+  per-finalist reason prefixes when multiple finalists fail.
+
+## Purity / dependency review
+
+Self-review confirmed the new module imports only stdlib modules:
+`math`, `collections`, `collections.abc`, `dataclasses`, `statistics`, and
+`typing`. It does not import filesystem helpers, runners, AKS code, or DSPy.
+
+## Verification
+
+Focused commands executed successfully:
+
+```bash
+uv run --python 3.12 pytest -q tests/test_stable_ranking.py
+uv run --python 3.12 ruff check src/korvid_prompt_lab/stable_ranking.py tests/test_stable_ranking.py
+uv run --python 3.12 mypy --python-version 3.12 src/korvid_prompt_lab/stable_ranking.py tests/test_stable_ranking.py
 ```
-$ uv run --python 3.12 pytest tests/test_campaign_state.py tests/test_campaigns.py -q
-54 passed in 0.26s
 
-$ uv run --python 3.12 ruff check src/korvid_prompt_lab/campaigns.py tests/test_campaign_state.py
-All checks passed!
+Latest results:
 
-$ uv run --python 3.12 mypy src/korvid_prompt_lab/campaigns.py
-Success: no issues found in 1 source file
-```
+- `pytest`: `11 passed in 0.06s`
+- `ruff`: `All checks passed!`
+- `mypy`: `Success: no issues found in 2 source files`
 
-## State Invariants
-1. `state_hash(state)` is deterministic SHA-256 over sorted-key compact JSON
-2. `advance_state` rejects any action whose `expected_state_hash` doesn't match current state
-3. SYSTEM_ERROR increments `retries_used` and `elapsed_seconds` only; never `metric_calls_used`
-4. Promotion requires: different fingerprint, no hard-safety regression, no core regression, strictly better rank
-5. Tie-break is full lexicographic fingerprint comparison (embedded in rank key tuple)
-6. Milestone/confirmation evidence does not affect GEPA candidate ranking
-7. Confirmation failure → NOT_CONVERGED (never publishes)
-8. Terminal states: QUALIFIED, NOT_CONVERGED, SYSTEM_ERROR — `next_action` returns None
+## Self-review notes
 
-## Self-Review
-- All brief requirements implemented
-- Immutable frozen+slotted dataclasses throughout
-- No network/filesystem/GitHub side effects in state machine
+- The qualification API supports both a single paired candidate call and the
+  ranked-finalists sequence Task 4 needs.
+- `QualificationDecision.assessments` preserves ordered evidence for artifact
+  writing even when there is no winner.
+- The exact `0.10` boundary uses a tiny absolute tolerance so decimal
+  round-off does not misclassify a true boundary pass.
 
 ## Concerns
-- Multi-tier re-entry (creating fresh state for tier 1+) left to orchestrator layer
-- `confirmation_runs > 1` not explicitly iterated in tests
+
+- The module currently treats any normalized status other than `completed` and
+  `model_failure` as systemic evidence. That matches the design’s fail-closed
+  intent, but Task 4 should keep feeding canonical normalized statuses only.
 
 ---
 
-## Review Fix (2026-08-26)
+## Review Fix (2026-09-01)
 
-### Status: DONE
+### Status
 
-### Commit
-- `65d204c` — fix(campaigns): address review findings for state machine
-
-### Findings Addressed
-1. **Action validation**: `_validate_action()` verifies action_id, kind, tier/stage/seed cursors, metric_calls against `next_action()` output. Forged/replayed actions raise ValueError.
-2. **confirmation_runs>1**: Loop until `confirmations_passed >= control.confirmation_runs`. Tested with confirmation_runs=2.
-3. **Tier rollover**: Non-final tier qualification resets champion, stage/seed, stagnation, retries, milestone/confirmation to initial. Preserves metric_calls_used, elapsed. Records TierResult.
-4. **CONFIG_ERROR**: Terminates as SYSTEM_ERROR with `stop_reason="config_error: ..."`.
-5. **Equal-score no-promote**: `_is_strictly_better()` uses core dimensions only (no fingerprint). Equal scores → stagnation.
-6. **metric_calls accounting**: Uses `action.metric_calls` (from stage definition), not +1. Tested exact increments.
-7. **Wall-clock crossing on SYSTEM_ERROR**: Checked in system_error branch → terminal SYSTEM_ERROR.
-8. **Tests replaced**: Removed equal-score promotion test, added forged-kind/id/cursor, stale replay, confirmation_runs=2, tier rollover, config_error, exact metric increments, wall-clock-crossing system error.
-
-### RED/GREEN Evidence
-```
-$ uv run --python 3.12 pytest tests/test_campaign_state.py tests/test_campaigns.py -q
-62 passed in 0.21s
-
-$ uv run --python 3.12 ruff check src/korvid_prompt_lab/campaigns.py tests/test_campaign_state.py
-All checks passed!
-
-$ uv run --python 3.12 mypy src/korvid_prompt_lab/campaigns.py
-Success: no issues found in 1 source file
-```
-
-### Self-Review
-- All 8 findings resolved with test coverage
-- Pure function boundary maintained (no global state, no side effects)
-- Task 2 manifest APIs preserved (OptimizationCampaign, SearchStage, ModelTier, load_optimization_campaign unchanged)
-- Immutable frozen+slotted dataclasses throughout
-
-### Concerns
-- None blocking. Milestone/confirm metric_calls set to 0 (free operations per the action's declared accounting contract). If the orchestrator needs non-zero cost for these, the action.metric_calls field is ready.
-
----
-
-## Review Fix Wave 2 (2026-08-26)
-
-### Status: DONE
+Complete.
 
 ### Commit
-- `f416c32` — fix(campaigns): correct qualification gate, tier rollover, and budget semantics
 
-### Corrected Semantics
-1. **Qualification/tier**: Success on ANY tier → campaign QUALIFIED. Never rolls to larger model after success.
-2. **Qualification gate**: `_passes_qualification_gate()` requires `hard_safety_failures=0`, `core_regression=False`, `pass_at_3=1.0`, `pass_at_5=1.0`. Milestone only sets `milestone_passed=True` when gate passes.
-3. **Tier exhaustion**: Milestone fail or confirmation fail → `_handle_tier_failure()` records `TierResult(NOT_CONVERGED)`, rolls to next tier (fresh champion/stage/seed/stagnation/retry/milestone/confirm), preserves campaign-wide metric_calls/elapsed. Final tier → campaign NOT_CONVERGED.
-4. **Budget accounting**: Uniform `new_metric_calls = state.metric_calls_used + action.metric_calls` before status check for ALL evidence kinds. Milestone/confirm with `metric_calls=0` add zero. Budget exceeded during milestone/confirm → NOT_CONVERGED.
-5. **Replay semantics**: Pure deterministic `_validate_action` with CAS on `expected_state_hash`. No global mutable state. Test named `test_stale_action_replay_against_advanced_state` — two workers compute same transition, only one persisted state hash matches.
-6. **New tests**: `test_milestone_gate_pass_at_3_failure_rejects`, `test_milestone_gate_hard_safety_rejects`, `test_qualification_tier0_success_qualifies_campaign`, `test_confirmation_failure_rolls_to_next_tier`, `test_milestone_failure_rolls_to_next_tier`, `test_final_tier_failure_not_converged`, `test_milestone_confirm_metric_accounting_uniform`, `test_wall_clock_crossing_during_milestone_terminates`, `test_wall_clock_crossing_during_confirm_terminates`.
+- `aa936cd` — `fix(search): enforce exact stable qualification counts`
 
-### RED/GREEN Evidence
-```
-$ uv run --python 3.12 pytest tests/test_campaign_state.py tests/test_campaigns.py -q
-67 passed in 0.19s
+### Findings addressed
 
-$ uv run --python 3.12 ruff check src/korvid_prompt_lab/campaigns.py tests/test_campaign_state.py
-All checks passed!
+1. **Exact five repetitions per case**
+   - `measure_candidate(...)` now rejects uneven per-case counts instead of
+     collapsing to `min(...)`.
+   - `CandidateMeasurement` now carries `per_case_repetition_counts`.
+   - qualification rejects measurements with counts above five through
+     `*_repetitions_not_exactly_5`.
+2. **Fail-closed unsafe baselines**
+   - `rank_screening(...)` and `select_finalists(...)` now abort when the paired
+     baseline has any hard-safety or systemic failures.
 
-$ uv run --python 3.12 mypy src/korvid_prompt_lab/campaigns.py
-Success: no issues found in 1 source file
-```
+### RED → GREEN evidence
 
-### Self-Review
-- All 6 review findings addressed with exact test coverage
-- Pure function boundary preserved — no global state, no side effects
-- Task 2 manifest APIs unchanged (OptimizationCampaign/SearchStage/ModelTier/load_optimization_campaign)
-- Tier rollover resets all tier-local state while preserving campaign-wide budget/time
+- Added regression tests for uneven `[5, 6, 6]` counts.
+- Added regression tests for invalid screening baselines:
+  `hard_safety_failures` and `systemic_failures`.
+- Added regression tests for invalid finalist-selection baselines:
+  `hard_safety_failures` and `systemic_failures`.
+- Added regression test for uniform `6` repetitions being rejected during
+  qualification.
+- RED run: `6 failed, 11 passed`.
+- GREEN run: `17 passed`.
 
-### Concerns
-- None blocking.
+### Verification
 
----
-
-## Review Fix Wave 3 (2026-08-26)
-
-### Status: DONE
-
-### Commit
-- `62d92d6` — fix(campaigns): add systemic_failures, evidence binding, stagnation rollover, model identity
-
-### Changes
-1. **systemic_failures**: New validated non-negative int field on CampaignScore. `__post_init__` rejects bool/negative. `_is_strictly_better()` blocks promotion when systemic>0. `_passes_qualification_gate()` requires systemic==0.
-2. **Evidence fingerprint binding**: MILESTONE/CONFIRM `advance_state` raises ValueError if `outcome.score.fingerprint != state.champion_fingerprint`. Fail-closed, can never set milestone_passed/QUALIFIED.
-3. **Stagnation rollover**: Stagnation at limit uses `_handle_tier_exhaustion()` (same helper as milestone/confirm failure). Non-final tier records TierResult(NOT_CONVERGED) and rolls; final tier ends campaign NOT_CONVERGED.
-4. **ModelIdentity**: New frozen dataclass (name/model/digest). `initial_state` derives from `control.model_tiers[0]`. Rollover replaces from next tier. Included in state_hash. `_validate_model_identity` called in `next_action`/`_validate_action` — tampered identity raises ValueError.
-5. **Tests**: 34 state-machine tests covering all new behaviors.
-
-### RED/GREEN Evidence
-```
-$ uv run --python 3.12 pytest tests/test_campaign_state.py tests/test_campaigns.py -q
-71 passed in 0.50s
-
-$ uv run --python 3.12 ruff check src/korvid_prompt_lab/campaigns.py tests/test_campaign_state.py
-All checks passed!
-
-$ uv run --python 3.12 mypy src/korvid_prompt_lab/campaigns.py
-Success: no issues found in 1 source file
+```bash
+uv run --python 3.12 pytest -q tests/test_stable_ranking.py
+uv run --python 3.12 ruff check src/korvid_prompt_lab/stable_ranking.py tests/test_stable_ranking.py
+uv run --python 3.12 mypy --python-version 3.12 src/korvid_prompt_lab/stable_ranking.py tests/test_stable_ranking.py
 ```
 
-### Self-Review
-- All 5 findings resolved with exact test coverage
-- Pure function boundary preserved
-- Task 2 manifest APIs unchanged
+Latest results at report update:
 
-### Concerns
-- None blocking.
+- `pytest`: `17 passed in 0.04s`
+- `ruff`: `All checks passed!`
+- `mypy`: `Success: no issues found in 2 source files`
+
+### Self-review
+
+- The new baseline guard is stage-local and does not change candidate ranking
+  semantics once a baseline is valid.
+- Uneven repetition counts now fail at measurement time with the actual count
+  vector preserved in the exception message.
+- Uniform counts above five stay measurable but are rejected by qualification,
+  which preserves Task 4’s ability to record evidence without promoting it.

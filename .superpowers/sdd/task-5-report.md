@@ -2,87 +2,149 @@
 
 ## Status
 
-PASS — exactly one planned AKS action is bound, executed, classified, and
-advanced through one cooperative-CAS transition.
+PASS — bounded one-axis append refinement now validates canonical output, strips only bounded feedback, and safely drops timeout/validation failures.
 
 ## Commit
 
-- `6c1c970` — `feat(campaigns): execute one holdout-safe action`
-- `cbd3fcd` — `fix(campaigns): safely classify campaign evidence`
-- `8c953b5` — `fix(workflow): gate GEPA budget to optimization`
+- `edc7a5f` — `feat(search): add bounded append proposer`
 
-## RED / GREEN
+## Tests
 
-- RED: campaign CLI rejected `--outcome-kind`; grounding still required
-  singular split variables; the campaign-step wrapper did not exist.
-- RED: scoped evaluation rejected planned split metadata outside the selected
-  validation cases.
-- RED: system/config retry accounting, reflection preflight classification,
-  and evaluation-campaign evidence identity tests failed.
-- RED (review fix): milestone/confirm rejected the controller's zero GEPA
-  budget, standalone evaluate required campaign action metadata, and malformed
-  evidence could fail before state advancement.
-- GREEN (review fix): real wrapper process tests reach exact milestone-only
-  evaluation with no optimize; missing, malformed, and contradictory evidence
-  preflight into exactly one SYSTEM_ERROR advance.
-- GREEN: all focused process, workflow, controller-boundary, and CLI tests pass.
-
-## Verification
-
-```text
-uv run --python 3.12 pytest tests/test_grounding_script.py tests/test_grounding_workflow.py tests/test_optimization_campaign_script.py tests/test_campaign_artifacts.py tests/test_campaign_cli.py tests/test_cli.py -q
-# 262 passed in 72.80s
-
-bash -n scripts/run-grounding-round.sh scripts/run-optimization-campaign-step.sh
-
-uv run --python 3.12 ruff check src/korvid_prompt_lab/campaign_cli.py src/korvid_prompt_lab/cli.py src/korvid_prompt_lab/campaign_artifacts.py tests/test_campaign_cli.py tests/test_cli.py tests/test_campaign_artifacts.py tests/test_grounding_script.py tests/test_grounding_workflow.py tests/test_optimization_campaign_script.py
-# All checks passed!
-
-uv run --python 3.12 mypy src/korvid_prompt_lab/campaign_cli.py src/korvid_prompt_lab/cli.py src/korvid_prompt_lab/campaign_artifacts.py
-# Success: no issues found in 3 source files
-```
-
-## Holdout proof
-
-- SEARCH receives repeated train/validation IDs and exact validation
-  `--case-id` values.
-- SEARCH optimize/evaluate subprocesses receive no milestone argv and run with
-  `GROUNDING_MILESTONE_CASE_IDS` removed from their environment.
-- MILESTONE/CONFIRM select exact milestone `--case-id` values and use
-  evaluate-only mode without exporting or passing a GEPA budget.
-- Split emptiness, duplicates, pairwise overlap, unknown IDs, and scope/action
-  mismatch fail before node-pool inspection.
-- Live selected-tier digest validation runs after AKS readiness and before seed
-  evaluation, optimization, or reflection.
-
-## Exit, CAS, and cleanup invariants
-
-- Grounding evidence exits are only `0`/`1`; systemic/config failures are `70`.
-- Grounding exit `70` advances SYSTEM_ERROR directly. Exit `0`/`1` first uses
-  read-only `validate-evidence`; validation failures advance SYSTEM_ERROR once
-  against the unchanged prior state.
-- A failure after successful evidence pre-validation is ambiguous and fails
-  closed without a fallback advance, preventing double advancement.
-- Optimizer failure never falls back to the seed.
-- System errors increment retry count without metric/score movement; config
-  errors are terminal without budget or retry consumption.
-- The wrapper invokes the Grounding round at most once and `advance` once.
-- Explicit expected-prior hash is checked before execution and again by
-  `korvid-campaign advance`.
-- Existing Grounding traps restore only capacity allocated by the round on
-  success, hard-safety failure, systemic failure, digest mismatch, and signal.
-
-## Self-review
-
-- Confirmed no singular split environment names remain in workflow/script.
-- Confirmed milestone flags occur only in the non-SEARCH evaluation branch.
-- Restored standalone workflow default `round_type=evaluate`; campaign action
-  metadata and GEPA budget are absent from ordinary evaluate execution.
-- Corrected evidence campaign identity to bind the evaluation campaign while
-  action ID/CAS bind evidence to the optimization controller.
-- Confirmed the pre-existing `.superpowers/sdd/progress.md` change was not
-  staged or modified by Task 5.
+- `uv run --python 3.12 pytest -q tests/test_reflection.py tests/test_stable_proposer.py`
+- `uv run --python 3.12 pytest -q tests/test_optimize.py`
+- `uv run --python 3.12 ruff check src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py tests/test_stable_proposer.py`
+- `uv run --python 3.12 mypy src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py`
 
 ## Concerns
 
-None.
+- Pre-existing unrelated workspace edits remain in `.superpowers/sdd/progress.md` and `.superpowers/sdd/task-2-report.md`.
+
+## Review Fix
+
+PASS — restored generic reflection rewrites above 480 chars, made bounded proposer serialization aggregate-only, and rejected noncanonical finalist append whitespace.
+
+## Commit
+
+- `415b392` — `fix(search): tighten bounded append proposer`
+
+## Tests
+
+- `uv run --python 3.12 pytest -q tests/test_reflection.py tests/test_stable_proposer.py tests/test_optimize.py`
+- `uv run --python 3.12 ruff check src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py tests/test_reflection.py tests/test_stable_proposer.py`
+- `uv run --python 3.12 mypy src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py`
+
+## Review Fix 8
+
+PASS — entrypoint revalidation now rejects forged exact-type requests before serialization, and malformed bounded_feedback inputs surface as ValueError so safe_propose returns None.
+
+## Commit
+
+- `55877a5` — `fix(search): tighten bounded entry validation`
+
+## Tests
+
+- `uv run pytest tests/test_reflection.py tests/test_optimize.py tests/test_stable_proposer.py`
+- `uv run ruff check src tests`
+- `uv run mypy src`
+
+## Concerns
+
+- None.
+
+## Review Fix 9
+
+PASS — reusable entry validation now requires repetitions_per_case to be positive, and both direct and forged zero-valued cases are rejected before serialization.
+
+## Commit
+
+- `410b58f` — `fix(search): require positive repetitions per case`
+
+## Tests
+
+- `uv run pytest tests/test_reflection.py tests/test_optimize.py tests/test_stable_proposer.py`
+- `uv run ruff check src tests`
+- `uv run mypy src`
+
+## Review Fix 4
+
+PASS — narrowed safe_propose to concrete LiteLLM transient failures only; AuthenticationError and BadRequestError now propagate.
+
+## Commit
+
+- `0fd8d05` — `fix(search): narrow liteLLM failure handling`
+
+## Tests
+
+- `uv run --python 3.12 pytest -q tests/test_reflection.py tests/test_stable_proposer.py tests/test_optimize.py`
+- `uv run --python 3.12 ruff check src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py tests/test_reflection.py tests/test_stable_proposer.py`
+- `uv run --python 3.12 mypy src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py`
+
+## Review Fix 5
+
+PASS — direct BoundedAppendProposalRequest construction now rejects non-BoundedAggregateFeedback payloads, and bounded metrics validate finite/unit/nonnegative bounds before serialization.
+
+## Commit
+
+- `a0480c1` — `fix(search): validate bounded aggregate feedback`
+
+## Tests
+
+- `uv run --python 3.12 pytest -q tests/test_reflection.py tests/test_stable_proposer.py tests/test_optimize.py`
+- `uv run --python 3.12 ruff check src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py tests/test_reflection.py tests/test_stable_proposer.py`
+- `uv run --python 3.12 mypy src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py`
+
+## Review Fix 6
+
+PASS — mean_verification now enforces [0,1], and bounded_feedback must be exactly BoundedAggregateFeedback so subclass fields cannot leak.
+
+## Commit
+
+- `e64efb9` — `fix(search): enforce bounded feedback exact type`
+
+## Tests
+
+- `uv run --python 3.12 pytest -q tests/test_reflection.py tests/test_stable_proposer.py tests/test_optimize.py`
+- `uv run --python 3.12 ruff check src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py tests/test_reflection.py tests/test_stable_proposer.py`
+- `uv run --python 3.12 mypy src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py`
+
+## Review Fix 3
+
+PASS — bounded proposer now catches only explicit built-in and LiteLLM transport/runtime failures; RuntimeError, PermissionError, and TypeError propagate.
+
+## Commit
+
+- `0cbee00` — `fix(search): narrow bounded proposer failures`
+
+## Tests
+
+- `uv run --python 3.12 pytest -q tests/test_reflection.py tests/test_stable_proposer.py tests/test_optimize.py`
+- `uv run --python 3.12 ruff check src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py tests/test_reflection.py tests/test_stable_proposer.py`
+- `uv run --python 3.12 mypy src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py`
+
+## Review Fix 7
+
+PASS — propose() now fails closed on forged request shapes before serialization, and safe_propose converts entrypoint validation errors to None.
+
+## Commit
+
+- `2b3161b` — `fix(search): harden bounded proposer entrypoint`
+
+## Tests
+
+- `uv run --python 3.12 pytest -q tests/test_reflection.py tests/test_stable_proposer.py tests/test_optimize.py`
+- `uv run --python 3.12 ruff check src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py tests/test_reflection.py tests/test_stable_proposer.py`
+- `uv run --python 3.12 mypy src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py`
+
+## Review Fix 2
+
+PASS — safe_propose now isolates expected LM/runtime/transport failures without swallowing TypeError or other programming bugs.
+
+## Commit
+
+- `10d899d` — `fix(search): isolate bounded proposer failures`
+
+## Tests
+
+- `uv run --python 3.12 pytest -q tests/test_reflection.py tests/test_stable_proposer.py tests/test_optimize.py`
+- `uv run --python 3.12 ruff check src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py tests/test_reflection.py tests/test_stable_proposer.py`
+- `uv run --python 3.12 mypy src/korvid_prompt_lab/reflection.py src/korvid_prompt_lab/stable_proposer.py`
