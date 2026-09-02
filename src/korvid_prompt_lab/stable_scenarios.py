@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from functools import lru_cache
@@ -13,10 +13,13 @@ from korvid.evals.scenario import Scenario, bundled_scenarios_dir, load_scenario
 from .baseline import korvid_distribution_version
 
 __all__ = [
+    "FreshHoldoutExhaustedError",
+    "RolloverScenarioManifest",
     "ScenarioAssignment",
     "ScenarioClass",
     "ScenarioManifest",
     "ScenarioSplitSummary",
+    "build_rollover_scenario_manifest",
     "build_scenario_manifest",
 ]
 
@@ -60,6 +63,18 @@ class ScenarioManifest:
     split_summaries: tuple[ScenarioSplitSummary, ...]
 
 
+class FreshHoldoutExhaustedError(ValueError):
+    """Raised when the catalog cannot provide a fresh rollover holdout."""
+
+
+@dataclass(frozen=True, slots=True)
+class RolloverScenarioManifest:
+    manifest: ScenarioManifest
+    consumed_ids: tuple[str, ...]
+    fresh_milestone_ids: tuple[str, ...]
+    audit_reserve_ids: tuple[str, ...]
+
+
 @dataclass(frozen=True, slots=True)
 class _ScenarioRecord:
     scenario_id: str
@@ -77,6 +92,11 @@ _CLASS_ORDER: tuple[ScenarioClass, ...] = (
     ScenarioClass.SCHEDULING_RESOURCES,
     ScenarioClass.NETWORKING,
     ScenarioClass.STORAGE,
+)
+_ROLLOVER_MILESTONE_CLASS_ORDER: tuple[ScenarioClass, ...] = (
+    ScenarioClass.STORAGE,
+    ScenarioClass.SCHEDULING_RESOURCES,
+    ScenarioClass.NETWORKING,
 )
 
 _ROOT_CAUSE_TO_CLASS: dict[str, ScenarioClass] = {
@@ -124,10 +144,7 @@ _ID_PREFIX_TO_CLASS: tuple[tuple[str, ScenarioClass], ...] = (
 
 
 def build_scenario_manifest(target_per_split: int = 6) -> ScenarioManifest:
-    if isinstance(target_per_split, bool) or not isinstance(target_per_split, int):
-        raise TypeError("target_per_split must be a positive integer")
-    if target_per_split <= 0:
-        raise ValueError("target_per_split must be a positive integer")
+    _validate_target_per_split(target_per_split)
 
     korvid_version = korvid_distribution_version()
     records = tuple(_load_catalog(korvid_version))
@@ -192,6 +209,69 @@ def build_scenario_manifest(target_per_split: int = 6) -> ScenarioManifest:
     )
 
 
+def build_rollover_scenario_manifest(
+    consumed: Sequence[ScenarioAssignment],
+    *,
+    target_per_split: int = 6,
+) -> RolloverScenarioManifest:
+    _validate_target_per_split(target_per_split)
+
+    korvid_version = korvid_distribution_version()
+    records = tuple(_load_catalog(korvid_version))
+    if len(records) < 12:
+        raise ValueError("installed Korvid scenario catalog must contain at least 12 eligible scenarios")
+
+    consumed_records = _validate_consumed_records(consumed, records=records, korvid_version=korvid_version)
+    if len(consumed_records) < target_per_split * 2:
+        raise ValueError("rollover requires at least 12 consumed scenarios")
+
+    consumed_id_set = {record.scenario_id for record in consumed_records}
+    untouched_records = tuple(record for record in records if record.scenario_id not in consumed_id_set)
+    if len(untouched_records) < target_per_split + 1:
+        raise FreshHoldoutExhaustedError("fresh holdout exhausted")
+
+    fresh_buckets = _group_records_by_class(
+        untouched_records,
+        sort_key=lambda record: _rollover_sort_key(korvid_version, record.scenario_id),
+    )
+    milestone_records, remaining_fresh_buckets = _take_balanced_records(
+        fresh_buckets,
+        count=target_per_split,
+        class_order=_ROLLOVER_MILESTONE_CLASS_ORDER,
+    )
+    if len(milestone_records) < target_per_split:
+        raise FreshHoldoutExhaustedError("fresh holdout exhausted")
+
+    remaining_fresh_records = _flatten_grouped_records(remaining_fresh_buckets)
+    if not remaining_fresh_records:
+        raise FreshHoldoutExhaustedError("fresh holdout exhausted")
+
+    development_buckets = _group_records_by_class(consumed_records, sort_key=lambda record: record.sort_key)
+    train_records, remaining_development_buckets = _take_balanced_records(
+        development_buckets,
+        count=target_per_split,
+        class_order=_CLASS_ORDER,
+    )
+    validation_records, _ = _take_balanced_records(
+        remaining_development_buckets,
+        count=target_per_split,
+        class_order=_CLASS_ORDER,
+    )
+
+    manifest = _build_manifest(
+        korvid_version,
+        train=train_records,
+        validation=validation_records,
+        milestone=milestone_records,
+    )
+    return RolloverScenarioManifest(
+        manifest=manifest,
+        consumed_ids=tuple(record.scenario_id for record in consumed_records),
+        fresh_milestone_ids=manifest.milestone,
+        audit_reserve_ids=(remaining_fresh_records[0].scenario_id,),
+    )
+
+
 @lru_cache(maxsize=1)
 def _load_catalog(korvid_version: str) -> tuple[_ScenarioRecord, ...]:
     directory = bundled_scenarios_dir()
@@ -249,3 +329,134 @@ def _ordered_unique_classes(classes: Iterable[ScenarioClass]) -> tuple[ScenarioC
     for scenario_class in classes:
         unique[scenario_class] = None
     return tuple(unique)
+
+
+def _validate_target_per_split(target_per_split: int) -> None:
+    if isinstance(target_per_split, bool) or not isinstance(target_per_split, int):
+        raise TypeError("target_per_split must be a positive integer")
+    if target_per_split <= 0:
+        raise ValueError("target_per_split must be a positive integer")
+
+
+def _validate_consumed_records(
+    consumed: Sequence[ScenarioAssignment],
+    *,
+    records: Sequence[_ScenarioRecord],
+    korvid_version: str,
+) -> tuple[_ScenarioRecord, ...]:
+    catalog_by_id = {record.scenario_id: record for record in records}
+    seen_ids: set[str] = set()
+    matched: list[_ScenarioRecord] = []
+
+    for assignment in consumed:
+        if assignment.scenario_id in seen_ids:
+            raise ValueError("duplicate consumed scenario ids are not allowed")
+        seen_ids.add(assignment.scenario_id)
+
+        if assignment.korvid_version != korvid_version:
+            raise ValueError("consumed assignment korvid version must match the installed korvid version")
+
+        record = catalog_by_id.get(assignment.scenario_id)
+        if record is None:
+            raise ValueError(f"consumed scenario {assignment.scenario_id!r} was not found in the installed catalog")
+        if assignment.question_sha256 != record.question_sha256:
+            raise ValueError("consumed assignment question digest must match the installed catalog")
+        if assignment.fixture_sha256 != record.fixture_sha256:
+            raise ValueError("consumed assignment fixture digest must match the installed catalog")
+        matched.append(record)
+
+    return tuple(sorted(matched, key=lambda record: record.sort_key))
+
+
+def _rollover_sort_key(korvid_version: str, scenario_id: str) -> str:
+    return hashlib.sha256(f"rollover-v1:{korvid_version}:{scenario_id}".encode()).hexdigest()
+
+
+def _group_records_by_class(
+    records: Sequence[_ScenarioRecord],
+    *,
+    sort_key: Callable[[_ScenarioRecord], str],
+) -> dict[ScenarioClass, list[_ScenarioRecord]]:
+    grouped: dict[ScenarioClass, list[_ScenarioRecord]] = {scenario_class: [] for scenario_class in _CLASS_ORDER}
+    for record in records:
+        grouped[record.scenario_class].append(record)
+    for items in grouped.values():
+        items.sort(key=sort_key)
+    return grouped
+
+
+def _take_balanced_records(
+    grouped: dict[ScenarioClass, list[_ScenarioRecord]],
+    *,
+    count: int,
+    class_order: Sequence[ScenarioClass],
+) -> tuple[tuple[_ScenarioRecord, ...], dict[ScenarioClass, list[_ScenarioRecord]]]:
+    remaining = {scenario_class: items.copy() for scenario_class, items in grouped.items()}
+    selected: list[_ScenarioRecord] = []
+
+    while len(selected) < count:
+        progress = False
+        for scenario_class in class_order:
+            items = remaining[scenario_class]
+            if not items:
+                continue
+            selected.append(items.pop(0))
+            progress = True
+            if len(selected) == count:
+                break
+        if not progress:
+            break
+
+    return tuple(selected), remaining
+
+
+def _flatten_grouped_records(
+    grouped: dict[ScenarioClass, list[_ScenarioRecord]],
+) -> tuple[_ScenarioRecord, ...]:
+    return tuple(record for scenario_class in _CLASS_ORDER for record in grouped[scenario_class])
+
+
+def _build_manifest(
+    korvid_version: str,
+    *,
+    train: Sequence[_ScenarioRecord],
+    validation: Sequence[_ScenarioRecord],
+    milestone: Sequence[_ScenarioRecord],
+) -> ScenarioManifest:
+    split_records = {
+        "train": tuple(train),
+        "validation": tuple(validation),
+        "milestone": tuple(milestone),
+    }
+    split_summaries: list[ScenarioSplitSummary] = []
+    assignments: list[ScenarioAssignment] = []
+
+    for split in _SPLITS:
+        selected = split_records[split]
+        assignments.extend(
+            ScenarioAssignment(
+                scenario_id=record.scenario_id,
+                scenario_class=record.scenario_class,
+                split=split,
+                question_sha256=record.question_sha256,
+                fixture_sha256=record.fixture_sha256,
+                korvid_version=korvid_version,
+            )
+            for record in selected
+        )
+        split_summaries.append(
+            ScenarioSplitSummary(
+                split_name=split,
+                classes=_ordered_unique_classes(record.scenario_class for record in selected),
+                scenario_ids=tuple(record.scenario_id for record in selected),
+            )
+        )
+
+    return ScenarioManifest(
+        korvid_version=korvid_version,
+        assignments=tuple(assignments),
+        train=tuple(record.scenario_id for record in split_records["train"]),
+        validation=tuple(record.scenario_id for record in split_records["validation"]),
+        milestone=tuple(record.scenario_id for record in split_records["milestone"]),
+        split_summaries=tuple(split_summaries),
+    )
