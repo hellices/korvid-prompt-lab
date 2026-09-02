@@ -791,12 +791,27 @@ Never change the PR title/body to claim prompt improvement unless v3 produces
 a valid stable winner.
 
 ## Measured Results
+
 - Committed receipt: `docs/evidence/2026-09-03-stable-search-v3.json`.
-- Verified live retry used commit `96cb416` under new immutable root `stable-search-live-20260903-v3-retry-1`; the aborted `stable-search-live-20260903-v3` root remains preserved and untouched.
-- v3 retry-1 completed with decision `no_stable_winner`; per rollover contract this closes the milestone as `fresh_holdout_exhausted`. The persisted lineage terminal reason remained `no_stable_winner` and no winner YAML was written.
-- Stage B baseline `0.4444444` vs leader `evidence-linked-conclusion` `0.5324074` (`+0.0879630`), but worst-case delta `-0.0666667` triggered `worst_case_regressed`; validation therefore produced `0` finalists.
-- Stage C wrote only the empty qualification receipt (`0` candidates / `0` assessments, reason `no_finalists`); no fresh-milestone evaluation runs were executed.
-- Target-model calls observed: `126` / `306` budget; all `126` retained responses were `completed`; hard/systemic failures `0/0`.
+- v3 aborted with decision `system_error` and terminal reason `bridge_timeout_error` before any valid qualification result.
+- Recorded Stage A partial metrics before abort: `continue-before-uncertainty` calls `2` mean `0.0000000`; `decisive-read-first` calls `6` mean `0.1333333`; `korvid-baseline-small` calls `6` mean `0.0166667`.
+- Target-model calls observed before abort: `14` / `306` budget.
+- No winner YAML was written.
 - Model metadata: `qwen3:0.6b`, digest `sha256:7df6b6e09427a769808717c0a93cadc4ae99ed4eb8bf5ca557c90846becea435`, Ollama `0.33.2`, Korvid `0.3.0`.
-- Serving stayed healthy through the run: pre/post loopback probes matched the expected identity and the supervisor recorded `0` restarts.
-- AKS `modeleval` was restored to `count=0` / `Succeeded`; temporary kubeconfig, scratch directory, helper, draft lineage, and recorded port-forward PIDs were removed.
+- AKS `modeleval` restored to `count=0` / `Succeeded`; temporary kubeconfig removed and recorded port-forward processes exited.
+- No Stage B or Stage C aggregates exist because the run stopped in Stage A.
+- A non-holdout diagnostic reproduced the failure at the derived 5-second model request timeout, while the same neutral request completed in 13.784 seconds with a 120-second timeout. Model, pod, node, and port-forward health remained stable with no restarts or OOM events.
+- Root cause: the 160-second whole-process budget reserved 120 seconds for worst-case serving probes and divided the remainder across six small-profile iterations, leaving only 5 seconds per model request.
+- The stable-search whole-process budget is now 850 seconds, which preserves the existing probe and process-overhead reservations while allowing 120 seconds for each of the six model iterations.
+- Because the aborted attempt stopped in Stage A before any valid qualification result and never evaluated the fresh milestone, a full retry may use the same untouched milestone under a new immutable artifact root. The aborted root remains immutable evidence and must not be resumed or overwritten.
+
+### Retry 1
+
+- Committed receipt: `docs/evidence/2026-09-03-stable-search-v3-retry-1.json`.
+- The verified retry used commit `96cb416` under the new immutable root `stable-search-live-20260903-v3-retry-1`.
+- The retry completed with decision `no_stable_winner`; per the rollover contract this closes the milestone as `fresh_holdout_exhausted`. No winner YAML was written.
+- Stage B baseline `0.4444444` vs leader `evidence-linked-conclusion` `0.5324074` (`+0.0879630`), but worst-case delta `-0.0666667` triggered `worst_case_regressed`, leaving zero finalists.
+- Stage C wrote only the empty qualification receipt (`0` candidates, `0` assessments, reason `no_finalists`); no fresh-milestone evaluation runs were executed.
+- Target-model calls observed: `126` / `306`; all retained responses completed, with hard/systemic failures `0/0`.
+- Pre/post serving probes matched the expected model identity, and the port-forward supervisor recorded zero restarts.
+- AKS `modeleval` was restored to `count=0` / `Succeeded`; temporary kubeconfig, scratch data, helper, draft lineage, and recorded port-forward processes were removed.
