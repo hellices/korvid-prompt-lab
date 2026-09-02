@@ -10,12 +10,24 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml  # type: ignore[import-untyped]
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from korvid_prompt_lab import stable_rollover
 from korvid_prompt_lab.contracts import Candidate
-from korvid_prompt_lab.stable_rollover import load_prior_campaign_evidence
-from korvid_prompt_lab.stable_scenarios import ScenarioAssignment, ScenarioClass
+from korvid_prompt_lab.stable_rollover import (
+    PriorCampaignEvidence,
+    PriorFinalistEvidence,
+    load_prior_campaign_evidence,
+)
+from korvid_prompt_lab.stable_scenarios import (
+    RolloverScenarioManifest,
+    ScenarioAssignment,
+    ScenarioClass,
+    ScenarioManifest,
+    ScenarioSplitSummary,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -183,6 +195,116 @@ def _build_prior_root(root: Path) -> dict[str, Any]:
             "finalist": finalist_fingerprint,
         },
     }
+
+
+def _rollover_manifest() -> RolloverScenarioManifest:
+    assignments = (
+        ScenarioAssignment(
+            scenario_id="dev-train-b",
+            scenario_class=ScenarioClass.IMAGE_CONFIG,
+            split="train",
+            question_sha256="9" * 64,
+            fixture_sha256="9" * 64,
+            korvid_version="0.3.0",
+        ),
+        ScenarioAssignment(
+            scenario_id="dev-train-a",
+            scenario_class=ScenarioClass.WORKLOAD_HEALTH,
+            split="train",
+            question_sha256="8" * 64,
+            fixture_sha256="8" * 64,
+            korvid_version="0.3.0",
+        ),
+        ScenarioAssignment(
+            scenario_id="dev-validation-a",
+            scenario_class=ScenarioClass.NETWORKING,
+            split="validation",
+            question_sha256="7" * 64,
+            fixture_sha256="7" * 64,
+            korvid_version="0.3.0",
+        ),
+        ScenarioAssignment(
+            scenario_id="fresh-milestone-b",
+            scenario_class=ScenarioClass.STORAGE,
+            split="milestone",
+            question_sha256="6" * 64,
+            fixture_sha256="e" * 64,
+            korvid_version="0.3.0",
+        ),
+        ScenarioAssignment(
+            scenario_id="fresh-milestone-a",
+            scenario_class=ScenarioClass.SCHEDULING_RESOURCES,
+            split="milestone",
+            question_sha256="5" * 64,
+            fixture_sha256="b" * 64,
+            korvid_version="0.3.0",
+        ),
+    )
+    manifest = ScenarioManifest(
+        korvid_version="0.3.0",
+        assignments=assignments,
+        train=("dev-train-b", "dev-train-a"),
+        validation=("dev-validation-a",),
+        milestone=("fresh-milestone-b", "fresh-milestone-a"),
+        split_summaries=(
+            ScenarioSplitSummary(
+                split_name="train",
+                classes=(ScenarioClass.IMAGE_CONFIG, ScenarioClass.WORKLOAD_HEALTH),
+                scenario_ids=("dev-train-b", "dev-train-a"),
+            ),
+            ScenarioSplitSummary(
+                split_name="validation",
+                classes=(ScenarioClass.NETWORKING,),
+                scenario_ids=("dev-validation-a",),
+            ),
+            ScenarioSplitSummary(
+                split_name="milestone",
+                classes=(ScenarioClass.STORAGE, ScenarioClass.SCHEDULING_RESOURCES),
+                scenario_ids=("fresh-milestone-b", "fresh-milestone-a"),
+            ),
+        ),
+    )
+    return RolloverScenarioManifest(
+        manifest=manifest,
+        consumed_ids=("dev-train-a", "dev-train-b", "dev-validation-a"),
+        fresh_milestone_ids=("fresh-milestone-b", "fresh-milestone-a"),
+        audit_reserve_ids=("fresh-audit",),
+    )
+
+
+def _prior_evidence(root: Path) -> PriorCampaignEvidence:
+    return PriorCampaignEvidence(
+        artifact_root=root.resolve(),
+        campaign_id="stable-search-korvid-small",
+        korvid_version="0.3.0",
+        summary_sha256="c" * 64,
+        scenario_manifest_sha256="d" * 64,
+        consumed_assignments=(
+            ScenarioAssignment(
+                scenario_id="used-b",
+                scenario_class=ScenarioClass.IMAGE_CONFIG,
+                split="validation",
+                question_sha256="2" * 64,
+                fixture_sha256="f" * 64,
+                korvid_version="0.3.0",
+            ),
+            ScenarioAssignment(
+                scenario_id="used-a",
+                scenario_class=ScenarioClass.WORKLOAD_HEALTH,
+                split="train",
+                question_sha256="1" * 64,
+                fixture_sha256="a" * 64,
+                korvid_version="0.3.0",
+            ),
+        ),
+        finalist=PriorFinalistEvidence(
+            candidate_id="cite-before-conclusion+stop-with-uncertainty",
+            candidate_fingerprint="e" * 64,
+            append="name the observed evidence and its source before the final conclusion.",
+            validation_delta=0.12,
+            milestone_delta=-0.08,
+        ),
+    )
 
 
 def test_load_prior_campaign_evidence_reads_confined_prior_artifacts(
@@ -394,3 +516,129 @@ def test_load_prior_campaign_evidence_rejects_invalid_prior_roots(
 
     with pytest.raises(ValueError, match=match):
         load_prior_campaign_evidence(root)
+
+
+def test_write_rollover_lineage_serializes_only_bounded_digests(
+    scratch: Path,
+) -> None:
+    prior_root = scratch / "prior-root"
+    prior_root.mkdir()
+    evidence = _prior_evidence(prior_root)
+    rollover = _rollover_manifest()
+    path = scratch / "rollover-lineage.json"
+
+    assert hasattr(stable_rollover, "write_rollover_lineage")
+    written = stable_rollover.write_rollover_lineage(
+        path,
+        evidence,
+        rollover,
+        terminal_reason="qualification_complete",
+    )
+
+    assert written == path
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload == {
+        "schema_version": 1,
+        "prior": {
+            "campaign_id": "stable-search-korvid-small",
+            "decision": "no_stable_winner",
+            "stable_search_summary_sha256": "c" * 64,
+            "scenario_manifest_sha256": "d" * 64,
+            "finalist_id": "cite-before-conclusion+stop-with-uncertainty",
+            "finalist_fingerprint": "e" * 64,
+        },
+        "scenario_consumption": {
+            "korvid_version": "0.3.0",
+            "consumed": ["a" * 64, "f" * 64],
+            "fresh_milestone": ["b" * 64, "e" * 64],
+            "counts": {
+                "train": 2,
+                "validation": 1,
+                "milestone": 2,
+                "audit_reserve": 1,
+            },
+        },
+        "candidate_matrix_version": "rollover-v1",
+        "max_target_calls": 306,
+        "terminal_reason": "qualification_complete",
+    }
+    text = path.read_text(encoding="utf-8")
+    assert str(prior_root.resolve()) not in text
+    assert "used-a" not in text
+    assert "fresh-milestone-a" not in text
+    for forbidden in ("question", "fixture_state", "endpoint", "raw_answer", "raw_error"):
+        assert forbidden not in text
+
+
+def test_write_rollover_winner_writes_exact_candidate_yaml_and_rejects_collisions(
+    scratch: Path,
+) -> None:
+    candidate = Candidate.from_mapping(
+        {
+            "schema_version": 1,
+            "candidate_id": "decisive-read-first",
+            "components": {
+                "system": "Stay safe.",
+                "append": "inspect runtime evidence before stating a diagnosis.",
+            },
+            "metadata": {
+                "profile": "small",
+                "rollover_from": "c" * 64,
+            },
+        }
+    )
+    path = scratch / "winner.yaml"
+    existing_path = scratch / "existing-winner.yaml"
+    existing_path.write_text("already here\n", encoding="utf-8")
+    symlink_path = scratch / "winner-link.yaml"
+    symlink_path.symlink_to(existing_path)
+
+    assert hasattr(stable_rollover, "write_rollover_winner")
+    written = stable_rollover.write_rollover_winner(path, candidate)
+
+    assert written == path
+    assert yaml.safe_load(path.read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "candidate_id": "decisive-read-first",
+        "components": {
+            "system": "Stay safe.",
+            "append": "inspect runtime evidence before stating a diagnosis.",
+        },
+        "metadata": {
+            "profile": "small",
+            "rollover_from": "c" * 64,
+        },
+    }
+    with pytest.raises(FileExistsError, match="already exists"):
+        stable_rollover.write_rollover_winner(existing_path, candidate)
+    with pytest.raises(FileExistsError, match="symlink"):
+        stable_rollover.write_rollover_winner(symlink_path, candidate)
+
+
+@pytest.mark.parametrize(
+    "components",
+    [
+        {"system": "Stay safe."},
+        {
+            "system": "Stay safe.",
+            "append": "inspect runtime evidence before stating a diagnosis.",
+            "tool.kubectl": "kubectl get pods",
+        },
+    ],
+)
+def test_write_rollover_winner_rejects_candidates_without_exact_system_and_append_components(
+    scratch: Path,
+    components: dict[str, str],
+) -> None:
+    candidate = Candidate.from_mapping(
+        {
+            "schema_version": 1,
+            "candidate_id": "bad-winner",
+            "components": components,
+            "metadata": {"profile": "small"},
+        }
+    )
+
+    assert hasattr(stable_rollover, "write_rollover_winner")
+    with pytest.raises(ValueError, match="exactly system and append"):
+        stable_rollover.write_rollover_winner(scratch / "bad-winner.yaml", candidate)

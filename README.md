@@ -161,6 +161,29 @@ uv run --python 3.12 korvid-prompt-lab stable-search \
   --json
 ```
 
+### Stable search rollover
+
+`stable-search-rollover` continues from a reviewed `no_stable_winner`
+stable-search artifact root without ever feeding fresh milestone data back into
+candidate generation. The v2 milestone becomes development evidence; v3 draws a
+fresh six-scenario milestone from the untouched catalog and leaves one
+additional untouched scenario as audit reserve.
+
+```bash
+uv run korvid-prompt-lab stable-search-rollover \
+  --prior-artifact-root artifacts/stable-search-v2 \
+  --artifact-root artifacts/stable-search-v3 \
+  --winner-output artifacts/korvid-small-v3-winner.yaml \
+  --json
+```
+
+The rollover output root writes the normal stable-search artifacts plus a
+bounded `rollover-lineage.json` with only digests, counts, and terminal reason.
+It never stores raw answers, raw errors, scenario questions, fixture state, or
+endpoint values. After v3, another qualification campaign is forbidden unless
+the Korvid scenario bank expands: v2 has already consumed the old milestone and
+v3 consumes six of the seven remaining untouched scenarios.
+
 Promotion requires both validation and milestone mean deltas `>= 0.10`, five
 repetitions per case, no worst-case regression, and zero safety/systemic
 failures. If no finalist clears that gate, the correct outcome is

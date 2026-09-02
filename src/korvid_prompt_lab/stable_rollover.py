@@ -3,14 +3,19 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
+import yaml  # type: ignore[import-untyped]
+
+from .artifacts import write_json_artifact
 from .contracts import Candidate
 from .stable_scenarios import (
+    RolloverScenarioManifest,
     ScenarioAssignment,
     ScenarioClass,
     ScenarioManifest,
@@ -21,6 +26,8 @@ __all__ = [
     "PriorCampaignEvidence",
     "PriorFinalistEvidence",
     "load_prior_campaign_evidence",
+    "write_rollover_lineage",
+    "write_rollover_winner",
 ]
 
 _SPLITS: tuple[Literal["train", "validation", "milestone"], ...] = (
@@ -82,6 +89,77 @@ def load_prior_campaign_evidence(root: Path | str) -> PriorCampaignEvidence:
         consumed_assignments=scenario_manifest.assignments,
         finalist=finalist,
     )
+
+
+def write_rollover_lineage(
+    path: Path | str,
+    evidence: PriorCampaignEvidence,
+    rollover: RolloverScenarioManifest,
+    *,
+    terminal_reason: str | None = None,
+) -> Path:
+    consumed = sorted(assignment.fixture_sha256 for assignment in evidence.consumed_assignments)
+    fresh_milestone = sorted(
+        assignment.fixture_sha256
+        for assignment in rollover.manifest.assignments
+        if assignment.split == "milestone"
+    )
+    return write_json_artifact(
+        path,
+        {
+            "schema_version": 1,
+            "prior": {
+                "campaign_id": evidence.campaign_id,
+                "decision": "no_stable_winner",
+                "stable_search_summary_sha256": evidence.summary_sha256,
+                "scenario_manifest_sha256": evidence.scenario_manifest_sha256,
+                "finalist_id": evidence.finalist.candidate_id,
+                "finalist_fingerprint": evidence.finalist.candidate_fingerprint,
+            },
+            "scenario_consumption": {
+                "korvid_version": evidence.korvid_version,
+                "consumed": consumed,
+                "fresh_milestone": fresh_milestone,
+                "counts": {
+                    "train": len(rollover.manifest.train),
+                    "validation": len(rollover.manifest.validation),
+                    "milestone": len(rollover.manifest.milestone),
+                    "audit_reserve": len(rollover.audit_reserve_ids),
+                },
+            },
+            "candidate_matrix_version": "rollover-v1",
+            "max_target_calls": 306,
+            "terminal_reason": terminal_reason,
+        },
+    )
+
+
+def write_rollover_winner(path: Path | str, candidate: Candidate) -> Path:
+    output_path = Path(path)
+    if output_path.is_symlink():
+        raise FileExistsError(f"refusing to write rollover winner over a symlink: {output_path}")
+    if output_path.exists():
+        raise FileExistsError(f"rollover winner output already exists: {output_path}")
+    if set(candidate.components) != {"system", "append"}:
+        raise ValueError("rollover winner candidate components must be exactly system and append")
+
+    payload = {
+        "schema_version": candidate.schema_version,
+        "candidate_id": candidate.candidate_id,
+        "components": candidate.components,
+        "metadata": candidate.metadata,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(f"{output_path.name}.tmp")
+    try:
+        temp_path.write_text(
+            yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+        os.replace(temp_path, output_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    return output_path
 
 
 def _resolve_root(root: Path | str) -> Path:
