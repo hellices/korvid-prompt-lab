@@ -74,13 +74,7 @@ def _candidate_id(axes: tuple[RolloverCandidateAxis, ...]) -> str:
 def _extract_rollover_seed(prior_append: str) -> str:
     if prior_append != prior_append.strip():
         raise ValueError("prior finalist append must use canonical outer whitespace")
-
-    lines = tuple(line.strip() for line in prior_append.splitlines() if line.strip())
-    if _ROLLOVER_SEED_LINE in lines:
-        return _ROLLOVER_SEED_LINE
-    if len(lines) == 1:
-        return lines[0]
-    raise ValueError("prior finalist append must contain the rollover seed line")
+    return _ROLLOVER_SEED_LINE
 
 
 def _render_append(prior_seed: str, axes: tuple[RolloverCandidateAxis, ...]) -> str:

@@ -974,3 +974,172 @@ def test_stable_search_rollover_cli_skips_winner_yaml_when_no_stable_winner(
     assert json.loads(stdout) == summary
     assert calls == []
     assert not winner_output.exists()
+
+
+@pytest.mark.parametrize(
+    "case_name",
+    (
+        "stable-search-summary",
+        "rollover-summary",
+        "rollover-lineage",
+        "rollover-winner-selection",
+        "rollover-winner-write",
+        "bridge-lineage",
+    ),
+)
+def test_stable_search_cli_bounds_post_campaign_and_secondary_lineage_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    case_name: str,
+) -> None:
+    secret = "TOKEN=secret raw_error=oops"
+    artifact_error = {
+        "error_label": "post_campaign_artifact_error",
+        "status": "artifact_error",
+    }
+    system_error = {
+        "error_label": "bridge_system_error",
+        "status": "system_error",
+    }
+
+    class FakeRunner:
+        def __init__(self, campaign: object) -> None:
+            self.campaign = campaign
+
+    monkeypatch.setenv("KORVID_READONLY_BASE_URL", "http://127.0.0.1:41001")
+
+    if case_name == "stable-search-summary":
+        summary_path = _write_json(
+            tmp_path / "stable-search-summary.json",
+            {
+                "campaign_id": "stable-search-korvid-small",
+                "decision": {"status": "no_stable_winner", "candidate_id": None, "reasons": ["no_finalists"]},
+            },
+        )
+        monkeypatch.setattr("korvid_prompt_lab.cli.build_baseline_candidate", lambda profile: _baseline())
+        monkeypatch.setattr(
+            "korvid_prompt_lab.cli.build_structured_candidates",
+            lambda baseline: (_structured_candidate(),),
+        )
+        monkeypatch.setattr("korvid_prompt_lab.cli.build_scenario_manifest", lambda target_per_split=6: _manifest())
+        monkeypatch.setattr("korvid_prompt_lab.cli.KorvidReadonlyRunner", FakeRunner)
+        monkeypatch.setattr(
+            "korvid_prompt_lab.cli.run_stable_search",
+            lambda **kwargs: _FakeArtifacts(summary_path=summary_path),
+        )
+        monkeypatch.setattr(
+            stable_search_cli,
+            "_load_json_file",
+            lambda path: (_ for _ in ()).throw(ValueError(secret)),
+        )
+
+        exit_code, stdout, stderr = _run_cli(
+            [
+                "stable-search",
+                "--artifact-root",
+                str(tmp_path / "stable-search"),
+                "--json",
+            ]
+        )
+        expected = artifact_error
+    else:
+        prior_root = tmp_path / "prior-root"
+        prior_root.mkdir()
+        artifact_root = tmp_path / "rollover-artifacts"
+        prior = _prior_evidence(prior_root)
+        candidates = _rollover_structured_candidates()
+        rollover = _rollover_manifest()
+        summary = {
+            "campaign_id": "stable-search-korvid-small",
+            "decision": {
+                "status": "promote",
+                "candidate_id": candidates[2].candidate.candidate_id,
+                "reasons": [],
+            },
+        }
+        summary_path = _write_json(tmp_path / "rollover-summary.json", summary)
+
+        monkeypatch.setattr(
+            "korvid_prompt_lab.cli.load_prior_campaign_evidence",
+            lambda root: prior,
+            raising=False,
+        )
+        monkeypatch.setattr("korvid_prompt_lab.cli.build_baseline_candidate", lambda profile: _baseline())
+        monkeypatch.setattr(
+            "korvid_prompt_lab.cli.build_rollover_candidates",
+            lambda baseline, prior_evidence: candidates,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "korvid_prompt_lab.cli.build_rollover_scenario_manifest",
+            lambda consumed, target_per_split=6: rollover,
+            raising=False,
+        )
+        monkeypatch.setattr("korvid_prompt_lab.cli.KorvidReadonlyRunner", FakeRunner)
+
+        if case_name == "bridge-lineage":
+            monkeypatch.setattr(
+                "korvid_prompt_lab.cli.run_stable_search",
+                lambda **kwargs: (_ for _ in ()).throw(BridgeSystemError(secret)),
+            )
+            monkeypatch.setattr(
+                stable_search_cli,
+                "_materialize_rollover_lineage",
+                lambda **kwargs: (_ for _ in ()).throw(OSError(secret)),
+                raising=False,
+            )
+            expected = system_error
+            winner_args: list[str] = []
+        else:
+            monkeypatch.setattr(
+                "korvid_prompt_lab.cli.run_stable_search",
+                lambda **kwargs: _FakeArtifacts(summary_path=summary_path),
+            )
+            expected = artifact_error
+            winner_args = []
+            if case_name == "rollover-summary":
+                monkeypatch.setattr(
+                    stable_search_cli,
+                    "_load_json_file",
+                    lambda path: (_ for _ in ()).throw(ValueError(secret)),
+                )
+            elif case_name == "rollover-lineage":
+                monkeypatch.setattr(
+                    stable_search_cli,
+                    "_materialize_rollover_lineage",
+                    lambda **kwargs: (_ for _ in ()).throw(OSError(secret)),
+                    raising=False,
+                )
+            elif case_name == "rollover-winner-selection":
+                monkeypatch.setattr(
+                    stable_search_cli,
+                    "_rollover_winner_candidate",
+                    lambda summary_payload, candidate_items: (_ for _ in ()).throw(ValueError(secret)),
+                    raising=False,
+                )
+            elif case_name == "rollover-winner-write":
+                winner_args = ["--winner-output", str(tmp_path / "winner.yaml")]
+                monkeypatch.setattr(
+                    stable_search_cli,
+                    "write_rollover_winner",
+                    lambda path, candidate: (_ for _ in ()).throw(FileExistsError(secret)),
+                    raising=False,
+                )
+
+        exit_code, stdout, stderr = _run_cli(
+            [
+                "stable-search-rollover",
+                "--prior-artifact-root",
+                str(prior_root),
+                "--artifact-root",
+                str(artifact_root),
+                *winner_args,
+                "--json",
+            ]
+        )
+
+    assert exit_code == 1
+    assert stderr == ""
+    assert "TOKEN=secret" not in stdout + stderr
+    assert "raw_error=oops" not in stdout + stderr
+    assert json.loads(stdout) == expected

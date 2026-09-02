@@ -378,6 +378,40 @@ def test_load_prior_campaign_evidence_breaks_finalist_ties_by_candidate_id(
     assert evidence.finalist.candidate_fingerprint == alpha_fingerprint
 
 
+def test_load_prior_campaign_evidence_skips_non_manifest_qualification_winner(
+    scratch: Path,
+) -> None:
+    _build_prior_root(scratch / "prior-root")
+    _write_json(
+        scratch / "prior-root" / "stage-c" / "qualification-summary.json",
+        {
+            "schema_version": 1,
+            "stage": "qualification",
+            "candidates": [
+                _qualification_entry(
+                    candidate_id="proposer-only",
+                    candidate_validation=0.47,
+                    baseline_validation=0.40,
+                    candidate_milestone=0.58,
+                    baseline_milestone=0.50,
+                ),
+                _qualification_entry(
+                    candidate_id="beta",
+                    candidate_validation=0.46,
+                    baseline_validation=0.40,
+                    candidate_milestone=0.57,
+                    baseline_milestone=0.50,
+                ),
+            ],
+            "decision": {"status": "no_stable_winner", "candidate_id": None},
+        },
+    )
+
+    evidence = load_prior_campaign_evidence(scratch / "prior-root")
+
+    assert evidence.finalist.candidate_id == "beta"
+
+
 def _replace_json(path: Path, replacer: Callable[[Any], Any]) -> None:
     payload = json.loads(path.read_text(encoding="utf-8"))
     _write_json(path, replacer(payload))
@@ -399,6 +433,15 @@ def _replace_with_external_symlink(root: Path) -> None:
     path.unlink()
     outside.write_text(original, encoding="utf-8")
     path.symlink_to(outside)
+
+
+def _replace_candidate_manifest_with_unknown_candidate(root: Path) -> None:
+    unknown_entry, _ = _candidate_entry(
+        candidate_id="gamma",
+        append="collect only the bounded evidence required to separate likely causes.",
+        axes=["gamma"],
+    )
+    _write_json(root / "candidate-manifest.json", {"schema_version": 1, "candidates": [unknown_entry]})
 
 
 @pytest.mark.parametrize(
@@ -458,18 +501,8 @@ def _replace_with_external_symlink(root: Path) -> None:
             "finite",
         ),
         (
-            "candidate ID missing from candidate-manifest",
-            lambda root: _replace_json(
-                root / "candidate-manifest.json",
-                lambda payload: {
-                    **payload,
-                    "candidates": [
-                        entry
-                        for entry in payload["candidates"]
-                        if entry["candidate"]["candidate_id"] != "beta"
-                    ],
-                },
-            ),
+            "no qualification candidate ID present in candidate-manifest",
+            _replace_candidate_manifest_with_unknown_candidate,
             "candidate manifest",
         ),
         (
@@ -613,6 +646,81 @@ def test_write_rollover_winner_writes_exact_candidate_yaml_and_rejects_collision
         stable_rollover.write_rollover_winner(existing_path, candidate)
     with pytest.raises(FileExistsError, match="symlink"):
         stable_rollover.write_rollover_winner(symlink_path, candidate)
+
+
+@pytest.mark.parametrize("temp_path_kind", ["preexisting", "symlink"])
+def test_write_rollover_winner_rejects_unsafe_temp_path_without_touching_target(
+    scratch: Path,
+    temp_path_kind: str,
+) -> None:
+    candidate = Candidate.from_mapping(
+        {
+            "schema_version": 1,
+            "candidate_id": "decisive-read-first",
+            "components": {
+                "system": "Stay safe.",
+                "append": "inspect runtime evidence before stating a diagnosis.",
+            },
+            "metadata": {
+                "profile": "small",
+                "rollover_from": "c" * 64,
+            },
+        }
+    )
+    path = scratch / "winner.yaml"
+    temp_path = path.with_name(f"{path.name}.tmp")
+    protected = scratch / "protected.txt"
+    protected.write_text("do not modify\n", encoding="utf-8")
+
+    if temp_path_kind == "preexisting":
+        temp_path.write_text("already here\n", encoding="utf-8")
+    else:
+        temp_path.symlink_to(protected)
+
+    with pytest.raises(FileExistsError, match="temporary"):
+        stable_rollover.write_rollover_winner(path, candidate)
+
+    assert not path.exists()
+    assert protected.read_text(encoding="utf-8") == "do not modify\n"
+    if temp_path_kind == "preexisting":
+        assert temp_path.read_text(encoding="utf-8") == "already here\n"
+    else:
+        assert temp_path.is_symlink()
+        assert temp_path.resolve() == protected.resolve()
+
+
+def test_write_rollover_winner_cleans_only_its_own_temp_file(
+    monkeypatch: pytest.MonkeyPatch,
+    scratch: Path,
+) -> None:
+    candidate = Candidate.from_mapping(
+        {
+            "schema_version": 1,
+            "candidate_id": "decisive-read-first",
+            "components": {
+                "system": "Stay safe.",
+                "append": "inspect runtime evidence before stating a diagnosis.",
+            },
+            "metadata": {
+                "profile": "small",
+                "rollover_from": "c" * 64,
+            },
+        }
+    )
+    path = scratch / "winner.yaml"
+    temp_path = path.with_name(f"{path.name}.tmp")
+    real_replace = stable_rollover.os.replace
+
+    def replace_and_recreate(src: Path, dst: Path) -> None:
+        real_replace(src, dst)
+        temp_path.write_text("recreated after replace\n", encoding="utf-8")
+
+    monkeypatch.setattr(stable_rollover.os, "replace", replace_and_recreate)
+
+    stable_rollover.write_rollover_winner(path, candidate)
+
+    assert path.exists()
+    assert temp_path.read_text(encoding="utf-8") == "recreated after replace\n"
 
 
 @pytest.mark.parametrize(

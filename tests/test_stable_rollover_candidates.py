@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from korvid_prompt_lab.contracts import Candidate
@@ -19,6 +21,31 @@ from korvid_prompt_lab.stable_scenarios import ScenarioAssignment, ScenarioClass
 _REAL_V2_FINALIST_APPEND = (
     "name the observed evidence and its source before the final conclusion.\n"
     "when evidence is insufficient, state what is missing and stop instead of guessing."
+)
+_FIXED_ROLLOVER_SEED = "name the observed evidence and its source before the final conclusion."
+_ORIGINAL_V2_APPEND_SHAPES = (
+    "gather the smallest relevant read-only evidence needed to distinguish likely causes before concluding.",
+    "when initial evidence is insufficient, inspect the next highest-value source before stopping.",
+    "after relevant read-only evidence is exhausted, state exactly what remains unknown and stop instead of guessing.",
+    "tie each conclusion to observed evidence and avoid unsupported remediation.",
+    (
+        "gather the smallest relevant read-only evidence needed to distinguish likely causes before concluding.\n"
+        "when initial evidence is insufficient, inspect the next highest-value source before stopping."
+    ),
+    (
+        "gather the smallest relevant read-only evidence needed to distinguish likely causes before concluding.\n"
+        "after relevant read-only evidence is exhausted, state exactly what remains unknown and stop instead of guessing."
+    ),
+    (
+        "after relevant read-only evidence is exhausted, state exactly what remains unknown and stop instead of guessing.\n"
+        "tie each conclusion to observed evidence and avoid unsupported remediation."
+    ),
+    (
+        "gather the smallest relevant read-only evidence needed to distinguish likely causes before concluding.\n"
+        "when initial evidence is insufficient, inspect the next highest-value source before stopping.\n"
+        "after relevant read-only evidence is exhausted, state exactly what remains unknown and stop instead of guessing.\n"
+        "tie each conclusion to observed evidence and avoid unsupported remediation."
+    ),
 )
 
 
@@ -153,7 +180,7 @@ def test_rollover_matrix_matches_canonical_axes_and_text() -> None:
     )
 
     def _expected_append(*lines: str) -> str:
-        return "\n".join((prior.finalist.append, *lines)) if lines else prior.finalist.append
+        return "\n".join((_FIXED_ROLLOVER_SEED, *lines)) if lines else _FIXED_ROLLOVER_SEED
 
     assert [item.candidate.components["append"] for item in candidates] == [
         _expected_append(
@@ -165,22 +192,26 @@ def test_rollover_matrix_matches_canonical_axes_and_text() -> None:
         _expected_append(
             "after relevant read-only evidence is exhausted, state exactly what remains unknown and stop instead of guessing."
         ),
-        _expected_append(),
         _expected_append(
-            "gather the smallest relevant read-only evidence needed to distinguish likely causes before concluding.",
-            "when initial evidence is insufficient, inspect the next highest-value source before stopping.",
-        ),
-        _expected_append(
-            "gather the smallest relevant read-only evidence needed to distinguish likely causes before concluding.",
-            "after relevant read-only evidence is exhausted, state exactly what remains unknown and stop instead of guessing.",
-        ),
-        _expected_append(
-            "after relevant read-only evidence is exhausted, state exactly what remains unknown and stop instead of guessing.",
+            "tie each conclusion to observed evidence and avoid unsupported remediation."
         ),
         _expected_append(
             "gather the smallest relevant read-only evidence needed to distinguish likely causes before concluding.",
             "when initial evidence is insufficient, inspect the next highest-value source before stopping.",
+        ),
+        _expected_append(
+            "gather the smallest relevant read-only evidence needed to distinguish likely causes before concluding.",
             "after relevant read-only evidence is exhausted, state exactly what remains unknown and stop instead of guessing.",
+        ),
+        _expected_append(
+            "after relevant read-only evidence is exhausted, state exactly what remains unknown and stop instead of guessing.",
+            "tie each conclusion to observed evidence and avoid unsupported remediation.",
+        ),
+        _expected_append(
+            "gather the smallest relevant read-only evidence needed to distinguish likely causes before concluding.",
+            "when initial evidence is insufficient, inspect the next highest-value source before stopping.",
+            "after relevant read-only evidence is exhausted, state exactly what remains unknown and stop instead of guessing.",
+            "tie each conclusion to observed evidence and avoid unsupported remediation.",
         ),
     ]
 
@@ -248,3 +279,27 @@ def test_rollover_matrix_uses_only_fixed_evidence_seed_from_real_v2_append() -> 
         "after relevant read-only evidence is exhausted, state exactly what remains unknown and stop instead of guessing.\n"
         "tie each conclusion to observed evidence and avoid unsupported remediation."
     )
+
+
+@pytest.mark.parametrize(
+    "prior_append",
+    _ORIGINAL_V2_APPEND_SHAPES + ("x" * 200,),
+)
+def test_rollover_matrix_reuses_fixed_seed_for_legacy_and_long_single_line_priors(
+    prior_append: str,
+) -> None:
+    baseline = _baseline()
+    prior = _prior(
+        consumed_assignments=(
+            _assignment("used-a"),
+            _assignment("used-b"),
+        ),
+        append=prior_append,
+    )
+
+    candidates = build_rollover_candidates(baseline, cast(Any, prior))
+
+    assert len(candidates) == 8
+    assert all(len(item.candidate.components["append"]) <= 480 for item in candidates)
+    assert all(item.candidate.components["append"].splitlines()[0] == _FIXED_ROLLOVER_SEED for item in candidates)
+    assert all(prior_append != item.candidate.components["append"] for item in candidates)

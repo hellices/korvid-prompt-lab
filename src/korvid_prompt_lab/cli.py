@@ -66,6 +66,7 @@ _STABLE_SEARCH_MODEL = "qwen3:0.6b"
 _STABLE_SEARCH_PROFILE = "small"
 _STABLE_SEARCH_TIMEOUT_SECONDS = 160.0
 _STABLE_SEARCH_REPETITIONS = 5
+_POST_CAMPAIGN_ARTIFACT_ERROR_LABEL = "post_campaign_artifact_error"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -600,7 +601,16 @@ def command_stable_search(args: argparse.Namespace) -> int:
         print(f"stable-search failed: {exc}", file=_stderr())
         return 1
 
-    summary = _load_json_file(artifacts.summary_path)
+    try:
+        summary = _load_json_file(artifacts.summary_path)
+    except (OSError, ValueError, FileExistsError):
+        return _emit_bounded_cli_error(
+            "stable-search",
+            json_output=args.json,
+            status="artifact_error",
+            error_label=_POST_CAMPAIGN_ARTIFACT_ERROR_LABEL,
+            stderr_detail="bounded post-campaign error",
+        )
     if args.json:
         print(json.dumps(summary, sort_keys=True, ensure_ascii=False, indent=2))
     else:
@@ -682,50 +692,55 @@ def command_stable_search_rollover(args: argparse.Namespace) -> int:
     except BridgeSystemError as exc:
         error_label = _stable_search_system_error_label(exc)
         if prior is not None and rollover is not None:
-            _materialize_rollover_lineage(
-                artifact_root=artifact_root,
-                draft_path=lineage_draft_path,
-                prior=prior,
-                rollover=rollover,
-                terminal_reason=error_label,
-            )
-        _cleanup_rollover_lineage_draft(lineage_draft_path)
-        if args.json:
-            print(
-                json.dumps(
-                    {"status": "system_error", "error_label": error_label},
-                    sort_keys=True,
-                    ensure_ascii=False,
-                    indent=2,
+            try:
+                _materialize_rollover_lineage(
+                    artifact_root=artifact_root,
+                    draft_path=lineage_draft_path,
+                    prior=prior,
+                    rollover=rollover,
+                    terminal_reason=error_label,
                 )
-            )
-        else:
-            print(
-                f"stable-search-rollover failed: systemic bridge error: {error_label}",
-                file=_stderr(),
-            )
-        return 1
+            except (OSError, ValueError, FileExistsError):
+                pass
+        _best_effort_cleanup_rollover_lineage_draft(lineage_draft_path)
+        return _emit_bounded_cli_error(
+            "stable-search-rollover",
+            json_output=args.json,
+            status="system_error",
+            error_label=error_label,
+            stderr_detail="systemic bridge error",
+        )
     except OSError as exc:
         _cleanup_rollover_lineage_draft(lineage_draft_path)
         print(f"stable-search-rollover failed: {exc}", file=_stderr())
         return 1
 
-    summary = _load_json_file(artifacts.summary_path)
-    terminal_reason = _rollover_terminal_reason(summary)
-    assert prior is not None
-    assert rollover is not None
-    _materialize_rollover_lineage(
-        artifact_root=artifact_root,
-        draft_path=lineage_draft_path,
-        prior=prior,
-        rollover=rollover,
-        terminal_reason=terminal_reason,
-    )
-    _cleanup_rollover_lineage_draft(lineage_draft_path)
+    try:
+        summary = _load_json_file(artifacts.summary_path)
+        terminal_reason = _rollover_terminal_reason(summary)
+        assert prior is not None
+        assert rollover is not None
+        _materialize_rollover_lineage(
+            artifact_root=artifact_root,
+            draft_path=lineage_draft_path,
+            prior=prior,
+            rollover=rollover,
+            terminal_reason=terminal_reason,
+        )
+        _cleanup_rollover_lineage_draft(lineage_draft_path)
 
-    winning_candidate = _rollover_winner_candidate(summary, candidates)
-    if winner_output is not None and winning_candidate is not None:
-        write_rollover_winner(winner_output, winning_candidate)
+        winning_candidate = _rollover_winner_candidate(summary, candidates)
+        if winner_output is not None and winning_candidate is not None:
+            write_rollover_winner(winner_output, winning_candidate)
+    except (OSError, ValueError, FileExistsError):
+        _best_effort_cleanup_rollover_lineage_draft(lineage_draft_path)
+        return _emit_bounded_cli_error(
+            "stable-search-rollover",
+            json_output=args.json,
+            status="artifact_error",
+            error_label=_POST_CAMPAIGN_ARTIFACT_ERROR_LABEL,
+            stderr_detail="bounded post-campaign error",
+        )
 
     if args.json:
         print(json.dumps(summary, sort_keys=True, ensure_ascii=False, indent=2))
@@ -745,6 +760,28 @@ def _stable_search_system_error_label(exc: BridgeSystemError) -> str:
     if isinstance(exc, StableSearchSystemError):
         return exc.error_label
     return re.sub(r"(?<!^)(?=[A-Z])", "_", type(exc).__name__).lower()
+
+
+def _emit_bounded_cli_error(
+    command: str,
+    *,
+    json_output: bool,
+    status: str,
+    error_label: str,
+    stderr_detail: str,
+) -> int:
+    if json_output:
+        print(
+            json.dumps(
+                {"status": status, "error_label": error_label},
+                sort_keys=True,
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        print(f"{command} failed: {stderr_detail}: {error_label}", file=_stderr())
+    return 1
 
 
 def _rollover_lineage_draft_path(artifact_root: Path) -> Path:
@@ -771,6 +808,13 @@ def _materialize_rollover_lineage(
 def _cleanup_rollover_lineage_draft(draft_path: Path | None) -> None:
     if draft_path is not None and draft_path.exists():
         draft_path.unlink()
+
+
+def _best_effort_cleanup_rollover_lineage_draft(draft_path: Path | None) -> None:
+    try:
+        _cleanup_rollover_lineage_draft(draft_path)
+    except OSError:
+        pass
 
 
 def _rollover_terminal_reason(summary: Mapping[str, Any]) -> str | None:

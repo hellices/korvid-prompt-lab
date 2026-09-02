@@ -151,14 +151,24 @@ def write_rollover_winner(path: Path | str, candidate: Candidate) -> Path:
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = output_path.with_name(f"{output_path.name}.tmp")
+    if temp_path.exists() or temp_path.is_symlink():
+        raise FileExistsError(f"rollover winner temporary output already exists: {temp_path}")
+    temp_fd: int | None = None
+    temp_created = False
     try:
-        temp_path.write_text(
-            yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
-            encoding="utf-8",
-        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        temp_fd = os.open(temp_path, flags, 0o600)
+        temp_created = True
+        with os.fdopen(temp_fd, "w", encoding="utf-8") as handle:
+            temp_fd = None
+            yaml.safe_dump(payload, handle, sort_keys=False, allow_unicode=True)
         os.replace(temp_path, output_path)
+        temp_created = False
     finally:
-        temp_path.unlink(missing_ok=True)
+        if temp_fd is not None:
+            os.close(temp_fd)
+        if temp_created:
+            temp_path.unlink(missing_ok=True)
     return output_path
 
 
@@ -419,21 +429,23 @@ def _select_finalist(
     qualification: Sequence[_QualificationDelta],
     candidates: Mapping[str, tuple[str, str]],
 ) -> PriorFinalistEvidence:
-    selected = min(
+    ranked = sorted(
         qualification,
         key=lambda item: (-item.validation_delta, -item.milestone_delta, item.candidate_id),
     )
-    finalist = candidates.get(selected.candidate_id)
-    if finalist is None:
-        raise ValueError(f"qualification candidate {selected.candidate_id!r} missing from candidate manifest")
-    fingerprint, append = finalist
-    return PriorFinalistEvidence(
-        candidate_id=selected.candidate_id,
-        candidate_fingerprint=fingerprint,
-        append=append,
-        validation_delta=selected.validation_delta,
-        milestone_delta=selected.milestone_delta,
-    )
+    for selected in ranked:
+        finalist = candidates.get(selected.candidate_id)
+        if finalist is None:
+            continue
+        fingerprint, append = finalist
+        return PriorFinalistEvidence(
+            candidate_id=selected.candidate_id,
+            candidate_fingerprint=fingerprint,
+            append=append,
+            validation_delta=selected.validation_delta,
+            milestone_delta=selected.milestone_delta,
+        )
+    raise ValueError("no qualification candidates are present in candidate manifest")
 
 
 def _require_no_stable_winner(payload: Any, context: str) -> None:

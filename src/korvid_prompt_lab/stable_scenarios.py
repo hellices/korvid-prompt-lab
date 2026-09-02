@@ -93,11 +93,6 @@ _CLASS_ORDER: tuple[ScenarioClass, ...] = (
     ScenarioClass.NETWORKING,
     ScenarioClass.STORAGE,
 )
-_ROLLOVER_MILESTONE_CLASS_ORDER: tuple[ScenarioClass, ...] = (
-    ScenarioClass.STORAGE,
-    ScenarioClass.SCHEDULING_RESOURCES,
-    ScenarioClass.NETWORKING,
-)
 
 _ROOT_CAUSE_TO_CLASS: dict[str, ScenarioClass] = {
     "bad_command": ScenarioClass.WORKLOAD_HEALTH,
@@ -234,10 +229,11 @@ def build_rollover_scenario_manifest(
         untouched_records,
         sort_key=lambda record: _rollover_sort_key(korvid_version, record.scenario_id),
     )
+    fresh_class_order = _present_class_order(untouched_records)
     milestone_records, remaining_fresh_buckets = _take_balanced_records(
         fresh_buckets,
         count=target_per_split,
-        class_order=_ROLLOVER_MILESTONE_CLASS_ORDER,
+        class_order=fresh_class_order,
     )
     if len(milestone_records) < target_per_split:
         raise FreshHoldoutExhaustedError("fresh holdout exhausted")
@@ -329,6 +325,11 @@ def _ordered_unique_classes(classes: Iterable[ScenarioClass]) -> tuple[ScenarioC
     for scenario_class in classes:
         unique[scenario_class] = None
     return tuple(unique)
+
+
+def _present_class_order(records: Sequence[_ScenarioRecord]) -> tuple[ScenarioClass, ...]:
+    present = {record.scenario_class for record in records}
+    return tuple(scenario_class for scenario_class in _CLASS_ORDER if scenario_class in present)
 
 
 def _validate_target_per_split(target_per_split: int) -> None:

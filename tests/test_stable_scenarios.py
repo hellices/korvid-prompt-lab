@@ -444,6 +444,85 @@ def test_rollover_manifest_uses_fresh_balanced_holdout_deterministically(
     assert milestone_classes.count(ScenarioClass.NETWORKING) == 2
 
 
+def test_rollover_manifest_uses_present_class_order_for_expanded_fresh_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records, consumed_ids = _rollover_catalog()
+    consumed_records = tuple(record for record in records if record.scenario_id in consumed_ids)
+    expanded_fresh_records = (
+        _record(
+            scenario_id="healthy-expanded-a",
+            scenario_class=ScenarioClass.HEALTHY_CONTROL,
+            question="fresh healthy 1",
+            root_cause="none",
+            sort_key="100",
+        ),
+        _record(
+            scenario_id="healthy-expanded-b",
+            scenario_class=ScenarioClass.HEALTHY_CONTROL,
+            question="fresh healthy 2",
+            root_cause="none",
+            sort_key="101",
+        ),
+        _record(
+            scenario_id="healthy-expanded-c",
+            scenario_class=ScenarioClass.HEALTHY_CONTROL,
+            question="fresh healthy 3",
+            root_cause="none",
+            sort_key="102",
+        ),
+        _record(
+            scenario_id="bad-command-expanded-a",
+            scenario_class=ScenarioClass.WORKLOAD_HEALTH,
+            question="fresh workload 1",
+            root_cause="bad_command",
+            sort_key="103",
+        ),
+        _record(
+            scenario_id="crashloop-expanded-a",
+            scenario_class=ScenarioClass.WORKLOAD_HEALTH,
+            question="fresh workload 2",
+            root_cause="crashloop_app_error",
+            sort_key="104",
+        ),
+        _record(
+            scenario_id="image-pull-expanded-a",
+            scenario_class=ScenarioClass.IMAGE_CONFIG,
+            question="fresh image 1",
+            root_cause="image_pull_auth",
+            sort_key="105",
+        ),
+        _record(
+            scenario_id="missing-secret-expanded-a",
+            scenario_class=ScenarioClass.IMAGE_CONFIG,
+            question="fresh image 2",
+            root_cause="missing_secret",
+            sort_key="106",
+        ),
+    )
+    expanded_records = consumed_records + expanded_fresh_records
+    consumed = _consumed_assignments(consumed_ids, expanded_records)
+    monkeypatch.setattr(stable_scenarios, "korvid_distribution_version", lambda: "0.3.0")
+    monkeypatch.setattr(stable_scenarios, "_load_catalog", lambda version: tuple(reversed(expanded_records)))
+
+    rollover = stable_scenarios.build_rollover_scenario_manifest(consumed, target_per_split=6)
+
+    assignments_by_id = {
+        assignment.scenario_id: assignment.scenario_class for assignment in rollover.manifest.assignments
+    }
+    assert [assignments_by_id[scenario_id] for scenario_id in rollover.manifest.milestone] == [
+        ScenarioClass.HEALTHY_CONTROL,
+        ScenarioClass.WORKLOAD_HEALTH,
+        ScenarioClass.IMAGE_CONFIG,
+        ScenarioClass.HEALTHY_CONTROL,
+        ScenarioClass.WORKLOAD_HEALTH,
+        ScenarioClass.IMAGE_CONFIG,
+    ]
+    assert set(rollover.manifest.milestone).isdisjoint(rollover.consumed_ids)
+    assert set(rollover.manifest.milestone) <= {record.scenario_id for record in expanded_fresh_records}
+    assert set(rollover.audit_reserve_ids) <= {record.scenario_id for record in expanded_fresh_records}
+
+
 def test_rollover_manifest_rejects_changed_korvid_version(monkeypatch: pytest.MonkeyPatch) -> None:
     records, consumed_ids = _rollover_catalog()
     consumed = list(_consumed_assignments(consumed_ids, records))
