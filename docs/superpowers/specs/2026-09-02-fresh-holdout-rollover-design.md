@@ -130,7 +130,8 @@ targeted pairs, and one all-axis candidate. Every candidate:
 - preserves the installed baseline `system` component byte-for-byte;
 - adds only a canonical `append`;
 - remains at most 480 characters;
-- records the prior finalist fingerprint and v2 receipt hash in metadata;
+- records the prior finalist fingerprint and prior stable-search summary hash
+  in metadata;
 - has an ID and fingerprint derived deterministically from its content.
 
 No v3 candidate text may depend on the untouched milestone identities or
@@ -172,7 +173,7 @@ bank before another qualification attempt.
 The v3 output root remains immutable and contains the existing normalized
 artifacts plus `rollover-lineage.json`. The lineage records:
 
-- prior campaign decision and receipt SHA-256;
+- prior campaign decision and stable-search summary SHA-256;
 - prior scenario-manifest SHA-256;
 - consumed scenario digests;
 - fresh milestone digests;
