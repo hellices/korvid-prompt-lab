@@ -669,6 +669,7 @@ def _validate_comparison_summary(
         expected_triplets=expected_triplets,
         context="comparison-summary.contract.evidence_sources",
         required=schema_version == 2,
+        expected_backend=evaluation_backend,
     )
     if comparison_evidence_sources != expected_evidence_sources:
         raise ValueError(
@@ -876,6 +877,7 @@ def _validate_evidence_sources(
     expected_triplets: list[tuple[str, str, int]],
     context: str,
     required: bool,
+    expected_backend: str,
 ) -> tuple[tuple[str, str, int, str, str, str], ...]:
     if not isinstance(value, list) or (required and not value):
         requirement = "a non-empty list" if required else "a list"
@@ -901,6 +903,8 @@ def _validate_evidence_sources(
         kind = _require_str(entry[3], f"{entry_context}.kind")
         if kind not in _VERSIONED_EVIDENCE_BACKENDS:
             raise ValueError(f"{entry_context}.kind must be korvid_readonly, korvid_navigation, or korvid_native")
+        if kind != expected_backend:
+            raise ValueError(f"{entry_context} backend mismatch: expected {expected_backend}, got {kind}")
         korvid_version = _require_str(
             entry[4], f"{entry_context}.korvid_version"
         )
@@ -934,6 +938,7 @@ def _load_response_evidence_sources(
     *,
     expected_triplets: list[tuple[str, str, int]],
     expected_candidate_fingerprint: str,
+    expected_backend: str,
     expected_root_identity: tuple[int, int],
     expected_runs: Mapping[
         tuple[str, str, int],
@@ -1017,6 +1022,7 @@ def _load_response_evidence_sources(
         expected_triplets=expected_triplets,
         context="response.evidence_source",
         required=True,
+        expected_backend=expected_backend,
     )
 
 
@@ -1156,6 +1162,7 @@ def _validate_before_response_metrics(
     expected_candidate_fingerprint: str,
     expected_root_identity: tuple[int, int],
     readonly: bool,
+    expected_backend: str,
     expected_evidence_sources: tuple[
         tuple[str, str, int, str, str, str], ...
     ],
@@ -1254,6 +1261,7 @@ def _validate_before_response_metrics(
             expected_triplets=expected_triplets,
             context="before-response.evidence_source",
             required=True,
+            expected_backend=expected_backend,
         )
         if before_sources != expected_evidence_sources:
             raise ValueError(
@@ -2024,6 +2032,7 @@ def load_round_outcome(
         expected_triplets=expected_evidence_triplets,
         context="round-summary.evidence_sources",
         required=round_schema_version == 2,
+        expected_backend=control.evaluation_backend,
     )
     if round_schema_version == 2:
         response_evidence_sources = _load_response_evidence_sources(
@@ -2031,6 +2040,7 @@ def load_round_outcome(
             round_summary.get("evaluation_artifact_refs"),
             expected_triplets=expected_evidence_triplets,
             expected_candidate_fingerprint=candidate_fingerprint,
+            expected_backend=control.evaluation_backend,
             expected_root_identity=safe_root_identity,
             expected_runs=round_runs,
         )
@@ -2142,6 +2152,7 @@ def load_round_outcome(
                 expected_candidate_fingerprint=state.champion_fingerprint,
                 expected_root_identity=safe_root_identity,
                 readonly=control.evaluation_backend in _VERSIONED_EVIDENCE_BACKENDS,
+                expected_backend=control.evaluation_backend,
                 expected_evidence_sources=round_evidence_sources,
             )
         core_regression = _validate_comparison_summary(

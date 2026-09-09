@@ -702,6 +702,21 @@ class TestLoadRoundOutcome:
         )
         assert outcome.search_improved is True
 
+    def test_native_control_rejects_consistent_but_foreign_backend_provenance(self, tmp_path: Path) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        _upgrade_round_summary_to_readonly(root)
+        _upgrade_comparison_to_readonly(root)
+        path = root / "round-summary.json"
+        summary = json.loads(path.read_text())
+        summary["evaluation_backend"] = "korvid_native"
+        path.write_text(json.dumps(summary))
+        control = replace(_control(), evaluation_backend="korvid_native")
+        with pytest.raises(ValueError, match="backend"):
+            load_round_outcome(
+                root, _search_action(control=control), control=control, state=_state(),
+            )
+
     def test_readonly_search_rejects_comparison_provenance_mismatch(
         self, tmp_path: Path
     ) -> None:

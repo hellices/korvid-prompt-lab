@@ -132,6 +132,8 @@ class KorvidNativeRunner:
             raise ValueError("invalid native repetition")
         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
             raise ValueError("invalid native seed")
+        if case not in self.campaign.cases or case.models != self.campaign.models:
+            raise ValueError("native case and model must match the declared campaign entry")
         authored = find_native_case(case.case_id)
         if case.prompt != authored.prompt or case.template_id != f"native-{authored.split}" or len(case.models) != 1:
             raise ValueError("native case does not match its authored identity")
