@@ -12,6 +12,8 @@ from .contracts import (
     Campaign,
     Candidate,
     EvalCase,
+    KorvidNativeServing,
+    KorvidNavigationServing,
     KorvidReadonlyServing,
     ProcessServing,
     _ensure_keys,
@@ -124,6 +126,29 @@ def _parse_korvid_readonly_serving(mapping: Mapping[str, Any]) -> KorvidReadonly
     )
 
 
+def _parse_navigation_serving(mapping: Mapping[str, Any]) -> KorvidNavigationServing:
+    _ensure_keys(
+        mapping, {"backend", "base_url", "timeout_seconds", "max_iterations"},
+        "serving.korvid_navigation",
+    )
+    iterations = mapping.get("max_iterations")
+    if isinstance(iterations, bool) or not isinstance(iterations, int) or not 1 <= iterations <= 12:
+        raise ValueError("serving.max_iterations must be an integer between 1 and 12")
+    base_url = _resolve_required_env_string(mapping.get("base_url"), "serving.base_url")
+    from urllib.parse import urlsplit
+
+    from .runner import _require_loopback_endpoint
+
+    parsed = urlsplit(base_url)
+    if parsed.path != "/v1":
+        raise ValueError("navigation model base_url must end with /v1")
+    _require_loopback_endpoint(base_url.removesuffix("/v1"))
+    return KorvidNavigationServing(
+        backend="korvid_navigation", base_url=base_url, max_iterations=iterations,
+        timeout_seconds=_require_bridge_timeout(mapping.get("timeout_seconds"), "serving.timeout_seconds"),
+    )
+
+
 def load_campaign(path: Path | str) -> Campaign:
     data = _require_mapping(_load_yaml(path), "campaign")
     _ensure_keys(
@@ -169,15 +194,58 @@ def load_campaign(path: Path | str) -> Campaign:
 
     serving_mapping = _require_mapping(data.get("serving"), "serving")
     backend = _require_string(serving_mapping.get("backend"), "serving.backend")
-    serving: ProcessServing | AKSPortForwardServing | KorvidReadonlyServing
+    serving: ProcessServing | AKSPortForwardServing | KorvidReadonlyServing | KorvidNavigationServing | KorvidNativeServing
     if backend == "process":
         serving = _parse_process_serving(serving_mapping)
     elif backend == "aks_port_forward":
         serving = _parse_aks_serving(serving_mapping)
     elif backend == "korvid_readonly":
         serving = _parse_korvid_readonly_serving(serving_mapping)
+    elif backend == "korvid_navigation":
+        serving = _parse_navigation_serving(serving_mapping)
+        from .navigation_cases import (
+            find_navigation_case,
+            require_complete_navigation_pack,
+        )
+
+        require_complete_navigation_pack(case_ids)
+        for case in cases:
+            authored = find_navigation_case(case.case_id)
+            if case.prompt != authored.prompt or case.template_id != f"navigation-{authored.split}":
+                raise ValueError(f"navigation case does not match its authored task: {case.case_id}")
+    elif backend == "korvid_native":
+        from .native_contract import (
+            NATIVE_KORVID_REVISION,
+            find_native_case,
+            require_native_pack,
+        )
+        from .runner import _require_loopback_endpoint
+
+        _ensure_keys(
+            serving_mapping, {"backend", "source_root", "base_url", "korvid_revision", "timeout_seconds"},
+            "serving.korvid_native",
+        )
+        revision = _require_string(serving_mapping.get("korvid_revision"), "serving.korvid_revision")
+        if revision != NATIVE_KORVID_REVISION:
+            raise ValueError("native campaign must use the reviewed Korvid v0.4.1 revision")
+        endpoint = _resolve_required_env_string(serving_mapping.get("base_url"), "serving.base_url")
+        _require_loopback_endpoint(endpoint)
+        if len(models) != 1 or any(case.models != models for case in cases):
+            raise ValueError("native cases must use exactly the single campaign model")
+        require_native_pack(case_ids)
+        for case in cases:
+            authored = find_native_case(case.case_id)
+            if case.prompt != authored.prompt or case.template_id != f"native-{authored.split}":
+                raise ValueError(f"native case differs from its authored task: {case.case_id}")
+        serving = KorvidNativeServing(
+            backend=backend,
+            source_root=_resolve_required_env_string(serving_mapping.get("source_root"), "serving.source_root"),
+            base_url=endpoint,
+            korvid_revision=revision,
+            timeout_seconds=_require_bridge_timeout(serving_mapping.get("timeout_seconds"), "serving.timeout_seconds"),
+        )
     else:
-        raise ValueError("serving backend must be process, aks_port_forward, or korvid_readonly")
+        raise ValueError("serving backend must be process, aks_port_forward, korvid_readonly, korvid_navigation, or korvid_native")
 
     return Campaign(
         schema_version=1,

@@ -16,7 +16,6 @@ from .aks import (
     AKSPreflightTransientError,
 )
 from .artifacts import write_json_artifact
-from .baseline import PROFILE_NAMES, build_baseline_candidate, write_baseline_candidate
 from .bridge_worker import EXECUTION_MODE_LIVE
 from .config import load_campaign, load_candidate
 from .contracts import (
@@ -24,9 +23,13 @@ from .contracts import (
     Campaign,
     Candidate,
     EvalCase,
+    KorvidNativeServing,
+    KorvidNavigationServing,
     KorvidReadonlyServing,
 )
-from .korvid_readonly import KorvidReadonlyRunner
+from .native import KorvidNativeRunner
+from .native_cli import add_native_commands, native_selections
+from .navigation_cli import add_navigation_commands, navigation_selections
 from .optimize import (
     DEFAULT_OPTIMIZATION_SEED,
     OptimizationArtifacts,
@@ -97,6 +100,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write the evaluation summary JSON to stdout.",
     )
     evaluate_parser.set_defaults(func=command_evaluate)
+    evaluate_parser.add_argument(
+        "--navigation-split", choices=("train", "validation", "holdout"),
+        help="Navigation-only case selection; defaults to validation, never holdout.",
+    )
 
     optimize_parser = subparsers.add_parser(
         "optimize", help="Run GEPA optimization with DSPy reflection."
@@ -196,7 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     baseline_parser.add_argument(
         "--profile",
-        choices=PROFILE_NAMES,
+        choices=("small", "full"),
         required=True,
         help="Installed Korvid agent profile to materialize (small or full).",
     )
@@ -207,6 +214,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to write the immutable baseline candidate YAML to; must not already exist.",
     )
     baseline_parser.set_defaults(func=command_korvid_baseline)
+    add_navigation_commands(subparsers)
+    add_native_commands(subparsers)
 
     return parser
 
@@ -251,6 +260,8 @@ def command_validate(args: argparse.Namespace) -> int:
 def command_evaluate(args: argparse.Namespace) -> int:
     try:
         candidate, campaign = _load_candidate_campaign(args.candidate, args.campaign)
+        native_selections(args, campaign)
+        navigation_selections(args, campaign)
         selected_cases = _select_cases(campaign.cases, args.case_ids)
         case_sets = _resolve_case_sets(
             args,
@@ -326,6 +337,8 @@ def command_optimize(args: argparse.Namespace) -> int:
 
     try:
         candidate, campaign = _load_candidate_campaign(args.candidate, args.campaign)
+        native_selections(args, campaign)
+        navigation_selections(args, campaign)
         _require_non_negative_seed(args.seed)
         _require_case_selection("--train-case-id", args.train_case_ids)
         _require_case_selection("--validation-case-id", args.validation_case_ids)
@@ -428,6 +441,8 @@ def command_publish(args: argparse.Namespace) -> int:
 
 
 def command_korvid_baseline(args: argparse.Namespace) -> int:
+    from .baseline import build_baseline_candidate, write_baseline_candidate
+
     try:
         candidate = build_baseline_candidate(args.profile)
         write_baseline_candidate(candidate, args.output)
@@ -467,7 +482,15 @@ def _build_runner(campaign: Campaign, *, model_endpoint: str | None) -> KorvidRu
     their existing KorvidProcessRunner construction unchanged.
     """
     if isinstance(campaign.serving, KorvidReadonlyServing):
+        from .korvid_readonly import KorvidReadonlyRunner
+
         return KorvidReadonlyRunner(campaign=campaign)
+    if isinstance(campaign.serving, KorvidNavigationServing):
+        from .navigation import KorvidNavigationRunner
+
+        return KorvidNavigationRunner(campaign=campaign)
+    if isinstance(campaign.serving, KorvidNativeServing):
+        return KorvidNativeRunner(campaign=campaign)
     return KorvidProcessRunner(
         campaign=campaign,
         timeout_seconds=campaign.bridge_timeout_seconds,

@@ -245,12 +245,13 @@ def test_build_round_report_rejects_unsafe_evidence_source_version(
         build_round_report(artifact_root)
 
 
+@pytest.mark.parametrize("backend", ["korvid_readonly", "korvid_navigation", "korvid_native"])
 def test_safe_readonly_round_summary_carries_backend_provenance(
-    tmp_path: Path,
+    tmp_path: Path, backend: str,
 ) -> None:
     payload = response("completed")
     payload["evidence_source"] = {
-        "kind": "korvid_readonly",
+        "kind": backend,
         "korvid_version": "0.3.0",
         "scenario_sha256": "a" * 64,
     }
@@ -263,9 +264,9 @@ def test_safe_readonly_round_summary_carries_backend_provenance(
         (safe_output / "round-summary.json").read_text(encoding="utf-8")
     )
     assert summary["schema_version"] == 2
-    assert summary["evaluation_backend"] == "korvid_readonly"
+    assert summary["evaluation_backend"] == backend
     assert summary["evidence_sources"] == [
-        ["case-a", "model-a", 1, "korvid_readonly", "0.3.0", "a" * 64]
+        ["case-a", "model-a", 1, backend, "0.3.0", "a" * 64]
     ]
 
 

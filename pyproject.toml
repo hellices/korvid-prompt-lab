@@ -10,7 +10,6 @@ requires-python = ">=3.11"
 dependencies = [
     "dspy",
     "gepa",
-    "korvid[agent]>=0.3",
     "PyYAML",
 ]
 
@@ -21,7 +20,8 @@ korvid-grounding-report = "korvid_prompt_lab.round_cli:main"
 korvid-campaign = "korvid_prompt_lab.campaign_cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest", "mypy", "ruff"]
+legacy = ["korvid[agent,mcp]==0.3.0"]
+dev = ["pytest", "mypy", "ruff", "korvid-prompt-lab[legacy]"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -33,6 +33,9 @@ where = ["src"]
 testpaths = ["tests"]
 
 [tool.mypy]
+exclude = ["src/korvid_prompt_lab/native_worker\\.py$"]
+# native_worker is checked separately with --python-executable pointing to
+# the pinned 0.4.1 source environment; this environment covers legacy 0.3.
 
 # Legacy write/approval bridge tests import Korvid checkout-only test modules.
 [[tool.mypy.overrides]]

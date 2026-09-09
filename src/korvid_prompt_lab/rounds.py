@@ -595,7 +595,10 @@ def write_safe_evidence(
         "reproduction_command": list(report.reproduction_command),
         **(
             {
-                "evaluation_backend": "korvid_readonly",
+                "evaluation_backend": (
+                    evidence_sources[0][3]
+                    if len({source[3] for source in evidence_sources}) == 1 else "mixed"
+                ),
                 "evidence_sources": [list(source) for source in evidence_sources],
             }
             if evidence_sources
@@ -899,9 +902,9 @@ def _parse_evidence_source(value: Any) -> tuple[str, str, str] | None:
     source = _require_response_mapping({"evidence_source": value}, "evidence_source")
     _ensure_keys(source, _EVIDENCE_SOURCE_ALLOWED_KEYS, "evidence_source")
     kind = _require_response_string(source, "kind")
-    if kind != "korvid_readonly":
+    if kind not in {"korvid_readonly", "korvid_navigation", "korvid_native"}:
         raise BridgeMalformedOutputError(
-            "evidence_source.kind must be korvid_readonly"
+            "evidence_source.kind must be korvid_readonly, korvid_navigation, or korvid_native"
         )
     korvid_version = _require_response_string(source, "korvid_version")
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.!+_-]{0,63}", korvid_version) is None:

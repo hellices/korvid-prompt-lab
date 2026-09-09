@@ -39,6 +39,8 @@ from .campaigns import (
 from .contracts import Candidate
 from .scoring import RepetitionOutcome, pass_hat_k
 
+_VERSIONED_EVIDENCE_BACKENDS = frozenset({"korvid_readonly", "korvid_navigation", "korvid_native"})
+
 #: Files the safe ingestion layer is allowed to read from a round evidence package.
 _ALLOWED_FILES = frozenset({
     "round-summary.json",
@@ -515,7 +517,7 @@ def _validate_comparison_summary(
     )
     if schema_version not in {1, 2}:
         raise ValueError("comparison-summary.schema_version must be 1 or 2")
-    expected_schema_version = 2 if evaluation_backend == "korvid_readonly" else 1
+    expected_schema_version = 2 if evaluation_backend in _VERSIONED_EVIDENCE_BACKENDS else 1
     if schema_version != expected_schema_version:
         raise ValueError(
             "comparison-summary.schema_version must be "
@@ -897,8 +899,8 @@ def _validate_evidence_sources(
             )
         source_triplets.add(triplet)
         kind = _require_str(entry[3], f"{entry_context}.kind")
-        if kind != "korvid_readonly":
-            raise ValueError(f"{entry_context}.kind must be korvid_readonly")
+        if kind not in _VERSIONED_EVIDENCE_BACKENDS:
+            raise ValueError(f"{entry_context}.kind must be korvid_readonly, korvid_navigation, or korvid_native")
         korvid_version = _require_str(
             entry[4], f"{entry_context}.korvid_version"
         )
@@ -1724,7 +1726,7 @@ def load_round_outcome(
         round_summary.get("schema_version"), "round-summary.schema_version"
     )
     expected_round_schema = (
-        2 if control.evaluation_backend == "korvid_readonly" else 1
+        2 if control.evaluation_backend in _VERSIONED_EVIDENCE_BACKENDS else 1
     )
     if round_schema_version != expected_round_schema:
         raise ValueError(
@@ -2139,7 +2141,7 @@ def load_round_outcome(
                 expected_triplets=expected_evidence_triplets,
                 expected_candidate_fingerprint=state.champion_fingerprint,
                 expected_root_identity=safe_root_identity,
-                readonly=control.evaluation_backend == "korvid_readonly",
+                readonly=control.evaluation_backend in _VERSIONED_EVIDENCE_BACKENDS,
                 expected_evidence_sources=round_evidence_sources,
             )
         core_regression = _validate_comparison_summary(

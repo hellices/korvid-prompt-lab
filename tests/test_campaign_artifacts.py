@@ -688,6 +688,20 @@ class TestLoadRoundOutcome:
                 root, _search_action(control=control), control=control, state=_state()
             )
 
+    @pytest.mark.parametrize("backend", ["korvid_navigation", "korvid_native"])
+    def test_accepts_navigation_schema_v2_evidence(self, tmp_path: Path, backend: str) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        _upgrade_round_summary_to_readonly(root)
+        _upgrade_comparison_to_readonly(root)
+        for path in root.rglob("*.json"):
+            path.write_text(path.read_text().replace("korvid_readonly", backend))
+        control = replace(_control(), evaluation_backend=backend)
+        outcome = load_round_outcome(
+            root, _search_action(control=control), control=control, state=_state(),
+        )
+        assert outcome.search_improved is True
+
     def test_readonly_search_rejects_comparison_provenance_mismatch(
         self, tmp_path: Path
     ) -> None:

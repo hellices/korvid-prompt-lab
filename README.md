@@ -1,8 +1,13 @@
 # Korvid Prompt Lab
 
-Korvid Prompt Lab is a small control plane for validating prompt candidates,
-running deterministic bridge evaluations, exercising read-only AKS preflight,
-and publishing prompt bundles with a common-first, safety-gated override policy.
+Korvid Prompt Lab optimizes additive **`agent.rules` for Korvid's native low-tier
+UI assistant**. Korvid is the source of truth: Prompt Lab evaluates its real
+policy, prompt harness, session, and screen-follow behavior instead of inventing
+a different agent and treating its results as native Korvid performance.
+
+The earlier 0.3 MCP navigation, diagnostic, and write/approval campaigns remain
+explicitly separate legacy experiments. Their scores are not native 0.4.1
+results, and their candidates must not be applied as current Korvid config.
 
 Run commands from the repository root so relative fixture and artifact paths
 resolve as documented.
@@ -13,11 +18,274 @@ resolve as documented.
 uv sync --python 3.12 --extra dev
 ```
 
+`dev` includes the optional `legacy` extra for the existing 0.3 regression tests.
+The primary control plane does not import or require that wheel. Production
+native evaluation runs in a separate, pinned Korvid source environment.
+
 CLI entrypoint:
 
 ```bash
 uv run --python 3.12 korvid-prompt-lab --help
 ```
+
+## Start here: unchanged Korvid v0.4.1 and directly applicable rules
+
+### Prepare the source environment
+
+Korvid v0.4.1 excludes evals from wheels and sdists. Use its unmodified source
+checkout, not an installed 0.3 harness and not a mutable `main`:
+
+```bash
+git clone --branch v0.4.1 --depth 1 https://github.com/hellices/korvid.git /path/to/korvid-native
+git -C /path/to/korvid-native rev-parse HEAD
+# Must be 33c483e041006eb20259a024ed85a9323e52c8f0.
+
+uv sync --project /path/to/korvid-native --python 3.12 --frozen --extra agent
+export KORVID_NATIVE_SOURCE_ROOT=/path/to/korvid-native
+export KORVID_NATIVE_MODEL_URL=http://127.0.0.1:11434
+```
+
+The worker uses that checkout's `.venv/bin/python`, verifies its exact commit
+and clean worktree, and does not install packages while evaluating. If your
+package mirror cannot supply the lock, preparing the environment from the
+unchanged declared dependencies is possible, but is **not lock-reproduced
+evidence**: preserve the recorded runtime dependency versions and do not combine
+results from different environments.
+
+### Create the native baseline
+
+```bash
+uv run korvid-prompt-lab native-init \
+  --directory artifacts/native --model ollama/qwen3:0.6b --repetitions 3
+uv run korvid-prompt-lab native-check \
+  --candidate artifacts/native/candidate.yaml \
+  --campaign artifacts/native/campaign.yaml
+```
+
+The seed's single `rules` component is the JSON string `[]`: Korvid's exact
+shipped behavior with **no additional user rules**. A changed candidate encodes
+a JSON array of at most 16 non-blank strings, each at most 1000 characters. Those
+strings go into native `user_rules`, in order and without rewriting. They never
+replace the immutable safety contract, the tier pack, or tool schemas.
+
+The native pack has 15 tasks: Pod view, Helm view, all-namespace Pod view, log
+pane, and describe view, with 5 train / 5 validation / 5 holdout cases and mixed
+Korean/English requests. Names and request wording differ across splits.
+Filtering and revision drill-down from the legacy 24-case MCP pack are not
+silently promoted to low-tier capabilities.
+
+The low model uses its real read tools and Korvid's default follow behavior:
+`list_resources` moves the view and `helm_list_releases` opens Helm, while
+`open_logs` and `open_describe` are already low-tier UI tools. We do not expose
+extra tools or force the model onto the high tier to make a case pass.
+
+### Evaluate, search, then hold out
+
+```bash
+uv run korvid-prompt-lab evaluate \
+  --candidate artifacts/native/candidate.yaml --campaign artifacts/native/campaign.yaml \
+  --artifact-root artifacts/native/before --json
+
+uv run korvid-prompt-lab optimize \
+  --candidate artifacts/native/candidate.yaml --campaign artifacts/native/campaign.yaml \
+  --artifact-root artifacts/native/search --max-metric-calls 64 --seed 0 \
+  --reflection-model ollama_chat/qwen3:14b
+
+# Use the optimizer's printed best_candidate path:
+uv run korvid-prompt-lab evaluate \
+  --candidate <best-candidate-path> --campaign artifacts/native/campaign.yaml \
+  --artifact-root artifacts/native/after --json
+
+uv run korvid-prompt-lab evaluate \
+  --candidate <best-candidate-path> --campaign artifacts/native/campaign.yaml \
+  --navigation-split holdout --artifact-root artifacts/native/holdout --json
+```
+
+Default evaluation is validation-only; holdout is explicit and cannot enter
+GEPA search. Configure the reflection teacher's local endpoint separately.
+Search changes only additive rules. Its feedback includes the synthetic
+request, native policy, tool results, and actual screen-state differences.
+Provider/runtime failures abort evidence generation rather than earning prompt
+scores. Synthetic scripted runs remain `scripted`, never live quality evidence.
+
+The native worker uses the real `KorvidApp` and `AgentUIController` over
+synthetic read/watch data. This matters: the standalone session/eval harness
+does **not** itself include the UI controller's read-follow behavior. Tool
+acknowledgements or a plausible final answer alone do not establish screen
+success. Actual view, scope, and opened target are checked.
+
+### Export and apply
+
+```bash
+uv run korvid-prompt-lab native-export \
+  --candidate <best-candidate-path> --campaign artifacts/native/campaign.yaml \
+  --directory artifacts/native/export
+```
+
+`korvid-config.yaml` uses current `agent.active`, `agent.profiles`,
+`agent.model_tier: low`, `agent.follow: true`, and `agent.rules`. Export reloads
+the serialized file with the pinned Korvid config parser and verifies that no
+rules were dropped or changed. `application-manifest.json` records source,
+candidate, composed prompt, and policy identities. Configuration compatibility
+is not model-quality qualification: its `qualification` remains `not_assessed`.
+
+Review the generated settings and merge them into your existing
+`~/.config/korvid/config.yaml`, preserving your cluster and unrelated UI
+configuration. For a fresh setup it is a complete agent configuration; it sets
+`readonly: true` and a keyless loopback Ollama connection. No command here
+overwrites your personal config or changes a running cluster. Restart Korvid
+after applying. Old `agent.profile` and `agent.prompts.*` are **not** valid
+v0.4.1 application formats.
+
+Replacing a tier pack or publishing an exact-model overlay is a separate,
+reviewed Korvid source change. `PromptGrind`'s eval-only overlay is not exported
+as if it were equivalent to an additive rule.
+
+### Verification commands
+
+```bash
+uv run pytest -q
+uv run mypy src tests
+uv run ruff check src tests
+
+# Native application tests invoke the isolated worker as a subprocess:
+KORVID_NATIVE_SOURCE_ROOT=/path/to/korvid-native \
+  uv run pytest tests/test_native_application.py -q
+# Worker unit tests run with the native interpreter and source imports:
+KORVID_NATIVE_SOURCE_ROOT=/path/to/korvid-native \
+  PYTHONPATH="$PWD/src:/path/to/korvid-native/src" \
+  /path/to/korvid-native/.venv/bin/python -m pytest tests/test_native_worker.py -q
+MYPYPATH="$PWD/src/korvid_prompt_lab:/path/to/korvid-native/src" \
+  uv run mypy --explicit-package-bases \
+  --python-executable /path/to/korvid-native/.venv/bin/python \
+  src/korvid_prompt_lab/native_worker.py
+```
+
+The worker is type-checked in its own 0.4.1 environment, not against the legacy
+0.3 wheel used by old tests. Real local-model improvement still requires the
+baseline/candidate runs above; passing scripted integration tests is not that
+claim.
+
+## Legacy: external MCP navigation on Korvid 0.3
+
+This is a separate external MCP agent experiment, **not** the recommended native
+optimization or current Korvid deployment path. Install with `--extra legacy`
+to run it; the following commands and APIs intentionally refer to 0.3 only.
+
+The navigation path uses the installed Korvid **0.3.x** MCP schemas and agent
+runtime, not the `small` agent profile's reduced tool list (that profile does not
+expose all navigation tools). The model still may be small: model size and tool
+availability are independent.
+
+### Prepare a prompt and evaluation pack
+
+```bash
+export KORVID_NAVIGATION_MODEL_URL=http://127.0.0.1:11434/v1
+
+uv run korvid-prompt-lab navigation-init \
+  --directory artifacts/navigation --model qwen3:0.6b --repetitions 3
+```
+
+This creates `candidate.yaml` and `campaign.yaml` without overwriting existing
+work. The candidate is a compact **navigation-specific seed**, not a claim that
+an optimized prompt already outperforms Korvid's shipped prompt.
+
+The pack contains 24 synthetic UI tasks: 8 train, 8 validation, and 8 explicit
+holdout tasks. Every split covers Pod view, Helm view, all namespaces, applying
+and clearing a filter, log pane, describe screen, and Helm revision history.
+Each split includes Korean and English requests; targets and wording differ
+across splits. Same-named resources in another namespace exercise target scoping.
+These are new navigation tasks owned by Prompt Lab, not renamed diagnostic
+scenarios. They are a starting benchmark, not proof of generalization to every
+Korvid interaction.
+
+### Evaluate and optimize
+
+```bash
+# Defaults to validation only. It never implicitly evaluates holdout.
+uv run korvid-prompt-lab evaluate \
+  --candidate artifacts/navigation/candidate.yaml \
+  --campaign artifacts/navigation/campaign.yaml \
+  --artifact-root artifacts/navigation/before --json
+
+# Train/validation IDs come from the authored splits; holdout cannot enter GEPA.
+# The reflection model is a separate local teacher, not necessarily the tiny target.
+uv run korvid-prompt-lab optimize \
+  --candidate artifacts/navigation/candidate.yaml \
+  --campaign artifacts/navigation/campaign.yaml \
+  --artifact-root artifacts/navigation/search \
+  --max-metric-calls 64 --seed 0 \
+  --reflection-model ollama_chat/qwen3:14b
+```
+
+Configure the reflection provider's local endpoint as in the existing Optimize
+setup. Do not send private cluster data to an external reflection provider.
+Use the printed `best_candidate=...` path to run `evaluate` again into a new
+artifact directory under the same campaign. Compare repeated validation
+results, not one lucky run. GEPA metric calls are search evaluations, not a
+count of improved candidates; inspect the recorded actual calls and
+`best_candidate_differs_from_seed`.
+
+Only after choosing a candidate, run an independent holdout check:
+
+```bash
+uv run korvid-prompt-lab evaluate \
+  --candidate <best-candidate-path> \
+  --campaign artifacts/navigation/campaign.yaml \
+  --navigation-split holdout \
+  --artifact-root artifacts/navigation/holdout --json
+```
+
+Do not use holdout failures to repeatedly tune the same benchmark. Expand the
+pack with genuinely new tasks when turning those failures into training data.
+These navigation results do not qualify a prompt for cluster writes.
+
+### Use the candidate on a real Korvid screen
+
+Start Korvid with MCP enabled (`korvid --mcp`). Explicitly select its loopback
+endpoint; do not guess between multiple running instances:
+
+```bash
+export KORVID_NAVIGATION_MCP_URL=http://127.0.0.1:7878/mcp
+
+uv run korvid-prompt-lab navigation-assist \
+  --candidate artifacts/navigation/candidate.yaml \
+  --campaign artifacts/navigation/campaign.yaml \
+  --prompt "Open the Helm releases screen in namespace monitoring."
+```
+
+Replace the candidate path with the measured winner when one exists.
+`navigation-assist` uses the same model/MCP execution path as evaluation. It
+allows only `navigate`, `set_filter`, `drill_down`, `open_logs`,
+`open_describe`, `list_resources`, and `helm_list_releases`. Model-invented
+write/proposal/diagnostic tools are rejected before dispatch. Opening logs is
+a screen action; fetching them for diagnosis is not part of this assistant.
+Model and MCP endpoints must be explicit loopback URLs. Local requests ignore
+environment proxies and refuse redirects.
+
+### What is actually measured
+
+Evaluation starts a real headless `KorvidApp` with synthetic watch/read data,
+then calls the real `KorvidMCPServer` over Streamable HTTP. It observes the
+actual view, namespace, filter, drill parent, and displayed log/describe target.
+A prose answer such as "opened Helm" earns no task completion without the
+matching screen transition. Wrong namespace, missing action, failed calls, and
+blocked tools cannot pass. No real cluster is contacted or changed by the
+evaluation fixture.
+
+GEPA receives the authored synthetic request, available tool schemas, actual
+calls/results, and expected-versus-observed state. This is causal feedback,
+not just a missing-item count. Public response projections still omit answers
+and detailed traces; rich feedback is confined to the synthetic optimization
+workspace. Live `navigation-assist` does not persist a conversation or tool
+outputs.
+
+Korvid 0.3 does **not** expose a separate MCP screen-snapshot endpoint. Therefore
+live assist reports tool acknowledgements with `screen_state_verified: false`;
+only the instrumented headless evaluation asserts observed screen state. Do not
+confuse these guarantees. The backend does not claim deterministic model
+seeding. Scripted-provider tests are labelled `scripted`, never live-model
+quality evidence.
 
 ## Korvid read-only evals
 

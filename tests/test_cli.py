@@ -2608,11 +2608,12 @@ def _patch_runner_recorders(
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[list[Any], list[Any]]:
     from korvid_prompt_lab import cli as cli_module
+    from korvid_prompt_lab import korvid_readonly
 
     process_created: list[Any] = []
     readonly_created: list[Any] = []
     real_process_runner = cli_module.KorvidProcessRunner
-    real_readonly_runner = cli_module.KorvidReadonlyRunner
+    real_readonly_runner = korvid_readonly.KorvidReadonlyRunner
 
     def recording_process_runner(**kwargs: Any) -> Any:
         runner = real_process_runner(**kwargs)
@@ -2628,7 +2629,7 @@ def _patch_runner_recorders(
         "korvid_prompt_lab.cli.KorvidProcessRunner", recording_process_runner
     )
     monkeypatch.setattr(
-        "korvid_prompt_lab.cli.KorvidReadonlyRunner", recording_readonly_runner
+        "korvid_prompt_lab.korvid_readonly.KorvidReadonlyRunner", recording_readonly_runner
     )
     return process_created, readonly_created
 
