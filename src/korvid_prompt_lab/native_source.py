@@ -15,17 +15,31 @@ from .native_contract import NATIVE_KORVID_REVISION
 from .runner import BridgeInvocationError, _terminate_process_group
 
 
+def _native_environment() -> dict[str, str]:
+    return {
+        key: value for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
+
+
 def validate_native_source(root: Path) -> Path:
     root = root.resolve(strict=True)
+    env = _native_environment()
     revision = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "HEAD"],
-        capture_output=True, text=True, timeout=15, check=False,
+        capture_output=True, text=True, timeout=15, check=False, env=env,
     )
     if revision.returncode or revision.stdout.strip() != NATIVE_KORVID_REVISION:
         raise ValueError("native Korvid source revision must match the reviewed v0.4.1 commit")
+    checkout = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True, timeout=15, check=False, env=env,
+    )
+    if checkout.returncode or Path(checkout.stdout.rstrip("\n")).resolve() != root:
+        raise ValueError("native source must be the attested Git repository root")
     status = subprocess.run(
         ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=normal"],
-        capture_output=True, text=True, timeout=15, check=False,
+        capture_output=True, text=True, timeout=15, check=False, env=env,
     )
     if status.returncode or status.stdout.strip():
         raise ValueError("native Korvid source must be unchanged; do not patch the product for evaluation")
@@ -45,7 +59,7 @@ def run_native_request(serving: KorvidNativeServing, payload: dict[str, Any]) ->
         private = Path(temporary)
         request_path = write_json_artifact(private / "request.json", payload)
         response_path = private / "response.json"
-        env = dict(os.environ)
+        env = _native_environment()
         for key in list(env):
             if key.lower() in {"http_proxy", "https_proxy", "all_proxy"}:
                 del env[key]

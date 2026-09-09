@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -36,6 +37,60 @@ def test_unreviewed_source_is_rejected_before_worker_start(tmp_path: Path) -> No
     subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
     with pytest.raises(ValueError, match="revision"):
         validate_native_source(tmp_path)
+
+
+def _source_repo(root: Path) -> str:
+    subprocess.run(["git", "init", "--quiet", str(root)], check=True)
+    (root / ".gitignore").write_text(".venv/\n")
+    for name in ("src/korvid/evals/harness.py", "src/korvid/ui/agent_ui_controller.py"):
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# reviewed fixture\n")
+    subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+    subprocess.run([
+        "git", "-C", str(root), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "commit", "--quiet", "-m", "fixture",
+    ], check=True)
+    python = root / ".venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    python.parent.mkdir(parents=True)
+    python.symlink_to(sys.executable)
+    return subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+
+
+def test_inherited_git_variables_cannot_attest_a_different_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted = tmp_path / "trusted"
+    revision = _source_repo(trusted)
+    actual = tmp_path / "actual"
+    subprocess.run(["git", "clone", "--quiet", str(trusted), str(actual)], check=True)
+    python = actual / ".venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    python.parent.mkdir(parents=True)
+    python.symlink_to(sys.executable)
+    (actual / "src/korvid/evals/harness.py").write_text("# modified product\n")
+    monkeypatch.setattr("korvid_prompt_lab.native_source.NATIVE_KORVID_REVISION", revision)
+    monkeypatch.setenv("GIT_DIR", str(trusted / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(trusted))
+    with pytest.raises(ValueError, match="unchanged"):
+        validate_native_source(actual)
+
+
+def test_native_source_must_be_the_attested_repository_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted = tmp_path / "trusted"
+    revision = _source_repo(trusted)
+    nested = trusted / ".venv" / "nested"
+    for relative in (
+        "src/korvid/evals/harness.py", "src/korvid/ui/agent_ui_controller.py",
+        ".venv/bin/python" if sys.platform != "win32" else ".venv/Scripts/python.exe",
+    ):
+        path = nested / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# not part of the reviewed checkout\n")
+    monkeypatch.setattr("korvid_prompt_lab.native_source.NATIVE_KORVID_REVISION", revision)
+    with pytest.raises(ValueError, match="root"):
+        validate_native_source(nested)
 
 
 @pytest.mark.parametrize("field,value", [
