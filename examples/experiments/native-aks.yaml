@@ -1,0 +1,77 @@
+# Unified native experiment (schema_version 2) - AKS port-forward serving.
+#
+# Runs a seven-case calibration subset of original Korvid v0.4.1 evaluations,
+# not the full 33-case corpus, against an Ollama service inside
+# the owner-specific `aks-shared-runners` cluster in `rg-pension-guard`, reached
+# through a single private port-forward for the whole campaign. The coordinates
+# below are owner-specific; the model/teacher digests are the captured values and
+# are re-verified live against /api/tags before search. This is an EXAMPLE, not a
+# recorded cloud run - adjust coordinates for your own cluster.
+#
+#   uv run --extra dev korvid-prompt-lab run \
+#     --experiment examples/experiments/native-aks.yaml \
+#     --artifact-root artifacts/native-aks-001 --check-only
+#
+# The optional `node_pool` below is configured at 0 nodes, so a live run must be
+# invoked with --allow-capacity-changes to permit the owned 0->1 scale and its
+# restoration to 0 on cleanup. Without that flag a zero-node pool aborts the run.
+schema_version: 2
+campaign_id: native-aks
+
+runtime:
+  backend: korvid_upstream                     # upstream.py / KorvidUpstreamRunner
+  source_root: env:KORVID_NATIVE_SOURCE_ROOT   # pinned v0.4.1 checkout
+  korvid_revision: 33c483e041006eb20259a024ed85a9323e52c8f0
+  timeout_seconds: 600                         # full journey timeout (no per-turn slicing)
+
+serving:
+  backend: aks_port_forward
+  resource_group: rg-pension-guard             # owner-specific example coordinates
+  cluster_name: aks-shared-runners
+  namespace: ollama
+  service: ollama
+  node_pool: modeleval                         # optional; capacity change is opt-in
+
+model:                                          # target tiny model
+  reference: ollama/qwen3:0.6b
+  # captured qwen3:0.6b digest (verified live against /api/tags)
+  digest: sha256:7df6b6e09427a769808717c0a93cadc4ae99ed4eb8bf5ca557c90846becea435
+  options:
+    native_thinking: true                       # select Korvid native/api/chat route
+    think: false
+    num_ctx: 16384
+    temperature: 0.0
+
+reflection:                                     # teacher on the same Ollama endpoint
+  reference: ollama_chat/qwen3:14b
+  # captured qwen3:14b teacher digest (verified live against /api/tags)
+  digest: sha256:bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8
+  timeout_seconds: 360                           # allow for the observed cold-start timeout
+  options:
+    reasoning_effort: disable
+    num_ctx: 4096
+    temperature: 0.2
+    max_tokens: 512
+
+evaluation:
+  repetitions: 5
+  seed: 0
+  train:
+    - scenarios/image-pull-typo
+    - scenarios/healthy-deployment
+    - journeys/logs-to-events
+  validation:
+    - journeys/tui-follow
+    - scenarios/oom-killed
+  holdout:
+    - journeys/compare-namespaces
+    - scenarios/readiness-probe-failing
+
+search:
+  stages:
+    - { name: explore, metric_calls: 16, seeds: [0, 1] }
+  total_metric_calls: 64
+  max_evaluations: 256
+  max_proposals: 12
+  wall_clock_seconds: 7200
+  stagnation_attempt_limit: 3

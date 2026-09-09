@@ -1,3 +1,5 @@
+"""GEPA adapter for original Korvid verdicts and bounded reflection evidence."""
+
 from __future__ import annotations
 
 import re
@@ -8,15 +10,9 @@ from typing import Any
 
 from gepa.core.adapter import EvaluationBatch, ProposalFn
 
-from .contracts import (
-    Candidate,
-    EvalCase,
-    KorvidNativeServing,
-    KorvidNavigationServing,
-    KorvidReadonlyServing,
-)
+from .contracts import Candidate, EvalCase
 from .runner import BridgeExecutionModeError, KorvidRunner
-from .scoring import BridgeResult, ScoredResult, grade_quality, score_result
+from .scoring import EvaluationResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,53 +21,15 @@ class SafeExecutionTrace:
     template_id: str
     model: str
     execution_mode: str
-    final_answer: str
-    answer_redacted: bool
-    checkpoint_names: tuple[str, ...]
-    tool_call_count: int
-    outcome: str
-    missing_checkpoints: tuple[str, ...]
-    hard_failures: tuple[str, ...]
     score: float
-    # korvid_readonly-only reflection feedback (Task 3). Always None for
-    # write/approval (KorvidProcessRunner) evidence: completion/verification
-    # do not mean "diagnosis"/"evidence" outcomes there. Populated only when
-    # this adapter's runner serves korvid_readonly evidence, and derived
-    # exclusively from the bounded journal/grade fields
-    # korvid_readonly.py already exposes (never raw request, fixture, or
-    # credential data).
-    diagnosis_success: bool | None = None
-    evidence_fetched: bool | None = None
-    missing_mention_count: int | None = None
-    missing_evidence_count: int | None = None
-    resolvable_tool_call_count: int | None = None
-    malformed_tool_call_count: int | None = None
-    citation_coverage: float | None = None
-    citation_precision: float | None = None
-    navigation_feedback: Mapping[str, Any] | None = None
-
-
-def _search_score(scored: ScoredResult) -> float:
-    if scored.result.status == "model_failure":
-        return 0.0
-    grade = scored.result.grade
-    if grade is None:  # pragma: no cover - score_result rejects this first
-        raise ValueError("completed results must carry a grade")
-    quality = 0.75 + 0.25 * grade_quality(grade)
-    return quality if not scored.unsafe else 2 ** (-len(grade.hard_failures)) * quality
+    feedback: Mapping[str, Any]
 
 
 class KorvidGEPAAdapter:
-    # GEPA reads this attribute on every reflective mutation. Keeping it declared and
-    # None keeps proposal responsibility outside the adapter (DSPy reflection or an
-    # explicitly injected proposer) instead of silently aborting the mutation step.
     propose_new_texts: ProposalFn | None = None
 
     def __init__(
-        self,
-        runner: KorvidRunner,
-        artifact_root: Path | str,
-        *,
+        self, runner: KorvidRunner, artifact_root: Path | str, *,
         candidate_id: str = "gepa-candidate",
         candidate_metadata: Mapping[str, str] | None = None,
     ) -> None:
@@ -84,324 +42,204 @@ class KorvidGEPAAdapter:
 
     @property
     def execution_modes(self) -> tuple[str, ...]:
-        """Every distinct way this optimization's evidence was produced, in first-seen order."""
         return tuple(self._execution_modes)
 
-    def _record_execution_mode(self, result: BridgeResult) -> None:
-        """Keep one optimization on one kind of evidence.
-
-        GEPA only ever compares candidates against each other, so a run that switched
-        from live grades to model-free scripted grades would rank a candidate against
-        a different experiment. Mixing is systemic, not a score.
-        """
-        if result.execution_mode in self._execution_modes:
-            return
-        if self._execution_modes:
-            raise BridgeExecutionModeError(
-                "optimization evidence must not mix execution modes:"
-                f" {self._execution_modes[0]} then {result.execution_mode}"
-            )
-        self._execution_modes.append(result.execution_mode)
-
     def evaluate(
-        self,
-        batch: list[EvalCase],
-        candidate: dict[str, str],
-        capture_traces: bool = False,
-    ) -> EvaluationBatch[SafeExecutionTrace, BridgeResult]:
-        resolved_candidate = self._materialize_candidate(candidate)
-        outputs: list[BridgeResult] = []
+        self, batch: list[EvalCase], candidate: dict[str, str], capture_traces: bool = False,
+    ) -> EvaluationBatch[SafeExecutionTrace, EvaluationResult]:
+        resolved = self._materialize_candidate(candidate)
+        outputs: list[EvaluationResult] = []
         scores: list[float] = []
         traces: list[SafeExecutionTrace] = []
         for case in batch:
-            run_dir = self._next_run_dir(resolved_candidate.fingerprint, case)
-            result = self.runner.run(resolved_candidate, case, run_dir)
-            self._record_execution_mode(result)
-            scored = score_result(result)
-            safe_result = self._safe_optimizer_output(result)
-            outputs.append(safe_result)
-            search_score = _search_score(scored)
-            scores.append(search_score)
+            directory = self.artifact_root / resolved.fingerprint / f"{self._execution_index:06d}-{_slugify(case.case_id)}"
+            self._execution_index += 1
+            result = self.runner.run(resolved, case, directory)
+            if self._execution_modes and result.execution_mode not in self._execution_modes:
+                raise BridgeExecutionModeError("optimization evidence must not mix live and scripted execution")
+            if not self._execution_modes:
+                self._execution_modes.append(result.execution_mode)
+            if result.candidate_fingerprint != resolved.fingerprint:
+                raise ValueError("evaluation candidate fingerprint mismatch")
+            feedback = _require_upstream_feedback(result.feedback)
+            if feedback["success"] is not result.success:
+                raise ValueError("evaluation result differs from Korvid's original verdict")
+            score = float(result.success)
+            outputs.append(result)
+            scores.append(score)
             if capture_traces:
-                traces.append(
-                    self._build_trace(
-                        case, safe_result, score=search_score, unsafe=scored.unsafe
-                    )
-                )
-
+                traces.append(SafeExecutionTrace(
+                    case.case_id, case.template_id, case.models[0],
+                    result.execution_mode, score, feedback,
+                ))
         return EvaluationBatch(
-            outputs=outputs,
-            scores=scores,
-            trajectories=traces if capture_traces else None,
+            outputs=outputs, scores=scores, trajectories=traces if capture_traces else None,
         )
+
     def make_reflective_dataset(
-        self,
-        candidate: dict[str, str],
-        eval_batch: EvaluationBatch[SafeExecutionTrace, BridgeResult],
+        self, candidate: dict[str, str],
+        eval_batch: EvaluationBatch[SafeExecutionTrace, EvaluationResult],
         components_to_update: list[str],
     ) -> dict[str, Sequence[Mapping[str, Any]]]:
-        validated_candidate = self._materialize_candidate(candidate).components
+        self._materialize_candidate(candidate)
+        if components_to_update != ["tier_pack"]:
+            raise ValueError("reflection can update only the original tier_pack")
         if eval_batch.trajectories is None:
-            raise ValueError("evaluate(..., capture_traces=True) is required to build reflection records")
-        if len(eval_batch.trajectories) != len(eval_batch.outputs) or len(eval_batch.trajectories) != len(eval_batch.scores):
-            raise ValueError("evaluation batch trajectories must align with outputs and scores")
+            raise ValueError("capture_traces=True is required for reflection")
+        if len(eval_batch.trajectories) != len(eval_batch.outputs) or len(eval_batch.outputs) != len(eval_batch.scores):
+            raise ValueError("reflection traces, outputs and scores must align")
+        return {"tier_pack": [self._trace_to_record(trace) for trace in eval_batch.trajectories]}
 
-        reflective_dataset: dict[str, Sequence[Mapping[str, Any]]] = {}
-        for component_name in components_to_update:
-            if component_name not in validated_candidate:
-                raise ValueError(f"unknown candidate component: {component_name}")
-            reflective_dataset[component_name] = [self._trace_to_record(trace) for trace in eval_batch.trajectories]
-        return reflective_dataset
+    def _materialize_candidate(self, components: Mapping[str, str]) -> Candidate:
+        return Candidate.from_mapping({
+            "schema_version": 1, "candidate_id": self.candidate_id,
+            "components": dict(components), "metadata": self.candidate_metadata,
+        })
 
-    def _safe_optimizer_output(self, result: BridgeResult) -> BridgeResult:
-        if not isinstance(self.runner.campaign.serving, KorvidReadonlyServing):
-            return result
-        return BridgeResult(
-            protocol_version=result.protocol_version,
-            status=result.status,
-            execution_mode=result.execution_mode,
-            candidate_fingerprint=result.candidate_fingerprint,
-            grade=result.grade,
-            answer="",
-            journal=result.journal,
-            usage=result.usage,
-            error="model_failure" if result.error is not None else None,
-        )
-
-    def _materialize_candidate(self, candidate: Mapping[str, str]) -> Candidate:
-        return Candidate.from_mapping(
-            {
-                "schema_version": 1,
-                "candidate_id": self.candidate_id,
-                "components": dict(candidate),
-                "metadata": dict(self.candidate_metadata),
-            }
-        )
-
-    def _next_run_dir(self, fingerprint: str, case: EvalCase) -> Path:
-        run_dir = self.artifact_root / fingerprint / f"{self._execution_index:06d}-{_slugify(case.case_id)}"
-        self._execution_index += 1
-        return run_dir
-
-    def _build_trace(self, case: EvalCase, result: BridgeResult, *, score: float, unsafe: bool) -> SafeExecutionTrace:
-        journal = result.journal
-        checkpoint_names = _coerce_string_sequence(journal.get("checkpoints"))
-        reported_tool_calls = result.usage.get("tool_calls", journal.get("tool_calls"))
-        return SafeExecutionTrace(
-            case_id=case.case_id,
-            template_id=case.template_id,
-            model=case.models[0],
-            execution_mode=result.execution_mode,
-            final_answer=result.answer,
-            answer_redacted=isinstance(
-                self.runner.campaign.serving, KorvidReadonlyServing
-            ),
-            checkpoint_names=checkpoint_names,
-            tool_call_count=_count_tool_calls(reported_tool_calls),
-            outcome="unsafe" if unsafe else result.status,
-            missing_checkpoints=_missing_checkpoints(journal, checkpoint_names),
-            hard_failures=result.grade.hard_failures if result.grade is not None else (),
-            score=score,
-            navigation_feedback=(
-                _require_navigation_feedback(journal)
-                if isinstance(self.runner.campaign.serving, (KorvidNavigationServing, KorvidNativeServing)) else None
-            ),
-            **self._readonly_reflection_fields(result),
-        )
-
-    def _readonly_reflection_fields(self, result: BridgeResult) -> dict[str, Any]:
-        """Bounded, read-only-specific reflection feedback (Task 3).
-
-        `completion`/`verification` are a spec-exact 1:1 encoding of
-        `diagnosis_success`/`evidence_fetched` only for korvid_readonly
-        evidence (see the design's Score Mapping section), so this must stay
-        gated on the runner actually serving korvid_readonly evidence and
-        must never be applied to write/approval (KorvidProcessRunner)
-        results, where those floats carry unrelated meaning.
-        """
-        if not isinstance(self.runner.campaign.serving, KorvidReadonlyServing):
-            return {}
-        journal = result.journal
-        grade = result.grade
-        if grade is None:
-            return {}
-        return {
-            "diagnosis_success": journal.get("diagnosis_success"),
-            "evidence_fetched": journal.get("evidence_fetched"),
-            "missing_mention_count": _coerce_optional_int(journal.get("missing_mentions")),
-            "missing_evidence_count": _coerce_optional_int(journal.get("missing_evidence")),
-            "resolvable_tool_call_count": _coerce_optional_int(
-                journal.get("resolvable_tool_calls")
-            ),
-            "malformed_tool_call_count": _coerce_optional_int(journal.get("malformed_tool_calls")),
-            "citation_coverage": _coerce_optional_float(journal.get("citation_coverage")),
-            "citation_precision": _coerce_optional_float(journal.get("citation_precision")),
-        }
-
-    def _trace_to_record(self, trace: SafeExecutionTrace) -> Mapping[str, Any]:
-        if trace.navigation_feedback is not None:
-            feedback = trace.navigation_feedback
-            native = isinstance(feedback["tools"], Mapping)
-            tools_field = "runtime_policy" if native else "available_mcp_tools"
-            guidance = (
-                "Improve reusable UI navigation instructions, not Kubernetes diagnosis. "
-                "Do not copy fixture resource names, namespaces, or case-specific answers "
-                "into the prompt. Tool schemas and runtime safety restrictions are fixed."
-            )
-            if native:
-                guidance += (
-                    " When updating the rules component, return ONLY a JSON array of at most "
-                    "16 short non-blank strings (1000 characters per string). These are additive "
-                    "agent.rules, not a replacement system prompt or an eval overlay. "
-                    "Use only the provided actual policy; never request unarmed tools or a higher tier."
-                )
-            return {
-                "Inputs": {
-                    "request": feedback["prompt"], "initial_state": feedback["initial"],
-                    tools_field: feedback["tools"],
-                },
-                "Generated Outputs": {
-                    "calls": feedback["calls"], "observed_state": feedback["observed"],
-                    "errors": feedback["errors"],
-                },
-                "Feedback": {
-                    "expected_state": feedback["expected"],
-                    "missing_postconditions": feedback["missing_postconditions"],
-                    "guidance": guidance,
-                },
-                "score": trace.score,
-            }
-        generated_outputs = {
-            "checkpoint_names": list(trace.checkpoint_names),
-            "tool_call_count": trace.tool_call_count,
-            "outcome": trace.outcome,
-            "execution_mode": trace.execution_mode,
-            **_readonly_output_fields(trace),
-        }
-        if not trace.answer_redacted:
-            generated_outputs["answer"] = trace.final_answer
+    @staticmethod
+    def _trace_to_record(trace: SafeExecutionTrace) -> Mapping[str, Any]:
+        feedback = trace.feedback
         return {
             "Inputs": {
-                "case_id": trace.case_id,
-                "template_id": trace.template_id,
-                "model": trace.model,
+                "case_id": trace.case_id, "template_id": trace.template_id, "model": trace.model,
+                "reference": feedback["reference"], "source_sha256": feedback["source_sha256"],
+                "questions": feedback["questions"],
+                "runtime_policy": feedback.get("policy", {}),
             },
-            "Generated Outputs": generated_outputs,
-            "Feedback": _build_feedback(trace),
+            "Generated Outputs": {
+                "turns": feedback["turns"], "calls": feedback["calls"],
+                "execution_mode": trace.execution_mode,
+            },
+            "Feedback": {
+                "success": feedback["success"],
+                "guidance": (
+                    "Improve the original Korvid operating prompt (tier_pack). Return its complete "
+                    "replacement as plain text, not JSON rules. Keep safety, tools and original "
+                    "evaluation conditions unchanged. Do not embed case-specific names or answers. "
+                    "The original Korvid verdict is authoritative; preserve whole journeys."
+                ),
+            },
             "score": trace.score,
         }
 
 
-def _require_navigation_feedback(journal: Mapping[str, Any]) -> Mapping[str, Any]:
-    feedback = journal.get("navigation_feedback")
-    required = {"prompt", "initial", "tools", "calls", "observed", "errors", "expected", "missing_postconditions"}
-    if not isinstance(feedback, Mapping) or set(feedback) != required:
-        raise ValueError("navigation runner must supply complete structured feedback")
-    return feedback
-
-
-def _readonly_output_fields(trace: SafeExecutionTrace) -> dict[str, Any]:
-    fields: dict[str, Any] = {}
-    if trace.diagnosis_success is not None:
-        fields["diagnosis_success"] = trace.diagnosis_success
-    if trace.evidence_fetched is not None:
-        fields["evidence_fetched"] = trace.evidence_fetched
-    if trace.missing_mention_count is not None:
-        fields["missing_mention_count"] = trace.missing_mention_count
-    if trace.missing_evidence_count is not None:
-        fields["missing_evidence_count"] = trace.missing_evidence_count
-    if trace.resolvable_tool_call_count is not None:
-        fields["resolvable_tool_call_count"] = trace.resolvable_tool_call_count
-    if trace.malformed_tool_call_count is not None:
-        fields["malformed_tool_call_count"] = trace.malformed_tool_call_count
-    if trace.citation_coverage is not None:
-        fields["citation_coverage"] = trace.citation_coverage
-    if trace.citation_precision is not None:
-        fields["citation_precision"] = trace.citation_precision
-    return fields
-
-
-def _build_feedback(trace: SafeExecutionTrace) -> str:
-    parts = [f"Outcome: {trace.outcome}."]
-    if trace.diagnosis_success is not None:
-        parts.append(f"Diagnosis: {'success' if trace.diagnosis_success else 'failure'}.")
-    if trace.evidence_fetched is not None:
-        parts.append(f"Evidence: {'fetched' if trace.evidence_fetched else 'missing'}.")
-    if trace.missing_mention_count:
-        parts.append(f"Missing mentions: {trace.missing_mention_count}.")
-    if trace.missing_evidence_count:
-        parts.append(f"Missing evidence items: {trace.missing_evidence_count}.")
-    if trace.resolvable_tool_call_count is not None:
-        parts.append(
-            f"Resolvable tool calls: {trace.resolvable_tool_call_count} "
-            f"of {trace.tool_call_count}."
-        )
-    if trace.malformed_tool_call_count:
-        parts.append(f"Malformed tool calls: {trace.malformed_tool_call_count}.")
-    if trace.citation_coverage is not None:
-        precision_text = f"{trace.citation_precision:.2f}" if trace.citation_precision is not None else "n/a"
-        parts.append(f"Citation coverage: {trace.citation_coverage:.2f}, precision: {precision_text}.")
-    if trace.missing_checkpoints:
-        parts.append(f"Missing checkpoints: {', '.join(trace.missing_checkpoints)}.")
-    if trace.hard_failures:
-        parts.append(f"Hard failures: {', '.join(trace.hard_failures)}.")
-    if (
-        trace.diagnosis_success is None
-        and not trace.missing_checkpoints
-        and not trace.hard_failures
+def _require_upstream_feedback(feedback: Mapping[str, Any]) -> Mapping[str, Any]:
+    success = feedback.get("success")
+    reference = feedback.get("reference")
+    source_sha256 = feedback.get("source_sha256")
+    questions, turns, calls = feedback.get("questions"), feedback.get("turns"), feedback.get("calls")
+    if type(success) is not bool:
+        raise ValueError("upstream feedback success must be boolean")
+    if not isinstance(reference, str) or not reference.strip():
+        raise ValueError("upstream feedback reference must be non-blank")
+    if not isinstance(source_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None:
+        raise ValueError("upstream feedback source_sha256 must be a SHA-256 digest")
+    if not isinstance(questions, list) or not questions or any(
+        not isinstance(question, str) or not question.strip() for question in questions
     ):
-        parts.append("No missing checkpoints or hard failures.")
-    return " ".join(parts)
+        raise ValueError("upstream feedback must contain the original questions")
+    if not isinstance(turns, list) or not turns or any(
+        not isinstance(turn, Mapping) or turn.get("outcome") not in {"success", "failure", "error"}
+        or not isinstance(turn.get("grade"), Mapping) for turn in turns
+    ):
+        raise ValueError("upstream feedback must contain original graded outcomes")
+    if not isinstance(calls, list) or any(not _valid_upstream_call(call) for call in calls):
+        raise ValueError("upstream feedback calls must contain compact tool calls")
+    if len(turns) > 64 or len(calls) > 256:
+        raise ValueError("upstream feedback exceeds the bounded reflection contract")
+    return {
+        "success": success, "reference": reference, "source_sha256": source_sha256,
+        "questions": list(questions), "turns": _compact_upstream_turns(turns),
+        "calls": _compact_upstream_calls(calls), "policy": _compact_policy(feedback.get("policy")),
+    }
 
 
-def _coerce_string_sequence(value: Any) -> tuple[str, ...]:
-    if not isinstance(value, list):
-        return ()
-    return tuple(item for item in value if isinstance(item, str) and item.strip())
+def _compact_policy(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    policy: dict[str, Any] = {}
+    for name in ("source", "prompt_pack", "tier"):
+        item = value.get(name)
+        if isinstance(item, str) and item.strip():
+            policy[name] = item[:500]
+    tools = value.get("tools")
+    if isinstance(tools, list):
+        policy["tools"] = [item[:200] for item in tools[:64] if isinstance(item, str) and item.strip()]
+    return policy
 
 
-def _count_tool_calls(value: Any) -> int:
-    if isinstance(value, list):
-        return len(value)
-    if isinstance(value, int) and value >= 0:
+def _compact_upstream_turns(value: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    turns: list[dict[str, Any]] = []
+    for raw in value:
+        turn: dict[str, Any] = {}
+        for name in ("outcome", "failure_class", "error_label"):
+            item = raw.get(name)
+            if name in raw and (item is None or isinstance(item, str)):
+                turn[name] = item
+        turn["grade"] = _safe_grade_mapping(raw["grade"])
+        turns.append(turn)
+    return turns
+
+
+def _compact_upstream_calls(value: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    for raw in value:
+        call: dict[str, Any] = {"name": raw["name"]}
+        arguments_valid = raw.get("arguments_valid", True)
+        if "arguments_valid" in raw:
+            call["arguments_valid"] = arguments_valid
+        if arguments_valid:
+            call["arguments"] = _safe_arguments(raw["arguments"])
+        else:
+            call["arguments_raw"] = raw["arguments_raw"]
+            call["error_label"] = raw["error_label"]
+        calls.append(call)
+    return calls
+
+
+def _valid_upstream_call(value: Any) -> bool:
+    if not isinstance(value, Mapping) or not isinstance(value.get("name"), str) or not value["name"].strip():
+        return False
+    valid = value.get("arguments_valid", True)
+    if type(valid) is not bool:
+        return False
+    if valid:
+        return isinstance(value.get("arguments"), Mapping)
+    return (
+        "arguments" not in value and isinstance(value.get("arguments_raw"), str)
+        and len(value["arguments_raw"]) <= 512
+        and value.get("error_label") in {"arguments_not_string", "malformed_arguments", "non_object_arguments"}
+    )
+
+
+def _safe_grade_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
+    allowed = {"diagnosis_success", "evidence_fetched", "missing_mentions", "forbidden_mentions", "missing_evidence"}
+    return {name: _safe_scalar_or_string_list(item) for name, item in value.items() if name in allowed}
+
+
+def _safe_scalar_or_string_list(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
         return value
-    if isinstance(value, Mapping):
-        return sum(item for item in value.values() if isinstance(item, int) and item >= 0)
-    return 0
+    if isinstance(value, str):
+        return value[:500]
+    if isinstance(value, list):
+        return [item[:500] for item in value[:64] if isinstance(item, str)]
+    return None
 
 
-def _coerce_optional_int(value: Any) -> int | None:
-    """Best-effort enrichment only: korvid_readonly.py already validated this
-    field strictly, so this never raises and simply omits a malformed value."""
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value
-
-
-def _coerce_optional_float(value: Any) -> float | None:
-    """Best-effort enrichment only: korvid_readonly.py already validated this
-    field strictly, so this never raises and simply omits a malformed value."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return float(value)
-
-
-def _missing_checkpoints(journal: Mapping[str, Any], checkpoint_names: Sequence[str]) -> tuple[str, ...]:
-    """The bridge's own report wins; reflection must never invent or drop a gap.
-
-    A bridge that reports `missing_checkpoints` is authoritative even when the
-    list is empty, because the grader that produced it knows which checkpoints
-    the operation actually required. The `dispatch`/`verify` inference below is
-    only a fallback for a bridge that reports no gaps at all.
-    """
-    if "missing_checkpoints" in journal:
-        return _coerce_string_sequence(journal.get("missing_checkpoints"))
-    observed = set(checkpoint_names)
-    if "dispatch" in observed and "verify" not in observed:
-        return ("verify",)
-    return ()
+def _safe_arguments(value: Mapping[str, Any]) -> dict[str, Any]:
+    sensitive = ("token", "secret", "password", "credential", "kubeconfig")
+    safe: dict[str, Any] = {}
+    for name, item in value.items():
+        key = str(name)
+        if any(marker in key.lower() for marker in sensitive):
+            safe[key] = "[redacted]"
+        elif isinstance(item, (bool, int, float)) or item is None:
+            safe[key] = item
+        elif isinstance(item, str):
+            safe[key] = item[:500]
+    return safe
 
 
 def _slugify(value: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-")
-    return slug or "case"
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-") or "case"

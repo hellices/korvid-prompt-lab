@@ -1,442 +1,468 @@
 from __future__ import annotations
 
 import json
-import sys
-from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from gepa import GEPAResult
+import yaml  # type: ignore[import-untyped]
+from current_helpers import (
+    IMPROVED_TEXT,
+    FakeRunner,
+    candidate,
+    case,
+    fake_gepa_result,
+)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from korvid_prompt_lab.config import load_candidate
-from korvid_prompt_lab.contracts import Campaign, Candidate, EvalCase, ProcessServing
+from korvid_prompt_lab.contracts import Candidate, EvalCase
+from korvid_prompt_lab.experiment_budget import BudgetExhausted, ExperimentBudget
 from korvid_prompt_lab.optimize import OptimizationArtifacts, optimize_campaign
-from korvid_prompt_lab.runner import KorvidProcessRunner
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tests" / "fixtures"))
-
-from fake_korvid_bridge import TUNED_MARKER
+from korvid_prompt_lab.reflection import ProposalProviderError
+from korvid_prompt_lab.runner import BridgeInvocationError
+from korvid_prompt_lab.scoring import EvaluationResult
 
 
-def _seed_candidate() -> Candidate:
-    return Candidate.from_mapping(
-        {
-            "schema_version": 1,
-            "candidate_id": "candidate-1",
-            "components": {
-                "system": "Stay safe.",
-                "append": "Verify the postcondition before reporting completion.",
-            },
-            "metadata": {"source": "seed"},
-        }
+def source_runner(
+    train: list[EvalCase],
+    validation: list[EvalCase],
+    holdout: list[EvalCase] | None = None,
+    **kwargs: Any,
+) -> FakeRunner:
+    holdout = holdout or []
+    return FakeRunner(
+        [*train, *validation, *holdout],
+        splits=(
+            ("train", tuple(item.case_id for item in train)),
+            ("validation", tuple(item.case_id for item in validation)),
+            *(
+                (("holdout", tuple(item.case_id for item in holdout)),)
+                if holdout
+                else ()
+            ),
+        ),
+        **kwargs,
     )
 
 
-def _case(case_id: str) -> EvalCase:
-    return EvalCase(
-        case_id=case_id,
-        template_id="template-1",
-        prompt="Confirm the postcondition.",
-        models=("mock-small",),
-    )
+def read_json(path: Path) -> dict[str, Any]:
+    return cast(dict[str, Any], json.loads(path.read_text(encoding="utf-8")))
 
 
-def _runner(cases: list[EvalCase]) -> KorvidProcessRunner:
-    command = (
-        sys.executable,
-        str(ROOT / "tests" / "fixtures" / "fake_korvid_bridge.py"),
-        "--request",
-        "{request}",
-        "--response",
-        "{response}",
-    )
-    campaign = Campaign(
-        schema_version=1,
-        campaign_id="campaign-1",
-        repetitions=1,
-        models=("mock-small",),
-        cases=tuple(cases),
-        serving=ProcessServing(backend="process", command=command),
-    )
-    return KorvidProcessRunner(campaign, timeout_seconds=1.0)
-
-
-def _fake_gepa_result(run_dir: str) -> GEPAResult:
-    return GEPAResult(
-        candidates=[
-            {
-                "system": "Stay safe.",
-                "append": "Verify the postcondition before reporting completion.",
-            },
-            {
-                "system": "Stay safe and verify approvals.",
-                "append": "Verify the postcondition before reporting completion.",
-            },
-        ],
-        parents=[[None], [0]],
-        val_aggregate_scores=[0.6, 0.9],
-        val_subscores=[{"val-1": 0.6}, {"val-1": 0.9}],
-        per_val_instance_best_candidates={"val-1": {1}},
-        discovery_eval_counts=[1, 2],
-        total_metric_calls=7,
-        num_full_val_evals=2,
-        run_dir=run_dir,
-        seed=0,
-    )
-
-
-def test_optimize_campaign_calls_gepa_and_persists_best_candidate_and_summary(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_optimize_requires_budget_and_exactly_one_proposal_source(
+    tmp_path: Path,
 ) -> None:
-    train_case = _case("train-1")
-    validation_case = _case("val-1")
-    runner = _runner([train_case, validation_case])
-    seed_candidate = _seed_candidate()
-    captured: dict[str, Any] = {}
+    train, validation = [case("train")], [case("validation")]
+    runner = source_runner(train, validation)
+    required = {
+        "runner": cast(Any, runner),
+        "seed_candidate": candidate(),
+        "train_cases": train,
+        "validation_cases": validation,
+        "artifact_root": tmp_path,
+        "max_metric_calls": 4,
+    }
 
-    def fake_optimize(**kwargs: object) -> GEPAResult:
-        captured.update(kwargs)
-        return _fake_gepa_result(cast(str, kwargs["run_dir"]))
+    with pytest.raises(TypeError):
+        optimize_campaign(  # type: ignore[call-arg]
+            **required,
+            candidate_proposer=lambda current, *_args: dict(current),
+        )
+    with pytest.raises(ValueError, match="exactly one"):
+        optimize_campaign(
+            **required,
+            budget=ExperimentBudget(10, 1, 30.0),
+        )
+    with pytest.raises(ValueError, match="exactly one"):
+        optimize_campaign(
+            **required,
+            reflection_lm=object(),
+            candidate_proposer=lambda current, *_args: dict(current),
+            budget=ExperimentBudget(10, 1, 30.0),
+        )
 
-    monkeypatch.setattr("korvid_prompt_lab.optimize.gepa.optimize", fake_optimize)
 
+def test_rejected_later_proposal_preserves_a_fully_evaluated_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "korvid_prompt_lab.reflection.validate_upstream_candidate", lambda *_args: None,
+    )
+    train = [case("train-a"), case("train-b")]
+    validation = [case("validation-a"), case("validation-b")]
+    original = candidate()
+    runner = source_runner(
+        train, validation,
+        success=lambda proposed, selected: (
+            proposed.fingerprint != original.fingerprint and selected.case_id.endswith("-a")
+        ),
+    )
+    proposals = iter([
+        {"tier_pack": "Use the original evidence carefully."},
+        {"tier_pack": ""},
+    ])
     result = optimize_campaign(
-        runner=runner,
-        seed_candidate=seed_candidate,
-        train_cases=[train_case],
-        validation_cases=[validation_case],
-        artifact_root=tmp_path / "artifacts",
-        max_metric_calls=7,
+        runner=runner, seed_candidate=original, train_cases=train, validation_cases=validation,
+        artifact_root=tmp_path, max_metric_calls=40,
+        candidate_proposer=lambda *_args: next(proposals),
+        budget=ExperimentBudget(100, 4, 30),
     )
-
-    assert isinstance(result, OptimizationArtifacts)
-    assert captured["seed_candidate"] == seed_candidate.components
-    assert captured["trainset"] == [train_case]
-    assert captured["valset"] == [validation_case]
-    assert captured["max_metric_calls"] == 7
-    assert captured["custom_candidate_proposer"] is None
-
-    persisted_candidate = load_candidate(result.best_candidate_path)
-    assert persisted_candidate.candidate_id == seed_candidate.candidate_id
-    assert persisted_candidate.metadata == seed_candidate.metadata
-    assert persisted_candidate.components == _fake_gepa_result(str(tmp_path / "artifacts" / "gepa")).best_candidate
-
-    summary = json.loads(result.summary_path.read_text(encoding="utf-8"))
-    assert summary["best_idx"] == 1
-    assert summary["best_validation_score"] == 0.9
-    assert summary["total_metric_calls"] == 7
-    assert summary["best_candidate_fingerprint"] == persisted_candidate.fingerprint
-
-
-def test_optimize_campaign_uses_optional_dspy_proposer_only_when_reflection_lm_is_supplied(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    train_case = _case("train-1")
-    validation_case = _case("val-1")
-    runner = _runner([train_case, validation_case])
-    seed_candidate = _seed_candidate()
-    created_with: list[object] = []
-    captured_proposers: list[object] = []
-    proposer = object()
-
-    def fake_proposer_factory(reflection_lm: object) -> object:
-        created_with.append(reflection_lm)
-        return proposer
-
-    def fake_optimize(**kwargs: object) -> GEPAResult:
-        captured_proposers.append(kwargs["custom_candidate_proposer"])
-        return _fake_gepa_result(cast(str, kwargs["run_dir"]))
-
-    monkeypatch.setattr("korvid_prompt_lab.optimize.DSPyInstructionProposer", fake_proposer_factory)
-    monkeypatch.setattr("korvid_prompt_lab.optimize.gepa.optimize", fake_optimize)
-
-    optimize_campaign(
-        runner=runner,
-        seed_candidate=seed_candidate,
-        train_cases=[train_case],
-        validation_cases=[validation_case],
-        artifact_root=tmp_path / "without-lm",
-        max_metric_calls=3,
-    )
-    optimize_campaign(
-        runner=runner,
-        seed_candidate=seed_candidate,
-        train_cases=[train_case],
-        validation_cases=[validation_case],
-        artifact_root=tmp_path / "with-lm",
-        max_metric_calls=3,
-        reflection_lm="reflection-lm",
-    )
-
-    assert created_with == ["reflection-lm"]
-    assert captured_proposers == [None, proposer]
-
-
-def _recording_proposer(proposals: list[list[str]]) -> Any:
-    def propose(
-        candidate: dict[str, str],
-        reflective_dataset: Mapping[str, Sequence[Mapping[str, Any]]],
-        components_to_update: list[str],
-    ) -> dict[str, str]:
-        proposals.append(list(components_to_update))
-        return {name: f"{candidate[name]} {TUNED_MARKER}" for name in components_to_update}
-
-    return propose
-
-
-def test_optimize_campaign_runs_real_gepa_and_persists_a_candidate_that_beats_the_seed(tmp_path: Path) -> None:
-    train_cases = [_case("train-1"), _case("train-2"), _case("train-3")]
-    validation_cases = [_case("val-1"), _case("val-2")]
-    runner = _runner(train_cases + validation_cases)
-    seed_candidate = _seed_candidate()
-    proposals: list[list[str]] = []
-
-    artifacts = optimize_campaign(
-        runner=runner,
-        seed_candidate=seed_candidate,
-        train_cases=train_cases,
-        validation_cases=validation_cases,
-        artifact_root=tmp_path / "artifacts",
-        max_metric_calls=16,
-        candidate_proposer=_recording_proposer(proposals),
-    )
-
-    assert proposals, "real GEPA must invoke the injected proposal contract"
-    assert artifacts.best_candidate.components != seed_candidate.components
-    assert TUNED_MARKER in "".join(artifacts.best_candidate.components.values())
-
-    summary = json.loads(artifacts.summary_path.read_text(encoding="utf-8"))
-    assert summary["seed_candidate_fingerprint"] == seed_candidate.fingerprint
-    assert summary["best_candidate_differs_from_seed"] is True
-    assert summary["train_case_ids"] == ["train-1", "train-2", "train-3"]
-    assert summary["validation_case_ids"] == ["val-1", "val-2"]
-
-    persisted = load_candidate(artifacts.best_candidate_path)
-    assert persisted.components == artifacts.best_candidate.components
-
-
-def test_optimize_campaign_never_resumes_a_stale_run_when_the_seed_changes(tmp_path: Path) -> None:
-    train_cases = [_case("train-1"), _case("train-2"), _case("train-3")]
-    validation_cases = [_case("val-1"), _case("val-2")]
-    runner = _runner(train_cases + validation_cases)
-    seed_candidate = _seed_candidate()
-    artifact_root = tmp_path / "artifacts"
-    first_proposals: list[list[str]] = []
-    second_proposals: list[list[str]] = []
-
-    first = optimize_campaign(
-        runner=runner,
-        seed_candidate=seed_candidate,
-        train_cases=train_cases,
-        validation_cases=validation_cases,
-        artifact_root=artifact_root,
-        max_metric_calls=16,
-        seed=1,
-        candidate_proposer=_recording_proposer(first_proposals),
-    )
-    first_summary = json.loads(first.summary_path.read_text(encoding="utf-8"))
-
-    second = optimize_campaign(
-        runner=runner,
-        seed_candidate=seed_candidate,
-        train_cases=train_cases,
-        validation_cases=validation_cases,
-        artifact_root=artifact_root,
-        max_metric_calls=16,
-        seed=2,
-        candidate_proposer=_recording_proposer(second_proposals),
-    )
-    second_summary = json.loads(second.summary_path.read_text(encoding="utf-8"))
-
-    assert first_proposals, "the first run must actually search"
-    assert second_proposals, "a changed seed must start a fresh search instead of resuming stale state"
-
-    assert first_summary["seed"] == 1
-    assert second_summary["seed"] == 2
-    assert first_summary["run_id"] != second_summary["run_id"]
-    assert first_summary["run_dir"] != second_summary["run_dir"]
-    assert second_summary["total_metric_calls"] == first_summary["total_metric_calls"]
-    assert second_summary["num_candidates"] == first_summary["num_candidates"]
-
-    assert first.summary_path != second.summary_path
-    assert first.best_candidate_path != second.best_candidate_path
-    assert json.loads(first.summary_path.read_text(encoding="utf-8")) == first_summary
-    assert load_candidate(first.best_candidate_path).components == first.best_candidate.components
-    assert not (artifact_root / "gepa" / "gepa_state.bin").exists()
-
-
-def test_optimize_campaign_refuses_to_reuse_an_existing_invocation_directory(tmp_path: Path) -> None:
-    train_cases = [_case("train-1"), _case("train-2")]
-    validation_cases = [_case("val-1")]
-    runner = _runner(train_cases + validation_cases)
-    seed_candidate = _seed_candidate()
-    artifact_root = tmp_path / "artifacts"
-
-    def run() -> OptimizationArtifacts:
-        return optimize_campaign(
-            runner=runner,
-            seed_candidate=seed_candidate,
-            train_cases=train_cases,
-            validation_cases=validation_cases,
-            artifact_root=artifact_root,
-            max_metric_calls=8,
-            seed=3,
-            candidate_proposer=_recording_proposer([]),
-        )
-
-    first = run()
-
-    with pytest.raises(ValueError, match="already exists"):
-        run()
-
-    assert json.loads(first.summary_path.read_text(encoding="utf-8"))["run_id"] == first.run_id
-
-
-def test_optimize_campaign_records_the_run_identity_next_to_the_artifacts(tmp_path: Path) -> None:
-    train_cases = [_case("train-1"), _case("train-2")]
-    validation_cases = [_case("val-1")]
-    runner = _runner(train_cases + validation_cases)
-    seed_candidate = _seed_candidate()
-
-    artifacts = optimize_campaign(
-        runner=runner,
-        seed_candidate=seed_candidate,
-        train_cases=train_cases,
-        validation_cases=validation_cases,
-        artifact_root=tmp_path / "artifacts",
-        max_metric_calls=8,
-        seed=7,
-        candidate_proposer=_recording_proposer([]),
-    )
-
-    identity = json.loads((artifacts.invocation_dir / "run-identity.json").read_text(encoding="utf-8"))
-    assert identity["seed"] == 7
-    assert identity["seed_candidate_fingerprint"] == seed_candidate.fingerprint
-    assert identity["train_case_ids"] == ["train-1", "train-2"]
-    assert identity["validation_case_ids"] == ["val-1"]
-    assert identity["max_metric_calls"] == 8
-    assert identity["proposal_source"] == "candidate_proposer"
-    assert identity["campaign_id"] == "campaign-1"
-    assert artifacts.summary_path.parent == artifacts.invocation_dir
-    assert artifacts.best_candidate_path.parent == artifacts.invocation_dir
-
-
-def test_optimize_campaign_passes_the_seed_to_gepa(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    train_case = _case("train-1")
-    validation_case = _case("val-1")
-    runner = _runner([train_case, validation_case])
-    captured: dict[str, Any] = {}
-
-    def fake_optimize(**kwargs: object) -> GEPAResult:
-        captured.update(kwargs)
-        return _fake_gepa_result(cast(str, kwargs["run_dir"]))
-
-    monkeypatch.setattr("korvid_prompt_lab.optimize.gepa.optimize", fake_optimize)
-
-    optimize_campaign(
-        runner=runner,
-        seed_candidate=_seed_candidate(),
-        train_cases=[train_case],
-        validation_cases=[validation_case],
-        artifact_root=tmp_path / "artifacts",
-        max_metric_calls=5,
-        seed=11,
-    )
-
-    assert captured["seed"] == 11
-
-
-@pytest.mark.parametrize("seed", [-1, True, 1.5, "1"])
-def test_optimize_campaign_rejects_invalid_seeds(tmp_path: Path, seed: object) -> None:
-    train_case = _case("train-1")
-    validation_case = _case("val-1")
-    runner = _runner([train_case, validation_case])
-
-    with pytest.raises(ValueError, match="seed must be a non-negative integer"):
-        optimize_campaign(
-            runner=runner,
-            seed_candidate=_seed_candidate(),
-            train_cases=[train_case],
-            validation_cases=[validation_case],
-            artifact_root=tmp_path / "artifacts",
-            max_metric_calls=4,
-            seed=cast(int, seed),
-        )
-
-
-def test_optimize_campaign_rejects_combining_reflection_lm_and_candidate_proposer(tmp_path: Path) -> None:
-    train_case = _case("train-1")
-    validation_case = _case("val-1")
-    runner = _runner([train_case, validation_case])
-
-    with pytest.raises(ValueError, match="reflection_lm"):
-        optimize_campaign(
-            runner=runner,
-            seed_candidate=_seed_candidate(),
-            train_cases=[train_case],
-            validation_cases=[validation_case],
-            artifact_root=tmp_path / "artifacts",
-            max_metric_calls=4,
-            reflection_lm="reflection-lm",
-            candidate_proposer=_recording_proposer([]),
-        )
+    assert result.best_candidate.fingerprint != original.fingerprint
+    assert result.result.val_aggregate_scores[result.result.best_idx] == 0.5
+    summary = read_json(result.summary_path)
+    assert summary["invalid_proposals"] == 1
+    assert summary["stop_reason"] == "proposal_rejected"
 
 
 @pytest.mark.parametrize(
-    ("train_case_ids", "validation_case_ids", "message"),
+    "failure",
     [
-        ((), ("val-1",), "train_cases must not be empty"),
-        (("train-1",), (), "validation_cases must not be empty"),
-        (("train-1", "val-1"), ("val-1",), "train and validation case sets must be disjoint"),
-        (("val-1",), ("val-1",), "train and validation case sets must be disjoint"),
+        ValueError("source configuration failed"),
+        RuntimeError("programming error"),
+        BridgeInvocationError("source worker failed"),
+        ProposalProviderError("provider_timeout"),
+        BudgetExhausted("wall_clock"),
     ],
 )
-def test_optimize_campaign_requires_explicit_disjoint_case_splits(
+def test_fatal_composition_validation_does_not_return_the_gepa_incumbent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception,
+) -> None:
+    train = [case("train-a"), case("train-b")]
+    validation = [case("validation-a"), case("validation-b")]
+    original = candidate()
+    incumbent = candidate("Use the original evidence carefully.")
+    runner = source_runner(
+        train, validation,
+        success=lambda proposed, selected: (
+            proposed.fingerprint != original.fingerprint and selected.case_id.endswith("-a")
+        ),
+    )
+
+    def validate(*args: Any) -> None:
+        if args[2].fingerprint != incumbent.fingerprint:
+            raise failure
+
+    monkeypatch.setattr("korvid_prompt_lab.reflection.validate_upstream_candidate", validate)
+    proposals = iter([incumbent.components, candidate("Another proposal.").components])
+    budget = ExperimentBudget(100, 4, 30)
+    with pytest.raises(type(failure)) as error:
+        optimize_campaign(
+            runner=runner, seed_candidate=original, train_cases=train,
+            validation_cases=validation, artifact_root=tmp_path,
+            max_metric_calls=40, candidate_proposer=lambda *_args: next(proposals),
+            budget=budget,
+        )
+    assert error.value is failure
+    assert budget.proposals == 2
+    assert budget.evaluations == len(runner.calls)
+    assert not list(tmp_path.rglob("best-candidate.yaml"))
+    audit_paths = list(tmp_path.rglob("proposal-audit.json"))
+    assert len(audit_paths) == 1
+    assert read_json(audit_paths[0])["invalid_proposals"] == 0
+    assert read_json(audit_paths[0])["provider_errors"] == 1
+
+
+def test_optimize_passes_current_contract_to_gepa_and_persists_winner(
     tmp_path: Path,
-    train_case_ids: tuple[str, ...],
-    validation_case_ids: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    train, validation = [case("train")], [case("validation", journey=True)]
+    runner = source_runner(train, validation)
+    seed = candidate()
+    captured: dict[str, Any] = {}
+
+    def fake_optimize(**kwargs: object) -> Any:
+        captured.update(kwargs)
+        return fake_gepa_result(
+            cast(str, kwargs["run_dir"]),
+            [seed.components, {"tier_pack": IMPROVED_TEXT}],
+            scores=[0.0, 1.0],
+        )
+
+    monkeypatch.setattr("korvid_prompt_lab.optimize.gepa.optimize", fake_optimize)
+    artifacts = optimize_campaign(
+        runner=cast(Any, runner),
+        seed_candidate=seed,
+        train_cases=train,
+        validation_cases=validation,
+        artifact_root=tmp_path,
+        max_metric_calls=8,
+        seed=7,
+        candidate_proposer=lambda *_args: {"tier_pack": IMPROVED_TEXT},
+        budget=ExperimentBudget(20, 2, 30.0),
+    )
+
+    assert isinstance(artifacts, OptimizationArtifacts)
+    assert captured["seed_candidate"] == {"tier_pack": seed.components["tier_pack"]}
+    assert captured["trainset"] == train
+    assert captured["valset"] == validation
+    assert captured["seed"] == 7
+    assert captured["raise_on_exception"] is True
+    assert captured["reflection_minibatch_size"] == 3
+    persisted = yaml.safe_load(
+        artifacts.best_candidate_path.read_text(encoding="utf-8")
+    )
+    assert persisted["components"] == {"tier_pack": IMPROVED_TEXT}
+    summary = read_json(artifacts.summary_path)
+    assert summary["best_candidate_fingerprint"] == artifacts.best_candidate.fingerprint
+    assert summary["seed_candidate_fingerprint"] == seed.fingerprint
+    assert summary["best_candidate_differs_from_seed"] is True
+    assert summary["train_case_ids"] == ["train"]
+    assert summary["validation_case_ids"] == ["validation"]
+
+
+@pytest.mark.parametrize(
+    ("splits", "selected_train", "message"),
+    [
+        ((), "train", "declared train and validation"),
+        (
+            (
+                ("train", ("train",)),
+                ("validation", ("validation",)),
+                ("holdout", ("holdout",)),
+            ),
+            "holdout",
+            "never holdout",
+        ),
+    ],
+)
+def test_optimize_enforces_declared_source_splits_and_never_uses_holdout(
+    tmp_path: Path,
+    splits: tuple[tuple[str, tuple[str, ...]], ...],
+    selected_train: str,
     message: str,
 ) -> None:
-    all_cases = [_case("train-1"), _case("val-1")]
-    runner = _runner(all_cases)
+    cases = {
+        "train": case("train"),
+        "validation": case("validation", journey=True),
+        "holdout": case("holdout", journey=True),
+    }
+    runner = FakeRunner(list(cases.values()), splits=splits)
 
     with pytest.raises(ValueError, match=message):
         optimize_campaign(
-            runner=runner,
-            seed_candidate=_seed_candidate(),
-            train_cases=[_case(case_id) for case_id in train_case_ids],
-            validation_cases=[_case(case_id) for case_id in validation_case_ids],
-            artifact_root=tmp_path / "artifacts",
-            max_metric_calls=4,
+            runner=cast(Any, runner),
+            seed_candidate=candidate(),
+            train_cases=[cases[selected_train]],
+            validation_cases=[cases["validation"]],
+            artifact_root=tmp_path,
+            max_metric_calls=8,
+            candidate_proposer=lambda current, *_args: dict(current),
+            budget=ExperimentBudget(20, 1, 30.0),
         )
 
 
-def test_optimization_summary_records_how_its_evidence_was_produced(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    train_case = _case("train-1[scripted-mode]")
-    validation_case = _case("val-1[scripted-mode]")
-    runner = _runner([train_case, validation_case])
-
-    def fake_optimize(**kwargs: object) -> GEPAResult:
-        adapter = cast(Any, kwargs["adapter"])
-        adapter.evaluate([train_case], _seed_candidate().components, capture_traces=True)
-        return _fake_gepa_result(cast(str, kwargs["run_dir"]))
-
-    monkeypatch.setattr("korvid_prompt_lab.optimize.gepa.optimize", fake_optimize)
-
-    result = optimize_campaign(
-        runner=runner,
-        seed_candidate=_seed_candidate(),
-        train_cases=[train_case],
-        validation_cases=[validation_case],
-        artifact_root=tmp_path / "artifacts",
-        max_metric_calls=3,
+def test_optimize_preserves_source_kind_and_identity(tmp_path: Path) -> None:
+    train, validation = case("train"), case("validation", journey=True)
+    runner = source_runner([train], [validation])
+    wrong_kind = EvalCase(
+        case_id=train.case_id,
+        template_id="korvid-journey",
+        prompt=train.prompt,
+        models=train.models,
     )
 
-    summary = json.loads(result.summary_path.read_text(encoding="utf-8"))
-    assert summary["execution_modes"] == ["scripted"]
+    with pytest.raises(ValueError, match="source identity"):
+        optimize_campaign(
+            runner=cast(Any, runner),
+            seed_candidate=candidate(),
+            train_cases=[wrong_kind],
+            validation_cases=[validation],
+            artifact_root=tmp_path,
+            max_metric_calls=8,
+            candidate_proposer=lambda current, *_args: dict(current),
+            budget=ExperimentBudget(20, 1, 30.0),
+        )
+
+
+def test_optimize_refuses_to_reuse_source_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    train, validation = [case("train")], [case("validation")]
+    runner = source_runner(train, validation)
+    seed = candidate()
+
+    monkeypatch.setattr(
+        "korvid_prompt_lab.optimize.gepa.optimize",
+        lambda **kwargs: fake_gepa_result(
+            cast(str, kwargs["run_dir"]),
+            [seed.components],
+        ),
+    )
+
+    def run() -> OptimizationArtifacts:
+        return optimize_campaign(
+            runner=cast(Any, runner),
+            seed_candidate=seed,
+            train_cases=train,
+            validation_cases=validation,
+            artifact_root=tmp_path,
+            max_metric_calls=8,
+            seed=3,
+            candidate_proposer=lambda current, *_args: dict(current),
+            budget=ExperimentBudget(20, 1, 30.0),
+        )
+
+    first = run()
+    with pytest.raises(ValueError, match="already exists|never resumes"):
+        run()
+
+    assert first.summary_path.is_file()
+    assert (
+        read_json(first.invocation_dir / "run-identity.json")["run_id"] == first.run_id
+    )
+
+
+def test_optimizer_does_not_double_count_a_runner_owned_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    train, validation = [case("train")], [case("validation")]
+    budget = ExperimentBudget(5, 1, 30.0)
+    delegate = source_runner(train, validation)
+
+    class BudgetOwningRunner:
+        campaign = delegate.campaign
+        evaluation_budget = budget
+        calls = 0
+
+        def run(
+            self,
+            candidate_value: Candidate,
+            case_value: EvalCase,
+            run_dir: Path | str,
+            *,
+            repetition: int = 1,
+            seed: int = 0,
+        ) -> EvaluationResult:
+            self.evaluation_budget.consume_evaluation()
+            self.calls += 1
+            return delegate.run(
+                candidate_value,
+                case_value,
+                run_dir,
+                repetition=repetition,
+                seed=seed,
+            )
+
+    runner = BudgetOwningRunner()
+
+    def fake_optimize(**kwargs: object) -> Any:
+        cast(Any, kwargs["adapter"]).evaluate(
+            validation,
+            candidate().components,
+        )
+        return fake_gepa_result(
+            cast(str, kwargs["run_dir"]),
+            [candidate().components],
+        )
+
+    monkeypatch.setattr("korvid_prompt_lab.optimize.gepa.optimize", fake_optimize)
+    optimize_campaign(
+        runner=cast(Any, runner),
+        seed_candidate=candidate(),
+        train_cases=train,
+        validation_cases=validation,
+        artifact_root=tmp_path,
+        max_metric_calls=8,
+        candidate_proposer=lambda current, *_args: dict(current),
+        budget=budget,
+    )
+
+    assert runner.calls == 1
+    assert budget.evaluations == 1
+
+
+def test_real_gepa_selects_a_distinct_plaintext_prompt_at_the_proposal_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "korvid_prompt_lab.reflection.validate_upstream_candidate", lambda *_args: None,
+    )
+    train = [case(f"train-{index}") for index in range(3)]
+    validation = [case(f"validation-{index}") for index in range(2)]
+    budget = ExperimentBudget(40, 1, 30.0)
+    runner = source_runner(
+        train,
+        validation,
+        success=lambda value, _case: value.components["tier_pack"] == IMPROVED_TEXT,
+    )
+
+    artifacts = optimize_campaign(
+        runner=cast(Any, runner),
+        seed_candidate=candidate(),
+        train_cases=train,
+        validation_cases=validation,
+        artifact_root=tmp_path,
+        max_metric_calls=40,
+        candidate_proposer=lambda *_args: {"tier_pack": IMPROVED_TEXT},
+        budget=budget,
+    )
+
+    assert artifacts.best_candidate.components == {"tier_pack": IMPROVED_TEXT}
+    assert artifacts.best_candidate.fingerprint != candidate().fingerprint
+    assert budget.proposals == 1
+
+
+def test_real_gepa_preserves_the_winner_when_an_atomic_iteration_will_not_fit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "korvid_prompt_lab.reflection.validate_upstream_candidate", lambda *_args: None,
+    )
+    train = [case(f"train-{index}") for index in range(3)]
+    validation = [case(f"validation-{index}") for index in range(2)]
+    budget = ExperimentBudget(40, 10, 30.0)
+    delegate = source_runner(
+        train,
+        validation,
+        success=lambda value, _case: value.components["tier_pack"] == IMPROVED_TEXT,
+    )
+
+    class SearchLimitedRunner:
+        campaign = delegate.campaign
+        evaluation_budget = budget
+
+        def __init__(self) -> None:
+            self.remaining_search_calls = 10
+            self.calls = 0
+
+        def run(
+            self,
+            candidate_value: Candidate,
+            case_value: EvalCase,
+            run_dir: Path | str,
+            *,
+            repetition: int = 1,
+            seed: int = 0,
+        ) -> EvaluationResult:
+            if self.remaining_search_calls <= 0:
+                raise AssertionError("GEPA started an iteration that could not finish")
+            self.remaining_search_calls -= 1
+            self.evaluation_budget.consume_evaluation()
+            self.calls += 1
+            return delegate.run(
+                candidate_value,
+                case_value,
+                run_dir,
+                repetition=repetition,
+                seed=seed,
+            )
+
+    runner = SearchLimitedRunner()
+    artifacts = optimize_campaign(
+        runner=cast(Any, runner),
+        seed_candidate=candidate(),
+        train_cases=train,
+        validation_cases=validation,
+        artifact_root=tmp_path,
+        max_metric_calls=40,
+        candidate_proposer=lambda *_args: {"tier_pack": IMPROVED_TEXT},
+        budget=budget,
+    )
+
+    assert runner.calls == 10
+    assert runner.remaining_search_calls == 0
+    assert artifacts.best_candidate.components == {"tier_pack": IMPROVED_TEXT}

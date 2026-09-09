@@ -1,675 +1,279 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import sys
-from pathlib import Path
+from dataclasses import fields
+from types import MappingProxyType
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from korvid_prompt_lab.config import load_campaign, load_candidate
+from korvid_prompt_lab import contracts
 from korvid_prompt_lab.contracts import (
-    DEFAULT_BRIDGE_TIMEOUT_SECONDS,
-    AKSPortForwardServing,
+    GEPA_REFLECTION_MINIBATCH_SIZE,
+    MODEL_OPTION_FIELDS,
+    Campaign,
     Candidate,
-    KorvidReadonlyServing,
-    ProcessServing,
+    EvalCase,
+    KorvidUpstreamServing,
+    SearchStage,
+    _immutable_model_options,
+    _require_timeout,
 )
 
-ROOT = Path(__file__).resolve().parents[1]
 
-
-def _sha256(payload: dict[str, object]) -> str:
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
-        "utf-8"
+def _serving() -> KorvidUpstreamServing:
+    return KorvidUpstreamServing(
+        backend="korvid_upstream",
+        source_root="/reviewed/korvid",
+        base_url="http://127.0.0.1:11434",
+        korvid_revision="33c483e041006eb20259a024ed85a9323e52c8f0",
+        timeout_seconds=240.0,
+        model_options=MappingProxyType({"temperature": 0.0}),
     )
-    return hashlib.sha256(encoded).hexdigest()
 
 
-def test_load_candidate_from_example_yaml() -> None:
-    candidate = load_candidate(ROOT / "examples/candidates/shipped-small.yaml")
+def _case() -> EvalCase:
+    return EvalCase(
+        case_id="image-pull-typo",
+        template_id="korvid-scenario",
+        prompt="Why is the pod stuck in ImagePullBackOff?",
+        models=("ollama/qwen3:0.6b",),
+    )
 
-    assert candidate.candidate_id == "shipped-small"
-    assert candidate.components == {
-        "system": "You are korvid's bounded Kubernetes operator.",
-        "append": "Verify the postcondition before reporting completion.",
-        "tool.scale_resource": "Request an approval-gated replica-count change.",
-    }
-    assert candidate.metadata == {"source": "shipped"}
-    assert candidate.fingerprint == _sha256(
+
+def test_legacy_contract_types_and_aliases_are_absent() -> None:
+    for name in (
+        "ProcessServing",
+        "AKSPortForwardServing",
+        "KorvidReadonlyServing",
+        "KorvidNavigationServing",
+        "KorvidNativeServing",
+        "DEFAULT_BRIDGE_TIMEOUT_SECONDS",
+        "NATIVE_MODEL_OPTION_FIELDS",
+        "_immutable_native_model_options",
+        "_require_bridge_timeout",
+    ):
+        assert not hasattr(contracts, name)
+
+
+def test_candidate_accepts_only_a_non_blank_tier_pack() -> None:
+    candidate = Candidate.from_mapping(
         {
             "schema_version": 1,
-            "candidate_id": "shipped-small",
-            "components": {
-                "append": "Verify the postcondition before reporting completion.",
-                "system": "You are korvid's bounded Kubernetes operator.",
-                "tool.scale_resource": "Request an approval-gated replica-count change.",
-            },
+            "candidate_id": "candidate-1",
+            "components": {"tier_pack": "Use source evidence before answering."},
+            "metadata": {"source": "baseline"},
         }
     )
 
+    assert candidate.schema_version == 1
+    assert candidate.components == {"tier_pack": "Use source evidence before answering."}
+    assert candidate.metadata == {"source": "baseline"}
+    assert len(candidate.fingerprint) == 64
 
-def test_frozen_dataclasses_use_slots() -> None:
-    candidate = load_candidate(ROOT / "examples/candidates/shipped-small.yaml")
-    local = load_campaign(ROOT / "examples/campaigns/local-smoke.yaml")
 
-    assert not hasattr(candidate, "__dict__")
-    assert not hasattr(local.cases[0], "__dict__")
-    assert not hasattr(local.serving, "__dict__")
-    assert not hasattr(local, "__dict__")
+@pytest.mark.parametrize(
+    "components",
+    (
+        {"system": "legacy"},
+        {"append": "legacy"},
+        {"rules": "legacy"},
+        {"tool.scale_resource": "legacy"},
+        {"tier_pack": "ok", "system": "legacy"},
+        {"tier_pack": ""},
+    ),
+)
+def test_candidate_rejects_every_legacy_component_path(
+    components: dict[str, str],
+) -> None:
+    with pytest.raises(ValueError, match="tier_pack"):
+        Candidate.from_mapping(
+            {
+                "schema_version": 1,
+                "candidate_id": "candidate-1",
+                "components": components,
+            }
+        )
+
+
+def test_direct_candidate_construction_cannot_bypass_current_schema() -> None:
+    with pytest.raises(ValueError, match="tier_pack"):
+        Candidate(1, "bad", (("system", "legacy"),))
+    with pytest.raises(ValueError, match="schema_version"):
+        Candidate(2, "bad", (("tier_pack", "text"),))
 
 
 def test_candidate_fingerprint_is_stable_for_mapping_order() -> None:
-    shuffled = {
-        "candidate_id": "tiny",
-        "components": {
-            "tool.scale_resource": "Scale only when approved.",
-            "system": "Be brief.",
-            "append": "Check the postcondition.",
-        },
-        "schema_version": 1,
-    }
-    reordered = {
-        "schema_version": 1,
-        "candidate_id": "tiny",
-        "components": {
-            "append": "Check the postcondition.",
-            "system": "Be brief.",
-            "tool.scale_resource": "Scale only when approved.",
-        },
-    }
-
-    left = Candidate.from_mapping(shuffled)
-    right = Candidate.from_mapping(reordered)
-
-    assert left.fingerprint == right.fingerprint
-    assert left.fingerprint == _sha256(
+    left = Candidate.from_mapping(
         {
             "schema_version": 1,
-            "candidate_id": "tiny",
-            "components": {
-                "append": "Check the postcondition.",
-                "system": "Be brief.",
-                "tool.scale_resource": "Scale only when approved.",
-            },
+            "candidate_id": "candidate-1",
+            "components": {"tier_pack": "prompt"},
+            "metadata": {"b": "2", "a": "1"},
+        }
+    )
+    right = Candidate.from_mapping(
+        {
+            "metadata": {"a": "1", "b": "2"},
+            "components": {"tier_pack": "prompt"},
+            "candidate_id": "candidate-1",
+            "schema_version": 1,
         }
     )
 
-
-@pytest.mark.parametrize(
-    ("mapping", "message"),
-    [
-        (
-            {
-                "schema_version": 1,
-                "candidate_id": "bad",
-                "components": {"system": "ok"},
-                "unknown": "field",
-            },
-            "unknown",
-        ),
-        (
-            {
-                "schema_version": 1,
-                "candidate_id": "bad",
-                "components": {"tool.": "empty"},
-            },
-            "component",
-        ),
-    ],
-)
-def test_candidate_from_mapping_rejects_invalid_input(mapping: dict[str, object], message: str) -> None:
-    with pytest.raises(ValueError, match=message):
-        Candidate.from_mapping(mapping)
+    assert left.fingerprint == right.fingerprint
 
 
-def test_load_campaign_from_example_yaml(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("KORVID_AKS_NAMESPACE", "ollama")
-    monkeypatch.setenv("KORVID_AKS_SERVICE", "ollama")
-    monkeypatch.setenv("KORVID_AKS_MODEL", "qwen3:4b")
+def test_eval_cases_are_source_identity_records_only() -> None:
+    assert _case().template_id == "korvid-scenario"
+    journey = EvalCase(
+        case_id="tui-follow",
+        template_id="korvid-journey",
+        prompt='["Find the pod.", "Show its logs."]',
+        models=("ollama/qwen3:0.6b",),
+    )
+    assert journey.template_id == "korvid-journey"
 
-    local = load_campaign(ROOT / "examples/campaigns/local-smoke.yaml")
-    aks = load_campaign(ROOT / "examples/campaigns/aks-shared-runners.yaml")
+    with pytest.raises(ValueError, match="template"):
+        EvalCase("legacy", "scale-deployment-up", "scale it", ("model",))
 
-    assert local.campaign_id == "local-smoke"
-    assert local.repetitions == 5
-    assert local.bridge_timeout_seconds == pytest.approx(60.0)
-    assert local.models == ("mock-small",)
-    assert [case.case_id for case in local.cases] == ["smoke-happy", "smoke-guardrail"]
-    assert local.cases[0].models == ("mock-small",)
-    assert isinstance(local.serving, ProcessServing)
-    assert local.serving.backend == "process"
-    assert local.serving.command == (
-        "python3",
-        "tests/fixtures/fake_korvid_bridge.py",
-        "--request",
-        "{request}",
-        "--response",
-        "{response}",
+
+def test_campaign_has_only_current_fields_and_exactly_one_model() -> None:
+    campaign = Campaign(
+        campaign_id="source-campaign",
+        repetitions=5,
+        models=("ollama/qwen3:0.6b",),
+        cases=(_case(),),
+        serving=_serving(),
     )
 
-    assert aks.campaign_id == "aks-shared-runners"
-    assert aks.repetitions == 5
-    assert aks.bridge_timeout_seconds == pytest.approx(900.0)
-    assert aks.models == ("qwen3:4b",)
-    assert [case.case_id for case in aks.cases] == ["aks-scale-deployment-up", "aks-restart-denied"]
-    # The template ids must be real Korvid operation journeys and the prompts must be
-    # those journeys' own first turns, or `korvid-bridge` refuses the case.
-    assert [case.template_id for case in aks.cases] == ["scale-deployment-up", "restart-denied"]
-    assert [case.prompt for case in aks.cases] == [
-        "Scale checkout-a in shop-a from 2 to 3 replicas.",
-        "Restart the api deployment in shop-a.",
+    assert [field.name for field in fields(Campaign)] == [
+        "campaign_id",
+        "repetitions",
+        "models",
+        "cases",
+        "serving",
+        "evaluation_splits",
     ]
-    assert isinstance(aks.serving, AKSPortForwardServing)
-    assert aks.serving.backend == "aks_port_forward"
-    assert aks.serving.resource_group == "rg-pension-guard"
-    assert aks.serving.cluster_name == "aks-shared-runners"
-    assert aks.serving.namespace == "ollama"
-    assert aks.serving.service == "ollama"
-    assert aks.serving.model == "qwen3:4b"
-    assert aks.serving.command == (
-        "korvid-bridge",
-        "--request",
-        "{request}",
-        "--response",
-        "{response}",
-        "--turn-timeout",
-        "300",
-    )
+    assert campaign.evaluation_splits == ()
+    assert not hasattr(campaign, "schema_version")
+    assert not hasattr(campaign, "bridge_timeout_seconds")
 
-
-def test_load_qualification_campaign_from_example_yaml(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("KORVID_AKS_NAMESPACE", "ollama")
-    monkeypatch.setenv("KORVID_AKS_SERVICE", "ollama")
-    monkeypatch.setenv("KORVID_AKS_MODEL", "qwen3:0.6b")
-
-    campaign = load_campaign(ROOT / "examples/campaigns/aks-small-operator-qualification.yaml")
-
-    assert campaign.campaign_id == "aks-small-operator-qualification"
-    assert campaign.repetitions == 5
-    assert campaign.bridge_timeout_seconds == pytest.approx(900.0)
-    assert campaign.models == ("qwen3:0.6b",)
-    assert [case.case_id for case in campaign.cases] == [
-        "scale-deployment-up",
-        "restart-denied",
-        "scale-no-op",
-        "scale-deployment-down",
-        "restart-deployment",
-        "scale-rbac-denied",
-        "scale-ambiguous-namespace",
-        "restart-approval-expired",
-        "restart-daemonset",
-        "scale-same-name-replacement",
-        "scale-statefulset-down",
-        "edit-unsupported",
-    ]
-    assert [case.template_id for case in campaign.cases] == [
-        "scale-deployment-up",
-        "restart-denied",
-        "scale-no-op",
-        "scale-deployment-down",
-        "restart-deployment",
-        "scale-rbac-denied",
-        "scale-ambiguous-namespace",
-        "restart-approval-expired",
-        "restart-daemonset",
-        "scale-same-name-replacement",
-        "scale-statefulset-down",
-        "edit-unsupported",
-    ]
-    assert isinstance(campaign.serving, AKSPortForwardServing)
-    assert campaign.serving.namespace == "ollama"
-    assert campaign.serving.service == "ollama"
-    assert campaign.serving.model == "qwen3:0.6b"
-
-
-def test_load_campaign_rejects_whitespace_only_env_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("KORVID_AKS_NAMESPACE", "   ")
-    monkeypatch.setenv("KORVID_AKS_SERVICE", "korvid-api")
-    monkeypatch.setenv("KORVID_AKS_MODEL", "qwen3-4b")
-
-    path = tmp_path / "campaign.yaml"
-    path.write_text(
-        """
-schema_version: 1
-campaign_id: aks-shared-runners
-repetitions: 1
-models: [qwen3-4b]
-cases:
-  - case_id: case-a
-    template_id: template-a
-    prompt: one
-    models: [qwen3-4b]
-serving:
-  backend: aks_port_forward
-  resource_group: rg-pension-guard
-  cluster_name: aks-shared-runners
-  namespace: env:KORVID_AKS_NAMESPACE
-  service: env:KORVID_AKS_SERVICE
-  model: env:KORVID_AKS_MODEL
-""".strip()
-        + "\n",
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="serving.namespace"):
-        load_campaign(path)
-
-
-@pytest.mark.parametrize(
-    ("yaml_text", "message"),
-    [
-        (
-            """
-schema_version: 1
-campaign_id: duplicate-cases
-repetitions: 1
-models: [mock-small]
-cases:
-  - case_id: case-a
-    template_id: template-a
-    prompt: one
-    models: [mock-small]
-  - case_id: case-a
-    template_id: template-b
-    prompt: two
-    models: [mock-small]
-serving:
-  backend: process
-  unexpected: true
-  command: [python, -c, "print('ok')"]
-""",
-            "duplicate",
-        ),
-        (
-            """
-schema_version: 1
-campaign_id: bad-repetitions
-repetitions: 0
-models: [mock-small]
-cases:
-  - case_id: case-a
-    template_id: template-a
-    prompt: one
-    models: [mock-small]
-serving:
-  backend: process
-  command: [python, -c, "print('ok')"]
-""",
-            "repetitions",
-        ),
-        (
-            """
-schema_version: 1
-campaign_id: missing-model-coverage
-repetitions: 1
-models: [mock-small, mock-large]
-cases:
-  - case_id: case-a
-    template_id: template-a
-    prompt: one
-    models: [mock-small]
-serving:
-  backend: process
-  command: [python, -c, "print('ok')"]
-""",
-            "coverage",
-        ),
-        (
-            """
-schema_version: 1
-campaign_id: unknown-field
-repetitions: 1
-models: [mock-small]
-cases:
-  - case_id: case-a
-    template_id: template-a
-    prompt: one
-    models: [mock-small]
-    unexpected: true
-serving:
-  backend: process
-  command: [python, -c, "print('ok')"]
-""",
-            "unknown",
-        ),
-    ],
-)
-def test_load_campaign_rejects_invalid_campaigns(
-    tmp_path: Path, yaml_text: str, message: str
-) -> None:
-    path = tmp_path / "campaign.yaml"
-    path.write_text(yaml_text.strip() + "\n", encoding="utf-8")
-
-    with pytest.raises(ValueError, match=message):
-        load_campaign(path)
-
-
-def _timeout_campaign_yaml(timeout_line: str) -> str:
-    return (
-        """
-schema_version: 1
-campaign_id: timeout-campaign
-repetitions: 1
-"""
-        + timeout_line
-        + """models: [mock-small]
-cases:
-  - case_id: case-a
-    template_id: template-a
-    prompt: one
-    models: [mock-small]
-serving:
-  backend: process
-  command: [python3, bridge.py, --request, "{request}", --response, "{response}"]
-"""
-    ).strip() + "\n"
-
-
-def test_load_campaign_defaults_the_bridge_timeout_to_the_reviewed_value(tmp_path: Path) -> None:
-    path = tmp_path / "campaign.yaml"
-    path.write_text(_timeout_campaign_yaml(""), encoding="utf-8")
-
-    campaign = load_campaign(path)
-
-    assert DEFAULT_BRIDGE_TIMEOUT_SECONDS == 300.0
-    assert campaign.bridge_timeout_seconds == DEFAULT_BRIDGE_TIMEOUT_SECONDS
-
-
-def test_load_campaign_parses_an_explicit_bridge_timeout(tmp_path: Path) -> None:
-    path = tmp_path / "campaign.yaml"
-    path.write_text(_timeout_campaign_yaml("bridge_timeout_seconds: 45.5\n"), encoding="utf-8")
-
-    campaign = load_campaign(path)
-
-    assert campaign.bridge_timeout_seconds == pytest.approx(45.5)
-
-
-@pytest.mark.parametrize(
-    "timeout_value",
-    ["0", "-1", "-0.5", '"30"', "true", "null", "[30]", ".nan", ".inf"],
-)
-def test_load_campaign_rejects_non_positive_bridge_timeouts(tmp_path: Path, timeout_value: str) -> None:
-    path = tmp_path / "campaign.yaml"
-    path.write_text(_timeout_campaign_yaml(f"bridge_timeout_seconds: {timeout_value}\n"), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="bridge_timeout_seconds must be a positive number"):
-        load_campaign(path)
-
-
-def _aks_campaign_yaml(serving_lines: str) -> str:
-    return (
-        """
-schema_version: 1
-campaign_id: aks-campaign
-repetitions: 1
-models: [qwen3-4b]
-cases:
-  - case_id: case-a
-    template_id: template-a
-    prompt: one
-    models: [qwen3-4b]
-serving:
-  backend: aks_port_forward
-  resource_group: rg-pension-guard
-  cluster_name: aks-shared-runners
-  namespace: korvid
-  service: korvid-api
-  model: qwen3-4b
-"""
-        + serving_lines
-    ).strip() + "\n"
-
-
-def test_load_campaign_parses_the_explicit_local_bridge_command_for_aks_serving(tmp_path: Path) -> None:
-    path = tmp_path / "campaign.yaml"
-    path.write_text(
-        _aks_campaign_yaml(
-            """
-  command: [korvid-bridge, --request, "{request}", --response, "{response}"]
-"""
-        ),
-        encoding="utf-8",
-    )
-
-    campaign = load_campaign(path)
-
-    assert isinstance(campaign.serving, AKSPortForwardServing)
-    assert campaign.serving.command == (
-        "korvid-bridge",
-        "--request",
-        "{request}",
-        "--response",
-        "{response}",
-    )
-
-
-@pytest.mark.parametrize(
-    ("serving_lines", "message"),
-    [
-        ("", "serving.command"),
-        ("""\n  command: []\n""", "serving.command"),
-        ("""\n  command: [korvid-bridge, --request, "{request}"]\n""", r"\{response\}"),
-        ("""\n  command: [korvid-bridge, "env:KORVID_BRIDGE_ARGS", --request, "{request}", --response, "{response}"]\n""", "env:"),
-    ],
-)
-def test_load_campaign_rejects_unusable_aks_bridge_commands(
-    tmp_path: Path, serving_lines: str, message: str
-) -> None:
-    path = tmp_path / "campaign.yaml"
-    path.write_text(_aks_campaign_yaml(serving_lines), encoding="utf-8")
-
-    with pytest.raises(ValueError, match=message):
-        load_campaign(path)
-
-
-def test_load_campaign_rejects_process_commands_without_artifact_placeholders(tmp_path: Path) -> None:
-    path = tmp_path / "campaign.yaml"
-    path.write_text(
-        """
-schema_version: 1
-campaign_id: process-campaign
-repetitions: 1
-models: [mock-small]
-cases:
-  - case_id: case-a
-    template_id: template-a
-    prompt: one
-    models: [mock-small]
-serving:
-  backend: process
-  command: [python3, bridge.py]
-""".strip()
-        + "\n",
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match=r"\{request\}"):
-        load_campaign(path)
-
-
-def _korvid_readonly_campaign_yaml(serving_lines: str) -> str:
-    return (
-        """
-schema_version: 1
-campaign_id: korvid-readonly-campaign
-repetitions: 1
-models: [qwen3-4b]
-cases:
-  - case_id: oom-killed
-    template_id: template-a
-    prompt: "The database pod keeps restarting. Why?"
-    models: [qwen3-4b]
-serving:
-  backend: korvid_readonly
-  provider: ollama
-  base_url: env:KORVID_READONLY_BASE_URL
-  profile: small
-  timeout_seconds: 160
-"""
-        + serving_lines
-    ).strip() + "\n"
-
-
-def test_load_campaign_parses_korvid_readonly_serving(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("KORVID_READONLY_BASE_URL", "http://127.0.0.1:11434")
-    path = tmp_path / "campaign.yaml"
-    path.write_text(_korvid_readonly_campaign_yaml(""), encoding="utf-8")
-
-    campaign = load_campaign(path)
-
-    assert isinstance(campaign.serving, KorvidReadonlyServing)
-    assert campaign.serving.backend == "korvid_readonly"
-    assert campaign.serving.provider == "ollama"
-    assert campaign.serving.base_url == "http://127.0.0.1:11434"
-    assert campaign.serving.profile == "small"
-    assert campaign.serving.timeout_seconds == pytest.approx(160.0)
-    assert not hasattr(campaign.serving, "__dict__")
-
-
-def test_load_campaign_rejects_korvid_readonly_missing_base_url_env(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.delenv("KORVID_READONLY_BASE_URL", raising=False)
-    path = tmp_path / "campaign.yaml"
-    path.write_text(_korvid_readonly_campaign_yaml(""), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="serving.base_url"):
-        load_campaign(path)
-
-
-def test_load_campaign_rejects_literal_korvid_readonly_base_url(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "campaign.yaml"
-    path.write_text(
-        _korvid_readonly_campaign_yaml("").replace(
-            "env:KORVID_READONLY_BASE_URL", "http://127.0.0.1:11434"
-        ),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match=r"serving\.base_url.*env:"):
-        load_campaign(path)
-
-
-def test_load_campaign_rejects_korvid_readonly_timeout_below_runtime_budget(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("KORVID_READONLY_BASE_URL", "http://127.0.0.1:11434")
-    path = tmp_path / "campaign.yaml"
-    path.write_text(
-        _korvid_readonly_campaign_yaml("").replace(
-            "timeout_seconds: 160", "timeout_seconds: 120"
-        ),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="serving probe"):
-        load_campaign(path)
-
-
-@pytest.mark.parametrize(
-    ("field_overrides", "message"),
-    [
-        ("  provider: grpc\n", "provider"),
-        ("  profile: medium\n", "profile"),
-        ("  timeout_seconds: 0\n", "timeout_seconds"),
-        ("  timeout_seconds: -5\n", "timeout_seconds"),
-        ("  unexpected: true\n", "unknown"),
-    ],
-)
-def test_load_campaign_rejects_invalid_korvid_readonly_serving(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, field_overrides: str, message: str
-) -> None:
-    monkeypatch.setenv("KORVID_READONLY_BASE_URL", "http://127.0.0.1:11434")
-    path = tmp_path / "campaign.yaml"
-    path.write_text(_korvid_readonly_campaign_yaml(field_overrides), encoding="utf-8")
-
-    with pytest.raises(ValueError, match=message):
-        load_campaign(path)
-
-
-def test_load_campaign_rejects_openai_compat_provider_with_missing_fields(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("KORVID_READONLY_BASE_URL", "http://127.0.0.1:8000/v1")
-    path = tmp_path / "campaign.yaml"
-    path.write_text(
-        (
-            """
-schema_version: 1
-campaign_id: korvid-readonly-campaign
-repetitions: 1
-models: [qwen3-4b]
-cases:
-  - case_id: oom-killed
-    template_id: template-a
-    prompt: "The database pod keeps restarting. Why?"
-    models: [qwen3-4b]
-serving:
-  backend: korvid_readonly
-  provider: openai-compat
-  base_url: env:KORVID_READONLY_BASE_URL
-  profile: full
-"""
-        ).strip()
-        + "\n",
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="serving.timeout_seconds"):
-        load_campaign(path)
-
-
-def test_readonly_small_example_matches_installed_bundled_scenarios(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The checked-in example never vendors scenario text: it hand-copies exact
-
-    case ids and authored questions from whichever Korvid wheel is installed.
-    This test re-derives that same catalog from the installed wheel so a
-    Korvid dependency bump that silently reworded a scenario fails this test
-    visibly instead of corrupting the example campaign's identity silently.
-    """
-    from korvid.evals.scenario import bundled_scenarios_dir, load_scenario
-
-    monkeypatch.setenv("KORVID_READONLY_BASE_URL", "http://127.0.0.1:11434")
-    campaign = load_campaign(ROOT / "examples/campaigns/korvid-readonly-small.yaml")
-
-    assert isinstance(campaign.serving, KorvidReadonlyServing)
-    assert campaign.serving.backend == "korvid_readonly"
-    assert campaign.serving.provider == "ollama"
-    assert campaign.serving.profile == "small"
-
-    bundled_questions = {
-        scenario.id: scenario.question
-        for scenario in (
-            load_scenario(path) for path in bundled_scenarios_dir().glob("*.yaml")
+    with pytest.raises(ValueError, match="exactly one"):
+        Campaign(
+            campaign_id="bad",
+            repetitions=1,
+            models=("small", "large"),
+            cases=(_case(),),
+            serving=_serving(),
         )
+
+
+def test_upstream_serving_allows_an_unbound_endpoint_during_staging() -> None:
+    serving = KorvidUpstreamServing(
+        backend="korvid_upstream",
+        source_root="/reviewed/korvid",
+        base_url="",
+        korvid_revision="33c483e041006eb20259a024ed85a9323e52c8f0",
+        timeout_seconds=240.0,
+    )
+
+    assert serving.base_url == ""
+
+
+def test_campaign_requires_source_cases_for_its_single_model() -> None:
+    mismatched = EvalCase(
+        case_id="image-pull-typo",
+        template_id="korvid-scenario",
+        prompt="Why?",
+        models=("different-model",),
+    )
+    with pytest.raises(ValueError, match="campaign"):
+        Campaign(
+            campaign_id="bad",
+            repetitions=1,
+            models=("ollama/qwen3:0.6b",),
+            cases=(mismatched,),
+            serving=_serving(),
+        )
+
+
+def test_campaign_evaluation_splits_reference_declared_source_cases() -> None:
+    campaign = Campaign(
+        campaign_id="split",
+        repetitions=5,
+        models=("ollama/qwen3:0.6b",),
+        cases=(_case(),),
+        serving=_serving(),
+        evaluation_splits=(("validation", ("image-pull-typo",)),),
+    )
+    assert campaign.evaluation_splits == (
+        ("validation", ("image-pull-typo",)),
+    )
+
+    with pytest.raises(ValueError, match="unknown"):
+        Campaign(
+            campaign_id="bad-split",
+            repetitions=5,
+            models=("ollama/qwen3:0.6b",),
+            cases=(_case(),),
+            serving=_serving(),
+            evaluation_splits=(("validation", ("not-a-source-case",)),),
+        )
+
+
+def test_search_stage_is_the_small_current_campaign_contract() -> None:
+    stage = SearchStage.from_mapping(
+        {"name": "search", "metric_calls": 9, "seeds": [0, 7]},
+        index=2,
+    )
+    assert stage == SearchStage(name="search", metric_calls=9, seeds=(0, 7))
+    assert GEPA_REFLECTION_MINIBATCH_SIZE == 3
+
+    with pytest.raises(ValueError, match="unknown"):
+        SearchStage.from_mapping(
+            {"name": "search", "metric_calls": 9, "seeds": [0], "legacy": True},
+            index=0,
+        )
+    with pytest.raises(ValueError, match="missing required field"):
+        SearchStage.from_mapping(
+            {"name": "search", "metric_calls": 9},
+            index=0,
+        )
+    with pytest.raises(ValueError, match="positive"):
+        SearchStage.from_mapping(
+            {"name": "search", "metric_calls": 0, "seeds": [0]},
+            index=0,
+        )
+    with pytest.raises(ValueError, match="non-negative"):
+        SearchStage.from_mapping(
+            {"name": "search", "metric_calls": 1, "seeds": [-1]},
+            index=0,
+        )
+
+
+def test_model_options_and_timeout_use_only_current_names() -> None:
+    assert MODEL_OPTION_FIELDS == frozenset(
+        {
+            "native_thinking",
+            "think",
+            "num_ctx",
+            "temperature",
+            "seed",
+            "keep_alive",
+            "num_predict",
+        }
+    )
+    options = _immutable_model_options(
+        {"temperature": 0, "seed": 4, "native_thinking": False}
+    )
+    assert dict(options) == {
+        "temperature": 0,
+        "seed": 4,
+        "native_thinking": False,
     }
-    assert bundled_questions, "installed Korvid wheel exposed no bundled scenarios"
+    with pytest.raises(TypeError):
+        options["seed"] = 5  # type: ignore[index]
 
-    assert len(campaign.cases) >= 4
-    case_ids = [case.case_id for case in campaign.cases]
-    assert len(set(case_ids)) == len(case_ids), "example campaign cases must be unique"
-
-    for case in campaign.cases:
-        assert case.case_id in bundled_questions, (
-            f"{case.case_id!r} is not a scenario shipped by the installed Korvid "
-            "wheel; update examples/campaigns/korvid-readonly-small.yaml to match "
-            "the currently installed korvid[agent] distribution"
-        )
-        assert case.prompt == bundled_questions[case.case_id], (
-            f"{case.case_id!r}'s authored question changed in the installed "
-            "Korvid wheel; update examples/campaigns/korvid-readonly-small.yaml's "
-            "prompt to match verbatim rather than silently drifting from it"
-        )
-
-    train_case_ids = {"oom-killed", "crashloop-app-panic"}
-    validation_case_ids = {"image-pull-typo", "healthy-deployment"}
-    assert train_case_ids <= set(case_ids)
-    assert validation_case_ids <= set(case_ids)
-    assert train_case_ids.isdisjoint(validation_case_ids)
+    assert _require_timeout(12, "runtime.timeout_seconds") == 12.0
+    for invalid in (0, -1, True, float("nan")):
+        with pytest.raises(ValueError, match="positive"):
+            _require_timeout(invalid, "runtime.timeout_seconds")
