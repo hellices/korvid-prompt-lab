@@ -8,8 +8,10 @@ import hashlib
 import json
 import os
 import platform
+import re
 import sys
 import tempfile
+import time
 from collections.abc import AsyncIterator, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -29,9 +31,14 @@ from korvid.agent.events import (
     AgentEvent,
     ToolCallFinished,
     ToolCallStarted,
+    TurnComplete,
 )
 from korvid.agent.interaction import InteractionContext, PaneContext
-from korvid.agent.model_policy import ResolvedAgentPolicy
+from korvid.agent.model_policy import (
+    ModelCapabilities,
+    ModelDescriptor,
+    ResolvedAgentPolicy,
+)
 from korvid.agent.prompt_harness import PromptHarness, PromptInputs, _user_rule_layer
 from korvid.agent.provider import LLMProvider
 from korvid.core.config import (
@@ -93,6 +100,41 @@ class _RecordingPanel:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._delegate, name)
+
+
+class _ProviderObserver(LLMProvider):
+    """Delegate provider calls while counting actual model rounds."""
+
+    def __init__(self, delegate: LLMProvider) -> None:
+        self._delegate = delegate
+        self.iterations = 0
+
+    @property
+    def descriptor(self) -> ModelDescriptor:
+        return self._delegate.descriptor
+
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        return self._delegate.capabilities
+
+    def prepare_messages(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        return self._delegate.prepare_messages(messages)
+
+    async def complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        stream: bool = True,
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.iterations += 1
+        async for event in self._delegate.complete(messages, tools, stream=stream):
+            yield event
+
+    async def aclose(self) -> None:
+        await self._delegate.aclose()
 
 
 def _plain(value: Any) -> Any:
@@ -401,11 +443,25 @@ def _calls(events: Sequence[AgentEvent]) -> tuple[list[dict[str, Any]], list[str
     started: dict[str, tuple[str, dict[str, Any]]] = {}
     calls: list[dict[str, Any]] = []
     errors: list[str] = []
-    for event in events:
+    for index, event in enumerate(events):
         if isinstance(event, AgentError):
-            raise NativeWorkerError(
-                f"native agent turn failed: {_bounded_label(event.message)}"
+            followed_by_completion = (
+                index + 1 < len(events)
+                and isinstance(events[index + 1], TurnComplete)
             )
+            if followed_by_completion and re.fullmatch(
+                r"iteration limit reached \(\d+\) — refine the question",
+                event.message,
+            ):
+                errors.append("agent:iteration-limit")
+                continue
+            if followed_by_completion and re.fullmatch(
+                r"history budget exceeded mid-turn \(\d+ chars\) — turn ended early",
+                event.message,
+            ):
+                errors.append("agent:history-budget-exceeded")
+                continue
+            raise NativeWorkerError("native agent turn failed")
         if isinstance(event, ToolCallStarted):
             arguments: dict[str, Any] = {}
             try:
@@ -481,7 +537,8 @@ async def _evaluate(
             raise TypeError("config_path must be a non-blank string when provided")
         config = load_config(Path(config_path))
         _assert_loaded_config(config, rules, profile)
-    execution_mode, provider = _provider(payload, profile)
+    execution_mode, raw_provider = _provider(payload, profile)
+    provider = _ProviderObserver(raw_provider)
     fixture = _fixture(case)
     kube = FakeKubeClient(fixture)
     aliases = _aliases()
@@ -513,6 +570,7 @@ async def _evaluate(
     agent_bridge.target = app.agent_ui.workspace_bridge
     panel = _RecordingPanel(app.agent_ui._panel)
     app.agent_ui._panel = cast(Any, panel)
+    started: float | None = None
     try:
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -531,12 +589,16 @@ async def _evaluate(
                     )
             await pilot.pause()
             initial = _observe(app, aliases)
+            started = time.monotonic()
             await app.agent_ui.run_turn(case.prompt)
             await pilot.pause()
             observed = _observe(app, aliases)
             fingerprint, rules_applied = _actual_prompt_identity(app, rules)
     finally:
         await provider.aclose()
+    if started is None:
+        raise NativeWorkerError("native agent turn did not start")
+    wall_time = time.monotonic() - started
     expected = _expected(case)
     calls, errors = _calls(panel.events)
     return {
@@ -557,6 +619,8 @@ async def _evaluate(
         "ui_follow": config.agent_follow,
         "model": model,
         "runtime": _runtime_metadata(),
+        "wall_time_seconds": wall_time,
+        "iterations": provider.iterations,
     }
 
 

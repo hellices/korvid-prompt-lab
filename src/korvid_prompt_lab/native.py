@@ -96,7 +96,7 @@ def validate_native_prompt_identity(payload: Mapping[str, Any]) -> None:
 
 def _validate_worker_result(
     payload: Mapping[str, Any], *, rules: list[str], case_id: str, execution_mode: str,
-) -> None:
+) -> tuple[float, int]:
     expected = {
         "protocol_version": NATIVE_PROTOCOL_VERSION, "korvid_version": NATIVE_KORVID_VERSION,
         "rules": rules, "case_id": case_id, "execution_mode": execution_mode,
@@ -107,6 +107,18 @@ def _validate_worker_result(
     if payload.get("rules_applied") is not True or payload.get("ui_follow") is not True:
         raise ValueError("native worker did not verify production rules and follow")
     validate_native_prompt_identity(payload)
+    wall_time = payload.get("wall_time_seconds")
+    if (
+        isinstance(wall_time, bool)
+        or not isinstance(wall_time, (int, float))
+        or not math.isfinite(wall_time)
+        or wall_time < 0
+    ):
+        raise ValueError("native worker wall_time_seconds must be finite and non-negative")
+    iterations = payload.get("iterations")
+    if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 1:
+        raise ValueError("native worker iterations must be a positive integer")
+    return float(wall_time), iterations
 
 
 @dataclass(frozen=True)
@@ -148,7 +160,9 @@ class KorvidNativeRunner:
             "case_id": case.case_id, "rules": rules,
             "model": native_model(case.models[0], serving, seed), "script": script,
         })
-        _validate_worker_result(result, rules=rules, case_id=case.case_id, execution_mode=mode)
+        wall_time, iterations = _validate_worker_result(
+            result, rules=rules, case_id=case.case_id, execution_mode=mode
+        )
         for key in ("initial", "expected", "observed"):
             if not isinstance(result.get(key), dict):
                 raise ValueError(f"native worker {key} must be an object")  # noqa: TRY004
@@ -207,10 +221,11 @@ class KorvidNativeRunner:
         # No endpoint or runtime paths in publication metadata; the contract digest
         # still detects differing model parameters, policy, source, and dependencies.
         contract_digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-        wall_time = result.get("wall_time_seconds", 0.0)
-        if isinstance(wall_time, bool) or not isinstance(wall_time, (int, float)) or not math.isfinite(wall_time) or wall_time < 0:
-            raise ValueError("native duration must be finite and non-negative")
-        usage = {"tool_calls": len(calls), "iterations": len(calls), "wall_time_seconds": wall_time}
+        usage = {
+            "tool_calls": len(calls),
+            "iterations": iterations,
+            "wall_time_seconds": wall_time,
+        }
         bridge = BridgeResult(
             protocol_version=2, status="completed", execution_mode=mode,
             candidate_fingerprint=candidate.fingerprint, grade=grade, answer="",

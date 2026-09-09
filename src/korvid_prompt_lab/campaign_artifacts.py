@@ -24,6 +24,7 @@ from typing import Any
 
 import yaml  # type: ignore[import-untyped]
 
+from .bridge_worker import PROTOCOL_VERSION
 from .campaigns import (
     ActionKind,
     CampaignAction,
@@ -908,6 +909,11 @@ def _validate_evidence_sources(
         korvid_version = _require_str(
             entry[4], f"{entry_context}.korvid_version"
         )
+        if kind == "korvid_native":
+            from .native_contract import NATIVE_KORVID_VERSION
+
+            if korvid_version != NATIVE_KORVID_VERSION:
+                raise ValueError(f"{entry_context}.korvid_version must be {NATIVE_KORVID_VERSION}")
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.!+_-]{0,63}", korvid_version) is None:
             raise ValueError(f"{entry_context}.korvid_version must be canonical")
         scenario_sha256 = _require_str(
@@ -966,7 +972,7 @@ def _load_response_evidence_sources(
             safe_root, ref, expected_root_identity=expected_root_identity
         )
         response = _require_mapping(payload, ref)
-        _validate_projected_response_shape(response, ref, readonly=True)
+        _validate_projected_response_shape(response, ref, evaluation_backend=expected_backend)
         response_candidate = _require_str(
             response.get("candidate_fingerprint"),
             f"{ref}.candidate_fingerprint",
@@ -1193,7 +1199,7 @@ def _validate_before_response_metrics(
             safe_root, ref, expected_root_identity=expected_root_identity
         )
         response = _require_mapping(payload, ref)
-        _validate_projected_response_shape(response, ref, readonly=readonly)
+        _validate_projected_response_shape(response, ref, evaluation_backend=expected_backend)
         candidate_fingerprint = _require_str(
             response.get("candidate_fingerprint"),
             f"{ref}.candidate_fingerprint",
@@ -1330,17 +1336,18 @@ def _validate_before_response_metrics(
 
 
 def _validate_projected_response_shape(
-    response: dict[str, Any], context: str, *, readonly: bool
+    response: dict[str, Any], context: str, *, evaluation_backend: str
 ) -> None:
+    versioned = evaluation_backend in _VERSIONED_EVIDENCE_BACKENDS
     _ensure_exact_keys(
         response,
-        _PROJECTED_RESPONSE_KEYS if readonly else _PROJECTED_PROCESS_RESPONSE_KEYS,
+        _PROJECTED_RESPONSE_KEYS if versioned else _PROJECTED_PROCESS_RESPONSE_KEYS,
         context,
     )
     if _require_positive_int(
         response.get("protocol_version"), f"{context}.protocol_version"
-    ) != 1:
-        raise ValueError(f"{context}.protocol_version must be 1")
+    ) != PROTOCOL_VERSION:
+        raise ValueError(f"{context}.protocol_version must be {PROTOCOL_VERSION}")
     status = _require_str(response.get("status"), f"{context}.status")
     if status not in {"completed", "model_failure"}:
         raise ValueError(f"{context}.status is invalid")
@@ -1358,7 +1365,7 @@ def _validate_projected_response_shape(
     _ensure_exact_keys(
         identity,
         _PROJECTED_IDENTITY_KEYS
-        if readonly
+        if versioned
         else _PROJECTED_PROCESS_IDENTITY_KEYS,
         f"{context}.request_identity",
     )
@@ -1369,14 +1376,18 @@ def _validate_projected_response_shape(
     _require_bounded_text(identity.get("model"), f"{context}.model")
     _require_positive_int(identity.get("repetition"), f"{context}.repetition")
     _require_non_negative_int(identity.get("seed"), f"{context}.seed")
-    if readonly and identity.get("seed_applied") is not False:
-        raise ValueError(f"{context}.request_identity.seed_applied must be false")
+    if versioned:
+        expected_seed_applied = evaluation_backend == "korvid_native"
+        if identity.get("seed_applied") is not expected_seed_applied:
+            raise ValueError(
+                f"{context}.request_identity.seed_applied must be {str(expected_seed_applied).lower()}"
+            )
     candidate_fingerprint = _require_str(
         response.get("candidate_fingerprint"), f"{context}.candidate_fingerprint"
     )
     if re.fullmatch(r"[0-9a-f]{64}", candidate_fingerprint) is None:
         raise ValueError(f"{context}.candidate_fingerprint must be SHA-256")
-    if readonly:
+    if versioned:
         source = _require_mapping(
             response.get("evidence_source"), f"{context}.evidence_source"
         )

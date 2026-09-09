@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 import subprocess
 import sys
@@ -163,6 +164,11 @@ def test_scripted_native_low_tools_drive_actual_ui(
     assert len(result["prompt_fingerprint"]) == 64
     assert result["runtime"]["lock_parity"] == "not-asserted"
     assert len(result["runtime"]["fingerprint"]) == 64
+    assert math.isfinite(result["wall_time_seconds"])
+    assert result["wall_time_seconds"] > 0
+    assert result["iterations"] == (
+        1 if tool in {"open_logs", "open_describe"} else 2
+    )
 
 
 def test_text_claim_without_ui_action_does_not_satisfy_postcondition(
@@ -175,6 +181,93 @@ def test_text_claim_without_ui_action_does_not_satisfy_postcondition(
     assert result["calls"] == []
     assert result["observed"]["logs"] == ""
     assert any(item.startswith("logs:") for item in result["missing_postconditions"])
+    assert result["iterations"] == 1
+
+
+def test_multiple_tool_calls_do_not_count_as_provider_iterations(
+    worker: ModuleType,
+) -> None:
+    calls = [
+        {
+            "type": "tool_call",
+            "id": f"call-{index}",
+            "name": "list_resources",
+            "arguments": json.dumps({"kind": "pods", "namespace": "shop"}),
+        }
+        for index in range(3)
+    ]
+    script = [
+        [*calls, {"type": "done"}],
+        [{"type": "text_delta", "text": "done"}, {"type": "done"}],
+    ]
+
+    result = worker.run_request(_payload("train-pods", script))
+
+    assert len(result["calls"]) == 3
+    assert result["iterations"] == 2
+
+
+def test_iteration_limit_is_a_completed_failed_evaluation(
+    worker: ModuleType,
+) -> None:
+    script = [
+        [
+            {
+                "type": "tool_call",
+                "id": f"call-{index}",
+                "name": "list_resources",
+                "arguments": json.dumps({"kind": "pods", "namespace": "shop"}),
+            },
+            {"type": "done"},
+        ]
+        for index in range(6)
+    ]
+
+    result = worker.run_request(_payload("train-pods", script))
+
+    assert result["iterations"] == 6
+    assert result["errors"] == ["agent:iteration-limit"]
+
+
+@pytest.mark.parametrize(
+    ("message", "label"),
+    [
+        (
+            "iteration limit reached (6) — refine the question",
+            "agent:iteration-limit",
+        ),
+        (
+            "history budget exceeded mid-turn (24000 chars) — turn ended early",
+            "agent:history-budget-exceeded",
+        ),
+    ],
+)
+def test_bounded_model_behavior_errors_remain_scoreable(
+    worker: ModuleType,
+    message: str,
+    label: str,
+) -> None:
+    calls, errors = worker._calls(
+        [
+            worker.AgentError(message=message),
+            worker.TurnComplete(input_tokens=1, output_tokens=2, estimated=False),
+        ]
+    )
+
+    assert calls == []
+    assert errors == [label]
+
+
+def test_unknown_agent_error_is_systemic_and_withholds_message(
+    worker: ModuleType,
+) -> None:
+    secret = "provider-response-secret"
+
+    with pytest.raises(worker.NativeWorkerError) as exc_info:
+        worker._calls([worker.AgentError(message=secret)])
+
+    assert str(exc_info.value) == "native agent turn failed"
+    assert secret not in str(exc_info.value)
 
 
 def test_wrong_target_is_observed_and_failed(worker: ModuleType) -> None:
@@ -241,6 +334,26 @@ def test_verify_config_round_trips_rules_through_native_loader(
     assert result["runtime"]["dependencies"]["litellm"] == version("litellm")
     assert result["runtime"]["dependencies"]["boto3"] == version("boto3")
     assert len(result["runtime"]["fingerprint"]) == 64
+
+
+def test_verify_config_round_trips_duplicate_rules_as_one_combined_layer(
+    worker: ModuleType,
+) -> None:
+    rules = [
+        "Prefer the exact namespace named by the user.",
+        "Prefer the exact namespace named by the user.",
+    ]
+    with _project_config(_export_config(rules)) as path:
+        result = worker.run_request(
+            {
+                **_payload("train-pods", [[{"type": "done"}]], rules=rules),
+                "operation": "verify-config",
+                "config_path": str(path),
+            }
+        )
+
+    assert result["rules"] == rules
+    assert result["rules_applied"] is True
 
 
 def test_runtime_identity_includes_actual_transport_dependency(worker: ModuleType) -> None:
@@ -463,6 +576,51 @@ def test_worker_cli_failure_is_prefixed_and_leaves_no_response(
         assert completed.returncode != 0
         assert completed.stderr.startswith("native-worker:")
         assert 0 < len(completed.stderr) <= 300
+        assert not response_path.exists()
+    finally:
+        request_path.unlink(missing_ok=True)
+        response_path.unlink(missing_ok=True)
+
+
+def test_worker_cli_provider_failure_withholds_event_message(
+    worker: ModuleType,
+) -> None:
+    del worker
+    token = uuid.uuid4().hex
+    request_path = LAB_ROOT / "tests" / f".native-provider-request-{token}.json"
+    response_path = LAB_ROOT / "tests" / f".native-provider-response-{token}.json"
+    request_path.write_text(
+        json.dumps(_payload("train-pods", [])),
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(
+            (str(LAB_ROOT / "src"), str(NATIVE_ROOT / "src"))
+        ),
+    }
+    try:
+        completed = subprocess.run(
+            [
+                str(NATIVE_PYTHON),
+                str(WORKER_PATH),
+                "--request",
+                str(request_path),
+                "--response",
+                str(response_path),
+            ],
+            cwd=LAB_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode != 0
+        assert completed.stderr.endswith(
+            "native-worker: native agent produced no outbound payload\n"
+        )
+        assert "scripted provider exhausted" not in completed.stderr
+        assert len(completed.stderr) <= 300
         assert not response_path.exists()
     finally:
         request_path.unlink(missing_ok=True)

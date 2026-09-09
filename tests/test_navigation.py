@@ -60,6 +60,8 @@ def test_navigation_runner_scores_actual_state_and_records_action_feedback(
     persisted = json.loads((tmp_path / "run" / "response.json").read_text())
     assert persisted["answer"] == ""
     assert persisted["evidence_source"]["kind"] == "korvid_navigation"
+    assert persisted["usage"]["tool_calls"] == 1
+    assert persisted["usage"]["iterations"] == 2
 
 
 def test_text_claim_alone_never_passes_navigation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -74,6 +76,7 @@ def test_text_claim_alone_never_passes_navigation(tmp_path: Path, monkeypatch: p
     assert not result_passed(score_result(result))
     assert result.grade is not None and result.grade.completion == 0
     assert result.journal["navigation_feedback"]["missing_postconditions"]
+    assert result.usage["iterations"] == 1
 
 
 def test_local_model_client_never_uses_environment_proxy() -> None:

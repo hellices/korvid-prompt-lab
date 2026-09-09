@@ -248,6 +248,8 @@ def build_round_report(
     sourced_runs = [run for run in ordered_runs if run.evidence_source is not None]
     if sourced_runs and len(sourced_runs) != len(ordered_runs):
         raise ValueError("response evidence_source must be present on every run or none")
+    if len({run.evidence_source[0] for run in sourced_runs if run.evidence_source is not None}) > 1:
+        raise ValueError("mixed evidence sources are invalid; every run must use the same backend")
     models = tuple(sorted({run.model for run in ordered_runs}))
     model_scores = dict(summary["model_scores"])
     if set(models) != set(model_scores):
@@ -595,10 +597,7 @@ def write_safe_evidence(
         "reproduction_command": list(report.reproduction_command),
         **(
             {
-                "evaluation_backend": (
-                    evidence_sources[0][3]
-                    if len({source[3] for source in evidence_sources}) == 1 else "mixed"
-                ),
+                "evaluation_backend": evidence_sources[0][3],
                 "evidence_sources": [list(source) for source in evidence_sources],
             }
             if evidence_sources
@@ -907,6 +906,11 @@ def _parse_evidence_source(value: Any) -> tuple[str, str, str] | None:
             "evidence_source.kind must be korvid_readonly, korvid_navigation, or korvid_native"
         )
     korvid_version = _require_response_string(source, "korvid_version")
+    if kind == "korvid_native":
+        from .native_contract import NATIVE_KORVID_VERSION
+
+        if korvid_version != NATIVE_KORVID_VERSION:
+            raise BridgeMalformedOutputError(f"native source version must be {NATIVE_KORVID_VERSION}")
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.!+_-]{0,63}", korvid_version) is None:
         raise BridgeMalformedOutputError(
             "evidence_source.korvid_version must be a bounded canonical version"

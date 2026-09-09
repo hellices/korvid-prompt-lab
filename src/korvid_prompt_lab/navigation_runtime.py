@@ -104,6 +104,30 @@ class NavigationTurn:
     blocked_tools: tuple[str, ...]
     input_tokens: int = 0
     output_tokens: int = 0
+    iterations: int = 0
+
+
+class _IterationProvider(LLMProvider):
+    def __init__(self, delegate: LLMProvider) -> None:
+        self.delegate = delegate
+        self.iterations = 0
+
+    @property
+    def name(self) -> str:
+        return self.delegate.name
+
+    def prepare_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return self.delegate.prepare_messages(messages)
+
+    async def complete(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, stream: bool = True,
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.iterations += 1
+        async for event in self.delegate.complete(messages, tools, stream=stream):
+            yield event
+
+    async def aclose(self) -> None:
+        await self.delegate.aclose()
 
 
 @dataclass(frozen=True, slots=True)
@@ -661,8 +685,9 @@ async def run_navigation_turn(
                 tool["function"]["name"]: _tool_schema_parameters(tool) for tool in tools
             }
             executor = _NavigationExecutor(session=session, tool_schemas=tool_schemas)
+            counted_provider = _IterationProvider(provider)
             runtime = _NavigationAgentRuntime(
-                provider=provider,
+                provider=counted_provider,
                 executor=executor,
                 tools=tools,
                 max_iterations=max_iterations,
@@ -718,6 +743,7 @@ async def run_navigation_turn(
                 blocked_tools=tuple(blocked_tools),
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                iterations=counted_provider.iterations,
             )
     except asyncio.CancelledError:
         raise

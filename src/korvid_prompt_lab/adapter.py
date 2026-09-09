@@ -241,7 +241,20 @@ class KorvidGEPAAdapter:
     def _trace_to_record(self, trace: SafeExecutionTrace) -> Mapping[str, Any]:
         if trace.navigation_feedback is not None:
             feedback = trace.navigation_feedback
-            tools_field = "runtime_policy" if isinstance(feedback["tools"], Mapping) else "available_mcp_tools"
+            native = isinstance(feedback["tools"], Mapping)
+            tools_field = "runtime_policy" if native else "available_mcp_tools"
+            guidance = (
+                "Improve reusable UI navigation instructions, not Kubernetes diagnosis. "
+                "Do not copy fixture resource names, namespaces, or case-specific answers "
+                "into the prompt. Tool schemas and runtime safety restrictions are fixed."
+            )
+            if native:
+                guidance += (
+                    " When updating the rules component, return ONLY a JSON array of at most "
+                    "16 short non-blank strings (1000 characters per string). These are additive "
+                    "agent.rules, not a replacement system prompt or an eval overlay. "
+                    "Use only the provided actual policy; never request unarmed tools or a higher tier."
+                )
             return {
                 "Inputs": {
                     "request": feedback["prompt"], "initial_state": feedback["initial"],
@@ -254,15 +267,7 @@ class KorvidGEPAAdapter:
                 "Feedback": {
                     "expected_state": feedback["expected"],
                     "missing_postconditions": feedback["missing_postconditions"],
-                    "guidance": (
-                        "Improve reusable UI navigation instructions, not Kubernetes diagnosis. "
-                        "Do not copy fixture resource names, namespaces, or case-specific answers "
-                        "into the prompt. Tool schemas and runtime safety restrictions are fixed. "
-                        "When updating the rules component, return ONLY a JSON array of at most "
-                        "16 short non-blank strings (1000 characters per string). These are additive "
-                        "agent.rules, not a replacement system prompt or an eval overlay. "
-                        "Use only the provided actual policy; never request unarmed tools or a higher tier."
-                    ),
+                    "guidance": guidance,
                 },
                 "score": trace.score,
             }

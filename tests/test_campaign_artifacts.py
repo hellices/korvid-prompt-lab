@@ -234,7 +234,7 @@ def _write_search_evidence(
         (before_responses / f"case-c-r{repetition:02d}.json").write_text(
             json.dumps(
                 {
-                    "protocol_version": 1,
+                    "protocol_version": 2,
                     "status": "completed",
                     "execution_mode": "live",
                     "candidate_fingerprint": seed_candidate_fingerprint,
@@ -425,7 +425,7 @@ def _upgrade_round_summary_to_readonly(root: Path) -> None:
         (root / response_ref).write_text(
             json.dumps(
                 {
-                    "protocol_version": 1,
+                    "protocol_version": 2,
                     "status": "completed",
                     "execution_mode": "live",
                     "request_identity": {
@@ -695,12 +695,30 @@ class TestLoadRoundOutcome:
         _upgrade_round_summary_to_readonly(root)
         _upgrade_comparison_to_readonly(root)
         for path in root.rglob("*.json"):
-            path.write_text(path.read_text().replace("korvid_readonly", backend))
+            text = path.read_text().replace("korvid_readonly", backend)
+            if backend == "korvid_native":
+                text = text.replace('"0.3.0"', '"0.4.1"')
+            payload = json.loads(text)
+            if "protocol_version" in payload:
+                payload["protocol_version"] = 2
+                payload["request_identity"]["seed_applied"] = backend == "korvid_native"
+            path.write_text(json.dumps(payload))
         control = replace(_control(), evaluation_backend=backend)
         outcome = load_round_outcome(
             root, _search_action(control=control), control=control, state=_state(),
         )
         assert outcome.search_improved is True
+
+    def test_native_provenance_rejects_a_legacy_korvid_version(self, tmp_path: Path) -> None:
+        root = tmp_path / "evidence"
+        _write_search_evidence(root)
+        _upgrade_round_summary_to_readonly(root)
+        _upgrade_comparison_to_readonly(root)
+        for path in root.rglob("*.json"):
+            path.write_text(path.read_text().replace("korvid_readonly", "korvid_native"))
+        control = replace(_control(), evaluation_backend="korvid_native")
+        with pytest.raises(ValueError, match="0.4.1"):
+            load_round_outcome(root, _search_action(control=control), control=control, state=_state())
 
     def test_native_control_rejects_consistent_but_foreign_backend_provenance(self, tmp_path: Path) -> None:
         root = tmp_path / "evidence"

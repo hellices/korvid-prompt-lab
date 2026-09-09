@@ -9,6 +9,7 @@ import pytest
 import yaml  # type: ignore[import-untyped]
 
 from korvid_prompt_lab.adapter import KorvidGEPAAdapter
+from korvid_prompt_lab.campaign_artifacts import _validate_projected_response_shape
 from korvid_prompt_lab.config import load_campaign
 from korvid_prompt_lab.contracts import EvalCase, KorvidNativeServing
 from korvid_prompt_lab.native import KorvidNativeRunner, initialize_native
@@ -19,6 +20,7 @@ from korvid_prompt_lab.native_contract import (
     rules_candidate,
 )
 from korvid_prompt_lab.native_source import run_native_request
+from korvid_prompt_lab.rounds import _parse_response
 from korvid_prompt_lab.scoring import result_passed, score_result
 
 pytestmark = pytest.mark.skipif(
@@ -105,3 +107,29 @@ def test_native_feedback_contains_real_policy_not_added_mcp_tools(
     assert record["Inputs"]["runtime_policy"]["tier"] == "low"
     assert "available_mcp_tools" not in record["Inputs"]
     assert record["Generated Outputs"]["observed_state"]["scope"] == "shop"
+
+
+def test_actual_native_writer_and_safe_projection_match_consumer_protocol(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KORVID_NATIVE_MODEL_URL", "http://127.0.0.1:11434")
+    _, campaign_path = initialize_native(tmp_path / "setup", model="ollama/qwen3:0.6b")
+    campaign = load_campaign(campaign_path)
+    root = tmp_path / "run"
+    KorvidNativeRunner(campaign, script_factory=action_script).run(
+        rules_candidate([]), campaign.cases[0], root,
+    )
+    stat = root.stat()
+    projected = dict(_parse_response(
+        root / "response.json", root=root, expected_root_identity=(stat.st_dev, stat.st_ino),
+    ).payload)
+    assert projected["protocol_version"] == 2
+    with pytest.raises(ValueError, match="must be live"):
+        _validate_projected_response_shape(projected, "fixture", evaluation_backend="korvid_native")
+    # Exercise only the live wire-shape contract; never persist or publish
+    # this relabelled scripted fixture as live model evidence.
+    live_shape = {
+        **projected, "execution_mode": "live",
+        "request_identity": {**projected["request_identity"], "seed_applied": True},
+    }
+    _validate_projected_response_shape(live_shape, "fixture", evaluation_backend="korvid_native")

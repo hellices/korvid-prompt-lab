@@ -239,6 +239,7 @@ def test_run_navigation_turn_discovers_only_navigation_tools_and_applies_overrid
     assert turn.calls == ()
     assert turn.errors == ()
     assert turn.blocked_tools == ()
+    assert turn.iterations == 1
 
 
 def test_run_navigation_turn_requires_full_navigation_surface_before_provider_contact() -> None:
@@ -303,6 +304,20 @@ def test_run_navigation_turn_records_success_calls_and_namespace_arguments() -> 
     assert turn.blocked_tools == ()
     assert turn.input_tokens == 8
     assert turn.output_tokens == 6
+    assert turn.iterations == 2
+
+
+def test_two_tools_in_one_provider_round_are_one_iteration() -> None:
+    provider = ScriptedProvider([[
+        {"type": "tool_call", "id": "one", "name": "navigate", "arguments": '{"view":"pods"}'},
+        {"type": "tool_call", "id": "two", "name": "set_filter", "arguments": '{"pattern":"web"}'},
+    ]])
+    turn = asyncio.run(run_navigation_turn(
+        provider=provider, session=FakeSession(tool_names=FULL_NAVIGATION_TOOL_NAMES),
+        candidate=_candidate(), prompt="show web pods", max_iterations=1,
+    ))
+    assert len(turn.calls) == 2
+    assert turn.iterations == 1
 
 
 def test_run_navigation_turn_handles_malformed_json_without_forwarding() -> None:

@@ -222,7 +222,7 @@ class KorvidNavigationRunner:
             candidate_fingerprint=candidate.fingerprint, grade=grade,
             answer="", journal={"tool_calls": len(turn.calls), "navigation_feedback": feedback},
             usage={
-                "tool_calls": len(turn.calls), "iterations": len(turn.calls),
+                "tool_calls": len(turn.calls), "iterations": turn.iterations,
                 "wall_time_seconds": round(time.monotonic() - start, 3),
             },
             error=None,

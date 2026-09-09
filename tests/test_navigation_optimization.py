@@ -52,6 +52,8 @@ def test_gepa_navigation_proposals_get_action_and_state_feedback(
     assert records[0]["Inputs"]["request"] == train[0].prompt
     assert records[0]["Inputs"]["available_mcp_tools"]
     assert records[0]["Feedback"]["missing_postconditions"]
+    assert "JSON array" not in records[0]["Feedback"]["guidance"]
+    assert "agent.rules" not in records[0]["Feedback"]["guidance"]
     assert "holdout" not in json.dumps(records)
 
     proposals: list[object] = []
