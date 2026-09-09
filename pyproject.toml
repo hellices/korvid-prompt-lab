@@ -11,17 +11,15 @@ dependencies = [
     "dspy",
     "gepa",
     "PyYAML",
+    "httpx",
+    "litellm",
 ]
 
 [project.scripts]
 korvid-prompt-lab = "korvid_prompt_lab.cli:main"
-korvid-bridge = "korvid_prompt_lab.bridge:main"
-korvid-grounding-report = "korvid_prompt_lab.round_cli:main"
-korvid-campaign = "korvid_prompt_lab.campaign_cli:main"
 
 [project.optional-dependencies]
-legacy = ["korvid[agent,mcp]==0.3.0"]
-dev = ["pytest", "mypy", "ruff", "korvid-prompt-lab[legacy]"]
+dev = ["pytest", "mypy", "ruff"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -33,11 +31,9 @@ where = ["src"]
 testpaths = ["tests"]
 
 [tool.mypy]
-exclude = ["src/korvid_prompt_lab/native_worker\\.py$"]
-# native_worker is checked separately with --python-executable pointing to
-# the pinned 0.4.1 source environment; this environment covers legacy 0.3.
-
-# Legacy write/approval bridge tests import Korvid checkout-only test modules.
-[[tool.mypy.overrides]]
-module = ["korvid.*", "tests.evals.*", "tests.ui.*", "httpx"]
-ignore_missing_imports = true
+exclude = [
+    "src/korvid_prompt_lab/upstream_worker\\.py$",
+    "tests/test_upstream_worker\\.py$",
+]
+# The source worker and its upstream tests are checked separately against
+# the prepared Korvid source environment. The control plane does not install Korvid.

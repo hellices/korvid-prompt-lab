@@ -1,0 +1,69 @@
+# Unified native experiment (schema_version 2) - loopback serving.
+#
+# Runs the complete native Korvid v0.4.1 campaign against a local Ollama endpoint
+# reached over a loopback URL (KORVID_NATIVE_MODEL_URL). The model/teacher digests
+# are the captured values and are re-verified live against /api/tags. This is an
+# EXAMPLE, not a recorded cloud run - point it at your own endpoint/models.
+#
+#   uv run --extra dev korvid-prompt-lab run \
+#     --experiment examples/experiments/native-loopback.yaml \
+#     --artifact-root artifacts/native-loopback-001 --check-only
+#
+# --check-only validates this manifest and the pinned Korvid source offline
+# (no Azure and no model calls). Drop it to execute the live campaign.
+schema_version: 2
+campaign_id: native-loopback
+
+runtime:
+  backend: korvid_upstream                     # upstream.py / KorvidUpstreamRunner
+  source_root: env:KORVID_NATIVE_SOURCE_ROOT   # pinned v0.4.1 checkout
+  korvid_revision: 33c483e041006eb20259a024ed85a9323e52c8f0
+  timeout_seconds: 600                         # full journey timeout (no per-turn slicing)
+
+serving:
+  backend: loopback
+  base_url: env:KORVID_NATIVE_MODEL_URL        # e.g. http://127.0.0.1:11434
+
+model:                                          # target tiny model
+  reference: ollama/qwen3:0.6b
+  # captured qwen3:0.6b digest (verified live against /api/tags)
+  digest: sha256:7df6b6e09427a769808717c0a93cadc4ae99ed4eb8bf5ca557c90846becea435
+  options:
+    native_thinking: true                       # select Korvid native/api/chat route
+    think: false
+    num_ctx: 16384
+    temperature: 0.0
+
+reflection:                                     # separate local teacher
+  reference: ollama_chat/qwen3:14b
+  # captured qwen3:14b teacher digest (verified live against /api/tags)
+  digest: sha256:bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8
+  timeout_seconds: 360
+  options:
+    reasoning_effort: disable
+    num_ctx: 4096
+    temperature: 0.2
+    max_tokens: 512
+
+evaluation:
+  repetitions: 5
+  seed: 0
+  train:
+    - scenarios/image-pull-typo
+    - scenarios/healthy-deployment
+    - journeys/logs-to-events
+  validation:
+    - journeys/tui-follow
+    - scenarios/oom-killed
+  holdout:
+    - journeys/compare-namespaces
+    - scenarios/readiness-probe-failing
+
+search:
+  stages:
+    - { name: explore, metric_calls: 16, seeds: [0, 1] }
+  total_metric_calls: 64
+  max_evaluations: 256
+  max_proposals: 12
+  wall_clock_seconds: 7200
+  stagnation_attempt_limit: 3

@@ -14,13 +14,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any, Protocol, Self
 
-from .contracts import AKSPortForwardServing, _require_mapping
+from .contracts import _require_mapping
 
 _MAX_BUFFERED_OUTPUT_BYTES = 65536
 _READER_THREAD_NAME = "korvid-aks-port-forward-reader"
 _OUTPUT_POLL_INTERVAL_SECONDS = 0.1
 _READER_JOIN_TIMEOUT_SECONDS = 5.0
 _READ_CHUNK_BYTES = 4096
+
+
+@dataclass(frozen=True, slots=True)
+class AKSForwardTarget:
+    resource_group: str
+    cluster_name: str
+    namespace: str
+    service: str
+    model: str
 
 
 class AKSPortForwardError(RuntimeError):
@@ -219,7 +228,7 @@ def _http_get_json(url: str) -> Mapping[str, Any]:
 
 @dataclass(slots=True)
 class AKSPortForward:
-    serving: AKSPortForwardServing
+    serving: AKSForwardTarget
     workspace_dir: Path | str = field(default_factory=Path.cwd)
     command_runner: _CommandRunner = _run_command
     process_launcher: _ProcessLauncher = _launch_process

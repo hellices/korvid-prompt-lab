@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from korvid_prompt_lab.aks import (
     _MAX_BUFFERED_OUTPUT_BYTES,
     _READER_THREAD_NAME,
+    AKSForwardTarget,
     AKSMissingToolError,
     AKSPortForward,
     AKSPortForwardError,
@@ -29,7 +30,6 @@ from korvid_prompt_lab.aks import (
     _ProcessLauncher,
     _SubprocessPortForward,
 )
-from korvid_prompt_lab.contracts import AKSPortForwardServing
 
 _KUBELOGIN_ARGS_PREFIX = (
     "kubelogin",
@@ -160,15 +160,13 @@ class FakeHttpGet(_HttpGetJson):
         return self._payloads.pop(0)
 
 
-def _serving() -> AKSPortForwardServing:
-    return AKSPortForwardServing(
-        backend="aks_port_forward",
+def _serving() -> AKSForwardTarget:
+    return AKSForwardTarget(
         resource_group="rg-team-a",
         cluster_name="cluster-one",
         namespace="korvid",
         service="korvid-api",
         model="qwen3-4b",
-        command=("korvid-bridge", "--request", "{request}", "--response", "{response}"),
     )
 
 

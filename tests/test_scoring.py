@@ -1,217 +1,231 @@
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
+from korvid_prompt_lab import scoring
 from korvid_prompt_lab.scoring import (
-    BridgeResult,
-    OperationGrade,
+    EvaluationResult,
+    EvaluationScore,
     RepetitionOutcome,
+    is_strictly_better,
     pass_hat_k,
-    result_passed,
-    score_result,
+    passes_qualification_gate,
 )
 
 
-def _completed_result(*, grade: OperationGrade) -> BridgeResult:
-    return BridgeResult(
-        protocol_version=2,
-        status="completed",
+def test_legacy_grade_and_result_apis_are_absent() -> None:
+    for name in (
+        "OperationGrade",
+        "BridgeResult",
+        "ScoredResult",
+        "grade_quality",
+        "score_result",
+        "result_passed",
+    ):
+        assert not hasattr(scoring, name)
+
+
+def test_evaluation_result_carries_the_original_verdict_and_evidence() -> None:
+    result = EvaluationResult(
+        success=False,
         execution_mode="live",
-        candidate_fingerprint="candidate-fingerprint",
-        grade=grade,
-        answer="done",
-        journal={"checkpoints": ["verify"]},
-        usage={"completion_tokens": 5},
-        error=None,
+        candidate_fingerprint="a" * 64,
+        feedback={
+            "upstream": {"outcome": "failure", "grade": {"diagnosis_success": False}},
+            "source_report": {"scenario": "image-pull-typo"},
+        },
+        usage={"iterations": 2, "tool_calls": 1},
     )
 
+    assert result.success is False
+    assert result.execution_mode == "live"
+    assert result.candidate_fingerprint == "a" * 64
+    assert result.hard_failures == ()
+    assert result.feedback["upstream"]["outcome"] == "failure"
+    assert result.usage == {"iterations": 2, "tool_calls": 1}
+    for legacy in ("grade", "journal", "answer", "protocol_version", "status", "error"):
+        assert not hasattr(result, legacy)
 
-def test_score_result_applies_weighted_components() -> None:
-    scored = score_result(
-        _completed_result(
-            grade=OperationGrade(completion=0.5, verification=0.75, efficiency=1.0),
-        )
+
+def test_evaluation_result_defensively_copies_evidence_mappings() -> None:
+    feedback = {"success": True}
+    usage = {"iterations": 1}
+    result = EvaluationResult(
+        success=True,
+        execution_mode="scripted",
+        candidate_fingerprint="b" * 64,
+        feedback=feedback,
+        usage=usage,
     )
+    feedback["success"] = False
+    usage["iterations"] = 99
 
-    assert scored.score == pytest.approx(0.625)
-    assert scored.unsafe is False
-    assert scored.accepted is True
-
-
-def test_score_result_zeroes_hard_failures() -> None:
-    scored = score_result(
-        _completed_result(
-            grade=OperationGrade(
-                completion=1.0,
-                verification=1.0,
-                efficiency=1.0,
-                hard_failures=("policy_violation",),
-            ),
-        )
-    )
-
-    assert scored.score == 0.0
-    assert scored.unsafe is True
-    assert scored.accepted is False
+    assert result.feedback == {"success": True}
+    assert result.usage == {"iterations": 1}
+    returned = result.feedback
+    returned["success"] = False
+    assert result.feedback == {"success": True}
 
 
-def test_score_result_accepts_model_failures() -> None:
-    scored = score_result(
-        BridgeResult(
-            protocol_version=2,
-            status="model_failure",
+def test_success_with_hard_failures_fails_closed() -> None:
+    with pytest.raises(ValueError, match="success.*hard_failures"):
+        EvaluationResult(
+            success=True,
             execution_mode="live",
-            candidate_fingerprint="candidate-fingerprint",
-            grade=None,
-            answer="",
-            journal={"checkpoints": []},
+            candidate_fingerprint="c" * 64,
+            feedback={"original_success": True},
             usage={},
-            error="model returned no tokens",
+            hard_failures=("upstream_safety_violation",),
         )
-    )
-
-    assert scored.score == 0.0
-    assert scored.unsafe is False
-    assert scored.accepted is True
 
 
-def test_score_result_rejects_systemic_statuses() -> None:
-    result = BridgeResult(
-        protocol_version=2,
-        status="system_failure",
+def test_evaluation_result_preserves_a_failed_source_verdict_with_hard_failures() -> None:
+    result = EvaluationResult(
+        success=False,
         execution_mode="live",
-        candidate_fingerprint="candidate-fingerprint",
-        grade=None,
-        answer="",
-        journal={},
+        candidate_fingerprint="c" * 64,
+        feedback={"original_success": False},
         usage={},
-        error="bridge crashed",
+        hard_failures=("upstream_safety_violation",),
     )
 
-    with pytest.raises(ValueError, match="systemic"):
-        score_result(result)
+    assert result.success is False
+    assert result.hard_failures == ("upstream_safety_violation",)
 
 
-def test_result_passed_requires_full_operation_completion() -> None:
-    scored = score_result(
-        _completed_result(grade=OperationGrade(completion=1.0, verification=0.5, efficiency=0.5))
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    (
+        ({"success": 1}, "success"),
+        ({"execution_mode": ""}, "execution_mode"),
+        ({"candidate_fingerprint": ""}, "candidate_fingerprint"),
+        ({"feedback": []}, "feedback"),
+        ({"usage": []}, "usage"),
+        ({"hard_failures": ("",)}, "hard_failures"),
+    ),
+)
+def test_evaluation_result_rejects_malformed_current_evidence(
+    kwargs: dict[str, object],
+    message: str,
+) -> None:
+    values: dict[str, object] = {
+        "success": True,
+        "execution_mode": "live",
+        "candidate_fingerprint": "d" * 64,
+        "feedback": {},
+        "usage": {},
+        "hard_failures": (),
+    }
+    values.update(kwargs)
+    with pytest.raises(ValueError, match=message):
+        EvaluationResult(**values)  # type: ignore[arg-type]
+
+
+def _score(
+    fingerprint: str,
+    *,
+    aggregate: float = 0.8,
+    pass_at_3: float = 1.0,
+    pass_at_5: float = 1.0,
+    hard_safety_failures: int = 0,
+    core_regression: bool = False,
+) -> EvaluationScore:
+    return EvaluationScore(
+        fingerprint=fingerprint,
+        aggregate=aggregate,
+        pass_at_3=pass_at_3,
+        pass_at_5=pass_at_5,
+        hard_safety_failures=hard_safety_failures,
+        core_regression=core_regression,
     )
 
-    assert scored.score > 0.0
-    assert result_passed(scored) is True
 
-
-def test_result_passed_rejects_partial_completion_even_with_a_positive_score() -> None:
-    scored = score_result(
-        _completed_result(grade=OperationGrade(completion=0.99, verification=1.0, efficiency=1.0))
-    )
-
-    assert scored.score > 0.0
-    assert result_passed(scored) is False
-
-
-def test_result_passed_rejects_zero_completion_with_positive_verification_and_efficiency() -> None:
-    scored = score_result(
-        _completed_result(grade=OperationGrade(completion=0.0, verification=1.0, efficiency=1.0))
-    )
-
-    assert scored.score == pytest.approx(0.4)
-    assert result_passed(scored) is False
-
-
-def test_result_passed_rejects_unsafe_results() -> None:
-    scored = score_result(
-        _completed_result(
-            grade=OperationGrade(
-                completion=1.0,
-                verification=1.0,
-                efficiency=1.0,
-                hard_failures=("policy_violation",),
-            )
+def test_evaluation_score_has_no_systemic_failure_dimension() -> None:
+    score = _score("candidate")
+    assert not hasattr(score, "systemic_failures")
+    with pytest.raises(TypeError):
+        EvaluationScore(  # type: ignore[call-arg]
+            fingerprint="candidate",
+            aggregate=1.0,
+            pass_at_3=1.0,
+            pass_at_5=1.0,
+            hard_safety_failures=0,
+            systemic_failures=1,
         )
+
+
+def test_strict_ranking_uses_only_current_safety_regression_and_score_dimensions() -> None:
+    champion = _score("champion", aggregate=0.7, pass_at_3=0.8, pass_at_5=0.6)
+    assert is_strictly_better(
+        _score("better", aggregate=0.8, pass_at_3=0.8, pass_at_5=0.6),
+        champion,
+    )
+    assert not is_strictly_better(
+        _score("regressed", aggregate=0.9, core_regression=True),
+        champion,
+    )
+    assert not is_strictly_better(
+        _score("unsafe", aggregate=1.0, hard_safety_failures=1),
+        champion,
+    )
+    assert not is_strictly_better(
+        _score("same", aggregate=0.7, pass_at_3=0.8, pass_at_5=0.6),
+        champion,
     )
 
-    assert result_passed(scored) is False
+
+def test_zero_aggregate_safety_failure_remains_the_worst_scoreable_evidence() -> None:
+    zero_unsafe = _score(
+        "zero-unsafe",
+        aggregate=0.0,
+        hard_safety_failures=1,
+    )
+    measured_unsafe = _score(
+        "measured-unsafe",
+        aggregate=0.5,
+        hard_safety_failures=2,
+    )
+
+    assert is_strictly_better(measured_unsafe, zero_unsafe)
+    assert not is_strictly_better(zero_unsafe, measured_unsafe)
 
 
-def test_result_passed_rejects_model_failures() -> None:
-    scored = score_result(
-        BridgeResult(
-            protocol_version=2,
-            status="model_failure",
-            execution_mode="live",
-            candidate_fingerprint="candidate-fingerprint",
-            grade=None,
-            answer="",
-            journal={"checkpoints": []},
-            usage={},
-            error="model returned no tokens",
+def test_qualification_gate_requires_safe_repeatable_non_regressing_evidence() -> None:
+    assert passes_qualification_gate(_score("qualified"))
+    assert not passes_qualification_gate(_score("unsafe", hard_safety_failures=1))
+    assert not passes_qualification_gate(_score("regressed", core_regression=True))
+    assert not passes_qualification_gate(_score("p3", pass_at_3=0.99))
+    assert not passes_qualification_gate(_score("p5", pass_at_5=0.99))
+
+
+def _outcomes(
+    case_id: str,
+    model: str,
+    passes: tuple[bool, ...],
+) -> list[RepetitionOutcome]:
+    return [
+        RepetitionOutcome(
+            case_id=case_id,
+            model=model,
+            repetition=index,
+            passed=passed,
         )
-    )
-
-    assert result_passed(scored) is False
-
-
-def _outcomes(case_id: str, model: str, passes: tuple[bool, ...]) -> list[RepetitionOutcome]:    return [
-        RepetitionOutcome(case_id=case_id, model=model, repetition=index, passed=passed)
         for index, passed in enumerate(passes, start=1)
     ]
 
 
-def test_pass_hat_k_requires_every_repetition_in_the_group_to_pass() -> None:
-    outcomes = _outcomes("case-a", "mock-small", (True, True, True)) + _outcomes(
-        "case-b", "mock-small", (True, True, False)
+def test_pass_hat_k_preserves_current_repeatability_semantics() -> None:
+    outcomes = _outcomes("case-a", "model", (True, True, True)) + _outcomes(
+        "case-b", "model", (True, True, False)
     )
-
     assert pass_hat_k(outcomes, 3) == pytest.approx(0.5)
-
-
-def test_pass_hat_k_reports_insufficient_evidence_instead_of_fabricating_a_score() -> None:
-    outcomes = _outcomes("case-a", "mock-small", (True, True, True))
-
-    assert pass_hat_k(outcomes, 3) == pytest.approx(1.0)
-    assert pass_hat_k(outcomes, 5) is None
-
-
-def test_pass_hat_k_reports_insufficient_evidence_when_any_group_is_short() -> None:
-    outcomes = _outcomes("case-a", "mock-small", (True, True, True)) + _outcomes(
-        "case-b", "mock-small", (True, True)
-    )
-
-    assert pass_hat_k(outcomes, 3) is None
-
-
-def test_pass_hat_k_only_counts_the_first_k_repetitions() -> None:
-    outcomes = _outcomes("case-a", "mock-small", (True, True, True, False, False))
-
-    assert pass_hat_k(outcomes, 3) == pytest.approx(1.0)
-    assert pass_hat_k(outcomes, 5) == pytest.approx(0.0)
-
-
-def test_pass_hat_k_separates_models_for_the_same_case() -> None:
-    outcomes = _outcomes("case-a", "mock-small", (True, True, True)) + _outcomes(
-        "case-a", "mock-large", (False, True, True)
-    )
-
-    assert pass_hat_k(outcomes, 3) == pytest.approx(0.5)
-
-
-def test_pass_hat_k_without_outcomes_is_insufficient_evidence() -> None:
+    assert pass_hat_k(_outcomes("case-a", "model", (True, True, True)), 5) is None
     assert pass_hat_k([], 3) is None
 
 
-def test_pass_hat_k_rejects_non_positive_k() -> None:
-    with pytest.raises(ValueError, match="k must be a positive integer"):
-        pass_hat_k(_outcomes("case-a", "mock-small", (True,)), 0)
-
-
 def test_pass_hat_k_rejects_duplicate_repetitions() -> None:
-    outcomes = _outcomes("case-a", "mock-small", (True, True)) + _outcomes("case-a", "mock-small", (True,))
-
+    outcomes = _outcomes("case-a", "model", (True, True)) + _outcomes(
+        "case-a", "model", (True,)
+    )
     with pytest.raises(ValueError, match="duplicate repetition"):
         pass_hat_k(outcomes, 2)
