@@ -16,7 +16,7 @@ from gepa.core.adapter import ProposalFn
 from .adapter import KorvidGEPAAdapter
 from .artifacts import write_json_artifact
 from .campaigns import GEPA_REFLECTION_MINIBATCH_SIZE
-from .contracts import Candidate, EvalCase
+from .contracts import Candidate, EvalCase, KorvidNativeServing, KorvidNavigationServing
 from .reflection import DSPyInstructionProposer
 from .runner import KorvidRunner
 
@@ -56,6 +56,19 @@ def optimize_campaign(
         raise ValueError("reflection_lm and candidate_proposer are mutually exclusive proposal sources")
 
     train_case_ids, validation_case_ids = _validate_case_splits(train_cases, validation_cases)
+    if isinstance(runner.campaign.serving, KorvidNativeServing):
+        from .native_contract import find_native_case, rules_from_candidate
+
+        rules_from_candidate(seed_candidate)
+        for label, cases in (("train", train_cases), ("validation", validation_cases)):
+            if any(find_native_case(case.case_id).split != label for case in cases):
+                raise ValueError(f"native optimization requires authored {label} cases, never holdout")
+    if isinstance(runner.campaign.serving, KorvidNavigationServing):
+        from .navigation_cases import find_navigation_case
+
+        for label, cases in (("train", train_cases), ("validation", validation_cases)):
+            if any(find_navigation_case(case.case_id).split != label for case in cases):
+                raise ValueError(f"navigation optimization requires authored {label} cases; holdout is never searched")
 
     custom_candidate_proposer: ProposalFn | None = candidate_proposer
     proposal_source = "candidate_proposer" if candidate_proposer is not None else "none"

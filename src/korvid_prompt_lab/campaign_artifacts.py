@@ -24,6 +24,7 @@ from typing import Any
 
 import yaml  # type: ignore[import-untyped]
 
+from .bridge_worker import PROTOCOL_VERSION
 from .campaigns import (
     ActionKind,
     CampaignAction,
@@ -38,6 +39,8 @@ from .campaigns import (
 )
 from .contracts import Candidate
 from .scoring import RepetitionOutcome, pass_hat_k
+
+_VERSIONED_EVIDENCE_BACKENDS = frozenset({"korvid_readonly", "korvid_navigation", "korvid_native"})
 
 #: Files the safe ingestion layer is allowed to read from a round evidence package.
 _ALLOWED_FILES = frozenset({
@@ -515,7 +518,7 @@ def _validate_comparison_summary(
     )
     if schema_version not in {1, 2}:
         raise ValueError("comparison-summary.schema_version must be 1 or 2")
-    expected_schema_version = 2 if evaluation_backend == "korvid_readonly" else 1
+    expected_schema_version = 2 if evaluation_backend in _VERSIONED_EVIDENCE_BACKENDS else 1
     if schema_version != expected_schema_version:
         raise ValueError(
             "comparison-summary.schema_version must be "
@@ -667,6 +670,7 @@ def _validate_comparison_summary(
         expected_triplets=expected_triplets,
         context="comparison-summary.contract.evidence_sources",
         required=schema_version == 2,
+        expected_backend=evaluation_backend,
     )
     if comparison_evidence_sources != expected_evidence_sources:
         raise ValueError(
@@ -874,6 +878,7 @@ def _validate_evidence_sources(
     expected_triplets: list[tuple[str, str, int]],
     context: str,
     required: bool,
+    expected_backend: str,
 ) -> tuple[tuple[str, str, int, str, str, str], ...]:
     if not isinstance(value, list) or (required and not value):
         requirement = "a non-empty list" if required else "a list"
@@ -897,11 +902,18 @@ def _validate_evidence_sources(
             )
         source_triplets.add(triplet)
         kind = _require_str(entry[3], f"{entry_context}.kind")
-        if kind != "korvid_readonly":
-            raise ValueError(f"{entry_context}.kind must be korvid_readonly")
+        if kind not in _VERSIONED_EVIDENCE_BACKENDS:
+            raise ValueError(f"{entry_context}.kind must be korvid_readonly, korvid_navigation, or korvid_native")
+        if kind != expected_backend:
+            raise ValueError(f"{entry_context} backend mismatch: expected {expected_backend}, got {kind}")
         korvid_version = _require_str(
             entry[4], f"{entry_context}.korvid_version"
         )
+        if kind == "korvid_native":
+            from .native_contract import NATIVE_KORVID_VERSION
+
+            if korvid_version != NATIVE_KORVID_VERSION:
+                raise ValueError(f"{entry_context}.korvid_version must be {NATIVE_KORVID_VERSION}")
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.!+_-]{0,63}", korvid_version) is None:
             raise ValueError(f"{entry_context}.korvid_version must be canonical")
         scenario_sha256 = _require_str(
@@ -932,6 +944,7 @@ def _load_response_evidence_sources(
     *,
     expected_triplets: list[tuple[str, str, int]],
     expected_candidate_fingerprint: str,
+    expected_backend: str,
     expected_root_identity: tuple[int, int],
     expected_runs: Mapping[
         tuple[str, str, int],
@@ -959,7 +972,7 @@ def _load_response_evidence_sources(
             safe_root, ref, expected_root_identity=expected_root_identity
         )
         response = _require_mapping(payload, ref)
-        _validate_projected_response_shape(response, ref, readonly=True)
+        _validate_projected_response_shape(response, ref, evaluation_backend=expected_backend)
         response_candidate = _require_str(
             response.get("candidate_fingerprint"),
             f"{ref}.candidate_fingerprint",
@@ -1015,6 +1028,7 @@ def _load_response_evidence_sources(
         expected_triplets=expected_triplets,
         context="response.evidence_source",
         required=True,
+        expected_backend=expected_backend,
     )
 
 
@@ -1154,6 +1168,7 @@ def _validate_before_response_metrics(
     expected_candidate_fingerprint: str,
     expected_root_identity: tuple[int, int],
     readonly: bool,
+    expected_backend: str,
     expected_evidence_sources: tuple[
         tuple[str, str, int, str, str, str], ...
     ],
@@ -1184,7 +1199,7 @@ def _validate_before_response_metrics(
             safe_root, ref, expected_root_identity=expected_root_identity
         )
         response = _require_mapping(payload, ref)
-        _validate_projected_response_shape(response, ref, readonly=readonly)
+        _validate_projected_response_shape(response, ref, evaluation_backend=expected_backend)
         candidate_fingerprint = _require_str(
             response.get("candidate_fingerprint"),
             f"{ref}.candidate_fingerprint",
@@ -1252,6 +1267,7 @@ def _validate_before_response_metrics(
             expected_triplets=expected_triplets,
             context="before-response.evidence_source",
             required=True,
+            expected_backend=expected_backend,
         )
         if before_sources != expected_evidence_sources:
             raise ValueError(
@@ -1320,17 +1336,18 @@ def _validate_before_response_metrics(
 
 
 def _validate_projected_response_shape(
-    response: dict[str, Any], context: str, *, readonly: bool
+    response: dict[str, Any], context: str, *, evaluation_backend: str
 ) -> None:
+    versioned = evaluation_backend in _VERSIONED_EVIDENCE_BACKENDS
     _ensure_exact_keys(
         response,
-        _PROJECTED_RESPONSE_KEYS if readonly else _PROJECTED_PROCESS_RESPONSE_KEYS,
+        _PROJECTED_RESPONSE_KEYS if versioned else _PROJECTED_PROCESS_RESPONSE_KEYS,
         context,
     )
     if _require_positive_int(
         response.get("protocol_version"), f"{context}.protocol_version"
-    ) != 1:
-        raise ValueError(f"{context}.protocol_version must be 1")
+    ) != PROTOCOL_VERSION:
+        raise ValueError(f"{context}.protocol_version must be {PROTOCOL_VERSION}")
     status = _require_str(response.get("status"), f"{context}.status")
     if status not in {"completed", "model_failure"}:
         raise ValueError(f"{context}.status is invalid")
@@ -1348,7 +1365,7 @@ def _validate_projected_response_shape(
     _ensure_exact_keys(
         identity,
         _PROJECTED_IDENTITY_KEYS
-        if readonly
+        if versioned
         else _PROJECTED_PROCESS_IDENTITY_KEYS,
         f"{context}.request_identity",
     )
@@ -1359,14 +1376,18 @@ def _validate_projected_response_shape(
     _require_bounded_text(identity.get("model"), f"{context}.model")
     _require_positive_int(identity.get("repetition"), f"{context}.repetition")
     _require_non_negative_int(identity.get("seed"), f"{context}.seed")
-    if readonly and identity.get("seed_applied") is not False:
-        raise ValueError(f"{context}.request_identity.seed_applied must be false")
+    if versioned:
+        expected_seed_applied = evaluation_backend == "korvid_native"
+        if identity.get("seed_applied") is not expected_seed_applied:
+            raise ValueError(
+                f"{context}.request_identity.seed_applied must be {str(expected_seed_applied).lower()}"
+            )
     candidate_fingerprint = _require_str(
         response.get("candidate_fingerprint"), f"{context}.candidate_fingerprint"
     )
     if re.fullmatch(r"[0-9a-f]{64}", candidate_fingerprint) is None:
         raise ValueError(f"{context}.candidate_fingerprint must be SHA-256")
-    if readonly:
+    if versioned:
         source = _require_mapping(
             response.get("evidence_source"), f"{context}.evidence_source"
         )
@@ -1724,7 +1745,7 @@ def load_round_outcome(
         round_summary.get("schema_version"), "round-summary.schema_version"
     )
     expected_round_schema = (
-        2 if control.evaluation_backend == "korvid_readonly" else 1
+        2 if control.evaluation_backend in _VERSIONED_EVIDENCE_BACKENDS else 1
     )
     if round_schema_version != expected_round_schema:
         raise ValueError(
@@ -2022,6 +2043,7 @@ def load_round_outcome(
         expected_triplets=expected_evidence_triplets,
         context="round-summary.evidence_sources",
         required=round_schema_version == 2,
+        expected_backend=control.evaluation_backend,
     )
     if round_schema_version == 2:
         response_evidence_sources = _load_response_evidence_sources(
@@ -2029,6 +2051,7 @@ def load_round_outcome(
             round_summary.get("evaluation_artifact_refs"),
             expected_triplets=expected_evidence_triplets,
             expected_candidate_fingerprint=candidate_fingerprint,
+            expected_backend=control.evaluation_backend,
             expected_root_identity=safe_root_identity,
             expected_runs=round_runs,
         )
@@ -2139,7 +2162,8 @@ def load_round_outcome(
                 expected_triplets=expected_evidence_triplets,
                 expected_candidate_fingerprint=state.champion_fingerprint,
                 expected_root_identity=safe_root_identity,
-                readonly=control.evaluation_backend == "korvid_readonly",
+                readonly=control.evaluation_backend in _VERSIONED_EVIDENCE_BACKENDS,
+                expected_backend=control.evaluation_backend,
                 expected_evidence_sources=round_evidence_sources,
             )
         core_regression = _validate_comparison_summary(

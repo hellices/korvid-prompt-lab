@@ -102,8 +102,8 @@ class Candidate:
         for key, value in components_value.items():
             key_text = _require_string(key, "component key")
             is_tool_key = key_text.startswith("tool.") and len(key_text) > len("tool.")
-            if not (key_text in {"system", "append"} or is_tool_key):
-                raise ValueError("component key must be system, append, or tool.<tool-name>")
+            if not (key_text in {"system", "append", "rules"} or is_tool_key):
+                raise ValueError("component key must be system, append, rules, or tool.<tool-name>")
             components.append((key_text, _require_string(value, f"component {key_text}")))
 
         metadata_items: list[tuple[str, str]] = []
@@ -156,13 +156,30 @@ class KorvidReadonlyServing:
 
 
 @dataclass(frozen=True, slots=True)
+class KorvidNavigationServing:
+    backend: str
+    base_url: str
+    timeout_seconds: float
+    max_iterations: int
+
+
+@dataclass(frozen=True, slots=True)
+class KorvidNativeServing:
+    backend: str
+    source_root: str
+    base_url: str
+    korvid_revision: str
+    timeout_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
 class Campaign:
     schema_version: int
     campaign_id: str
     repetitions: int
     models: tuple[str, ...]
     cases: tuple[EvalCase, ...]
-    serving: ProcessServing | AKSPortForwardServing | KorvidReadonlyServing
+    serving: ProcessServing | AKSPortForwardServing | KorvidReadonlyServing | KorvidNavigationServing | KorvidNativeServing
     bridge_timeout_seconds: float = DEFAULT_BRIDGE_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:

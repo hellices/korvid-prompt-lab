@@ -211,7 +211,7 @@ def _write_evidence(
         (before_responses / f"case-c-r{repetition:02d}.json").write_text(
             json.dumps(
                 {
-                    "protocol_version": 1,
+                    "protocol_version": 2,
                     "status": "completed",
                     "execution_mode": "live",
                     "candidate_fingerprint": SEED_FINGERPRINT,

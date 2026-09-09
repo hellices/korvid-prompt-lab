@@ -8,7 +8,13 @@ from typing import Any
 
 from gepa.core.adapter import EvaluationBatch, ProposalFn
 
-from .contracts import Candidate, EvalCase, KorvidReadonlyServing
+from .contracts import (
+    Candidate,
+    EvalCase,
+    KorvidNativeServing,
+    KorvidNavigationServing,
+    KorvidReadonlyServing,
+)
 from .runner import BridgeExecutionModeError, KorvidRunner
 from .scoring import BridgeResult, ScoredResult, grade_quality, score_result
 
@@ -42,6 +48,7 @@ class SafeExecutionTrace:
     malformed_tool_call_count: int | None = None
     citation_coverage: float | None = None
     citation_precision: float | None = None
+    navigation_feedback: Mapping[str, Any] | None = None
 
 
 def _search_score(scored: ScoredResult) -> float:
@@ -195,6 +202,10 @@ class KorvidGEPAAdapter:
             missing_checkpoints=_missing_checkpoints(journal, checkpoint_names),
             hard_failures=result.grade.hard_failures if result.grade is not None else (),
             score=score,
+            navigation_feedback=(
+                _require_navigation_feedback(journal)
+                if isinstance(self.runner.campaign.serving, (KorvidNavigationServing, KorvidNativeServing)) else None
+            ),
             **self._readonly_reflection_fields(result),
         )
 
@@ -228,6 +239,38 @@ class KorvidGEPAAdapter:
         }
 
     def _trace_to_record(self, trace: SafeExecutionTrace) -> Mapping[str, Any]:
+        if trace.navigation_feedback is not None:
+            feedback = trace.navigation_feedback
+            native = isinstance(feedback["tools"], Mapping)
+            tools_field = "runtime_policy" if native else "available_mcp_tools"
+            guidance = (
+                "Improve reusable UI navigation instructions, not Kubernetes diagnosis. "
+                "Do not copy fixture resource names, namespaces, or case-specific answers "
+                "into the prompt. Tool schemas and runtime safety restrictions are fixed."
+            )
+            if native:
+                guidance += (
+                    " When updating the rules component, return ONLY a JSON array of at most "
+                    "16 short non-blank strings (1000 characters per string). These are additive "
+                    "agent.rules, not a replacement system prompt or an eval overlay. "
+                    "Use only the provided actual policy; never request unarmed tools or a higher tier."
+                )
+            return {
+                "Inputs": {
+                    "request": feedback["prompt"], "initial_state": feedback["initial"],
+                    tools_field: feedback["tools"],
+                },
+                "Generated Outputs": {
+                    "calls": feedback["calls"], "observed_state": feedback["observed"],
+                    "errors": feedback["errors"],
+                },
+                "Feedback": {
+                    "expected_state": feedback["expected"],
+                    "missing_postconditions": feedback["missing_postconditions"],
+                    "guidance": guidance,
+                },
+                "score": trace.score,
+            }
         generated_outputs = {
             "checkpoint_names": list(trace.checkpoint_names),
             "tool_call_count": trace.tool_call_count,
@@ -247,6 +290,14 @@ class KorvidGEPAAdapter:
             "Feedback": _build_feedback(trace),
             "score": trace.score,
         }
+
+
+def _require_navigation_feedback(journal: Mapping[str, Any]) -> Mapping[str, Any]:
+    feedback = journal.get("navigation_feedback")
+    required = {"prompt", "initial", "tools", "calls", "observed", "errors", "expected", "missing_postconditions"}
+    if not isinstance(feedback, Mapping) or set(feedback) != required:
+        raise ValueError("navigation runner must supply complete structured feedback")
+    return feedback
 
 
 def _readonly_output_fields(trace: SafeExecutionTrace) -> dict[str, Any]:

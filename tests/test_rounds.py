@@ -245,13 +245,15 @@ def test_build_round_report_rejects_unsafe_evidence_source_version(
         build_round_report(artifact_root)
 
 
+@pytest.mark.parametrize("backend", ["korvid_readonly", "korvid_navigation", "korvid_native"])
 def test_safe_readonly_round_summary_carries_backend_provenance(
-    tmp_path: Path,
+    tmp_path: Path, backend: str,
 ) -> None:
     payload = response("completed")
+    version = "0.4.1" if backend == "korvid_native" else "0.3.0"
     payload["evidence_source"] = {
-        "kind": "korvid_readonly",
-        "korvid_version": "0.3.0",
+        "kind": backend,
+        "korvid_version": version,
         "scenario_sha256": "a" * 64,
     }
     artifact_root = write_live_fixture(tmp_path / "input", responses=[payload])
@@ -263,10 +265,33 @@ def test_safe_readonly_round_summary_carries_backend_provenance(
         (safe_output / "round-summary.json").read_text(encoding="utf-8")
     )
     assert summary["schema_version"] == 2
-    assert summary["evaluation_backend"] == "korvid_readonly"
+    assert summary["evaluation_backend"] == backend
     assert summary["evidence_sources"] == [
-        ["case-a", "model-a", 1, "korvid_readonly", "0.3.0", "a" * 64]
+        ["case-a", "model-a", 1, backend, version, "a" * 64]
     ]
+
+
+def test_safe_report_rejects_mixed_backend_sources(tmp_path: Path) -> None:
+    first = response("completed", repetition=1)
+    second = response("completed", repetition=2)
+    for payload, backend in ((first, "korvid_readonly"), (second, "korvid_navigation")):
+        payload["evidence_source"] = {
+            "kind": backend, "korvid_version": "0.3.0", "scenario_sha256": "a" * 64,
+        }
+    root = write_live_fixture(tmp_path / "input", responses=[first, second], repetitions_per_case=2)
+    with pytest.raises(ValueError, match="mixed|same backend"):
+        write_safe_evidence(root, tmp_path / "safe")
+    assert not (tmp_path / "safe" / "round-summary.json").exists()
+
+
+def test_native_source_cannot_claim_legacy_product_version(tmp_path: Path) -> None:
+    payload = response("completed")
+    payload["evidence_source"] = {
+        "kind": "korvid_native", "korvid_version": "0.3.0", "scenario_sha256": "a" * 64,
+    }
+    root = write_live_fixture(tmp_path, responses=[payload])
+    with pytest.raises(ValueError, match="0.4.1|native.*version"):
+        build_round_report(root)
 
 
 def test_build_round_report_rejects_missing_duplicate_and_extra_evidence(tmp_path: Path) -> None:
