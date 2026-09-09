@@ -15,8 +15,10 @@ from current_helpers import (
 )
 
 from korvid_prompt_lab.contracts import Candidate, EvalCase
-from korvid_prompt_lab.experiment_budget import ExperimentBudget
+from korvid_prompt_lab.experiment_budget import BudgetExhausted, ExperimentBudget
 from korvid_prompt_lab.optimize import OptimizationArtifacts, optimize_campaign
+from korvid_prompt_lab.reflection import ProposalProviderError
+from korvid_prompt_lab.runner import BridgeInvocationError
 from korvid_prompt_lab.scoring import EvaluationResult
 
 
@@ -79,7 +81,12 @@ def test_optimize_requires_budget_and_exactly_one_proposal_source(
         )
 
 
-def test_rejected_later_proposal_preserves_a_fully_evaluated_winner(tmp_path: Path) -> None:
+def test_rejected_later_proposal_preserves_a_fully_evaluated_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "korvid_prompt_lab.reflection.validate_upstream_candidate", lambda *_args: None,
+    )
     train = [case("train-a"), case("train-b")]
     validation = [case("validation-a"), case("validation-b")]
     original = candidate()
@@ -104,6 +111,54 @@ def test_rejected_later_proposal_preserves_a_fully_evaluated_winner(tmp_path: Pa
     summary = read_json(result.summary_path)
     assert summary["invalid_proposals"] == 1
     assert summary["stop_reason"] == "proposal_rejected"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ValueError("source configuration failed"),
+        RuntimeError("programming error"),
+        BridgeInvocationError("source worker failed"),
+        ProposalProviderError("provider_timeout"),
+        BudgetExhausted("wall_clock"),
+    ],
+)
+def test_fatal_composition_validation_does_not_return_the_gepa_incumbent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception,
+) -> None:
+    train = [case("train-a"), case("train-b")]
+    validation = [case("validation-a"), case("validation-b")]
+    original = candidate()
+    incumbent = candidate("Use the original evidence carefully.")
+    runner = source_runner(
+        train, validation,
+        success=lambda proposed, selected: (
+            proposed.fingerprint != original.fingerprint and selected.case_id.endswith("-a")
+        ),
+    )
+
+    def validate(*args: Any) -> None:
+        if args[2].fingerprint != incumbent.fingerprint:
+            raise failure
+
+    monkeypatch.setattr("korvid_prompt_lab.reflection.validate_upstream_candidate", validate)
+    proposals = iter([incumbent.components, candidate("Another proposal.").components])
+    budget = ExperimentBudget(100, 4, 30)
+    with pytest.raises(type(failure)) as error:
+        optimize_campaign(
+            runner=runner, seed_candidate=original, train_cases=train,
+            validation_cases=validation, artifact_root=tmp_path,
+            max_metric_calls=40, candidate_proposer=lambda *_args: next(proposals),
+            budget=budget,
+        )
+    assert error.value is failure
+    assert budget.proposals == 2
+    assert budget.evaluations == len(runner.calls)
+    assert not list(tmp_path.rglob("best-candidate.yaml"))
+    audit_paths = list(tmp_path.rglob("proposal-audit.json"))
+    assert len(audit_paths) == 1
+    assert read_json(audit_paths[0])["invalid_proposals"] == 0
+    assert read_json(audit_paths[0])["provider_errors"] == 1
 
 
 def test_optimize_passes_current_contract_to_gepa_and_persists_winner(
@@ -320,7 +375,11 @@ def test_optimizer_does_not_double_count_a_runner_owned_budget(
 
 def test_real_gepa_selects_a_distinct_plaintext_prompt_at_the_proposal_cap(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "korvid_prompt_lab.reflection.validate_upstream_candidate", lambda *_args: None,
+    )
     train = [case(f"train-{index}") for index in range(3)]
     validation = [case(f"validation-{index}") for index in range(2)]
     budget = ExperimentBudget(40, 1, 30.0)
@@ -348,7 +407,11 @@ def test_real_gepa_selects_a_distinct_plaintext_prompt_at_the_proposal_cap(
 
 def test_real_gepa_preserves_the_winner_when_an_atomic_iteration_will_not_fit(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "korvid_prompt_lab.reflection.validate_upstream_candidate", lambda *_args: None,
+    )
     train = [case(f"train-{index}") for index in range(3)]
     validation = [case(f"validation-{index}") for index in range(2)]
     budget = ExperimentBudget(40, 10, 30.0)

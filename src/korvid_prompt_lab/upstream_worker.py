@@ -23,7 +23,11 @@ from korvid.agent.model_policy import (
     ResolvedAgentPolicy,
 )
 from korvid.agent.model_profiles import ConnectionAuthConfig, ModelConnectionConfig
-from korvid.agent.prompt_harness import PromptHarness, PromptInputs
+from korvid.agent.prompt_harness import (
+    PromptHarness,
+    PromptInputs,
+    StaticPromptTooLargeError,
+)
 from korvid.agent.prompt_packs import (
     COMMON_ROLE,
     MODEL_PROMPT_OVERLAYS,
@@ -448,6 +452,29 @@ async def _inspect(payload: Mapping[str, Any]) -> dict[str, Any]:
     return response
 
 
+async def _validate_candidate(payload: Mapping[str, Any]) -> dict[str, Any]:
+    model, profile = _model(payload.get("model"))
+    tier_pack = payload.get("tier_pack")
+    if not isinstance(tier_pack, str) or not tier_pack.strip():
+        raise ValueError("tier_pack must be a non-blank string")
+    policy = await _resolved_policy(profile, _script(payload.get("script")))
+    # A broken baseline is a source/configuration failure, not a bad proposal.
+    build_prompt_harness(policy, NO_GRIND).validate(policy)
+    error_label = None
+    try:
+        build_prompt_harness(policy, PromptGrind(tier_pack=tier_pack)).validate(policy)
+    except StaticPromptTooLargeError:
+        error_label = "static_prompt_too_large"
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "operation": "validate_candidate",
+        "model": model,
+        "tier_pack_sha256": _sha_text(tier_pack),
+        "valid": error_label is None,
+        "error_label": error_label,
+    }
+
+
 def _model_bound(error: str | None) -> bool:
     return error is not None and any(pattern.match(error) for pattern in _MODEL_BOUND_ERRORS)
 
@@ -515,8 +542,10 @@ async def _evaluate(payload: Mapping[str, Any]) -> dict[str, Any]:
     if prompt_path is not None:
         if not isinstance(prompt_path, str) or not prompt_path:
             raise TypeError("prompt_path must be a non-blank string")
-        if Path(prompt_path).read_text(encoding="utf-8") != tier_pack:
+        loaded_tier_pack = Path(prompt_path).read_text(encoding="utf-8")
+        if loaded_tier_pack != tier_pack:
             raise ValueError("reloaded optimized prompt differs from the candidate")
+        tier_pack = loaded_tier_pack
         prompt_path_verified = True
     kind, source, path, source_sha256 = _load_reference(
         payload.get("reference"), payload.get("source_sha256")
@@ -618,7 +647,9 @@ def run_request(payload: Mapping[str, Any]) -> dict[str, Any]:
         return asyncio.run(_inspect(payload))
     if operation == "evaluate":
         return asyncio.run(_evaluate(payload))
-    raise ValueError("operation must be 'inspect' or 'evaluate'")
+    if operation == "validate_candidate":
+        return asyncio.run(_validate_candidate(payload))
+    raise ValueError("operation must be 'inspect', 'evaluate', or 'validate_candidate'")
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:

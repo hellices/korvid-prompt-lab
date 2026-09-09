@@ -16,8 +16,8 @@ README.md. The user-agreed role takes precedence over any implementation descrip
 - Preserve original IDs, questions, fixtures, assertions, and whole journeys.
   Select original references; never invent variants, translate cases, or split
   dependent turns into independent examples. Lab fixtures test plumbing only.
-- `upstream.py` exports `inspect_upstream`, `KorvidUpstreamRunner`, and
-  `export_upstream_prompt`. `upstream_contract.py` holds source-reference and
+- `upstream.py` exports `inspect_upstream`, `validate_upstream_candidate`,
+  `KorvidUpstreamRunner`, and `export_upstream_prompt`. `upstream_contract.py` holds source-reference and
   prompt-pack metadata helpers. `source_runtime.py` is the subprocess launcher
   (`validate_source`, `run_upstream_request`). `upstream_worker.py` invokes the
   original Korvid loaders/runners/grader in the source environment.
@@ -46,6 +46,10 @@ README.md. The user-agreed role takes precedence over any implementation descrip
   and user approval. Do not change scoring or fixtures to make a candidate pass.
 - Do not reproduce Korvid with DSPy `ReAct`. DSPy and the teacher propose text;
   standalone `gepa.optimize` searches using original Korvid outcomes.
+- Validate proposals through Korvid's original composition validator before
+  evaluation; never duplicate its length policy. Candidate-only size rejection
+  preserves the evaluated incumbent. Source/provider/deadline errors remain fatal.
+  Static validation uses wall time, not evaluation calls or holdout cases.
 - `prompt_improved` and `qualified` reset to false on cleanup/system failure.
   Never relax score/pass criteria or fabricate evidence. Do not invent test
   counts or completion status.

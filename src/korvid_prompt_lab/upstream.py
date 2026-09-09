@@ -111,6 +111,34 @@ def inspect_upstream(
     }
 
 
+def validate_upstream_candidate(
+    serving: KorvidUpstreamServing,
+    model: str,
+    candidate: Candidate,
+) -> str | None:
+    """Return a candidate-only rejection label from Korvid, without inference."""
+    if serving.backend != "korvid_upstream" or serving.korvid_revision != KORVID_REVISION:
+        raise ValueError("candidate validation requires the reviewed upstream serving")
+    tier_pack = tier_pack_from_candidate(candidate)
+    identity = {
+        "protocol_version": UPSTREAM_PROTOCOL_VERSION,
+        "operation": "validate_candidate",
+        "model": _model_payload(model, serving, 0),
+    }
+    result = run_upstream_request(serving, {**identity, "tier_pack": tier_pack})
+    expected = {
+        **identity,
+        "tier_pack_sha256": hashlib.sha256(tier_pack.encode()).hexdigest(),
+    }
+    if any(result.get(key) != value for key, value in expected.items()):
+        raise ValueError("upstream candidate validation identity mismatch")
+    if result.get("valid") is True and result.get("error_label") is None:
+        return None
+    if result.get("valid") is False and result.get("error_label") == "static_prompt_too_large":
+        return "static_prompt_too_large"
+    raise ValueError("upstream candidate validation returned an invalid verdict")
+
+
 def _finite_nonnegative(value: Any, label: str) -> float:
     if (
         isinstance(value, bool)

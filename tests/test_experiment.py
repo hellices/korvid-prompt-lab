@@ -154,6 +154,9 @@ def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(experiment, "lab_identity", lambda: {"test_double": True})
     monkeypatch.setattr(experiment, "export_upstream_prompt", export)
     monkeypatch.setattr(experiment, "build_reflection_lm", lambda *args, **kwargs: teacher)
+    monkeypatch.setattr(
+        "korvid_prompt_lab.reflection.validate_upstream_candidate", lambda *_args: None,
+    )
     return state
 
 

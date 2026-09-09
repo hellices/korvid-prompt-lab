@@ -76,6 +76,93 @@ def test_inspect_upstream_launches_only_pinned_upstream_worker() -> None:
     assert snapshot["cases"] == endpoint_snapshot["cases"]
 
 
+def test_oversized_proposal_retains_the_fully_evaluated_gepa_incumbent(
+    tmp_path: Path,
+) -> None:
+    from current_helpers import FakeRunner, candidate
+
+    from korvid_prompt_lab.contracts import Candidate
+    from korvid_prompt_lab.experiment_budget import ExperimentBudget
+    from korvid_prompt_lab.optimize import optimize_campaign
+    from korvid_prompt_lab.source_runtime import run_upstream_request
+
+    references = (
+        "scenarios/image-pull-typo", "scenarios/healthy-deployment",
+        "scenarios/oom-killed", "scenarios/readiness-probe-failing",
+    )
+    cases = [source.eval_case("ollama/qwen3:0.6b")
+             for source in load_source_cases(SOURCE_ROOT, references)]
+    original = candidate()
+    incumbent = candidate("Use the original evidence carefully.")
+    oversized = candidate("A" * 4000)
+    checked: set[str] = set()
+
+    class CompositionCheckedRunner(FakeRunner):
+        def run(
+            self, proposed: Candidate, selected: EvalCase, run_dir: Path | str,
+            *, repetition: int = 1, seed: int = 0,
+        ) -> EvaluationResult:
+            # Exercise the real source composition failure without model inference.
+            if proposed.fingerprint not in checked:
+                run_upstream_request(_serving(), {
+                    "protocol_version": 1, "operation": "inspect",
+                    "references": list(references),
+                    "tier_pack": proposed.components["tier_pack"],
+                    "model": {
+                        "reference": "ollama/qwen3:0.6b",
+                        "endpoint": "http://127.0.0.1:1",
+                        "options": {"temperature": 0.0, "seed": 0},
+                    },
+                })
+                checked.add(proposed.fingerprint)
+            return super().run(
+                proposed, selected, run_dir, repetition=repetition, seed=seed,
+            )
+
+    runner = CompositionCheckedRunner(
+        cases,
+        splits=(("train", tuple(case.case_id for case in cases[:2])),
+                ("validation", tuple(case.case_id for case in cases[2:]))),
+        success=lambda proposed, selected: (
+            proposed.fingerprint != original.fingerprint
+            and selected in (cases[0], cases[2])
+        ),
+    )
+    runner.campaign = replace(runner.campaign, serving=_serving())
+    budget = ExperimentBudget(100, 4, 180)
+    proposals = iter([incumbent.components, oversized.components])
+    artifacts = optimize_campaign(
+        runner=runner, seed_candidate=original,
+        train_cases=cases[:2], validation_cases=cases[2:],
+        artifact_root=tmp_path, max_metric_calls=40,
+        candidate_proposer=lambda *_args: next(proposals), budget=budget,
+    )
+
+    assert artifacts.best_candidate.fingerprint == incumbent.fingerprint
+    assert artifacts.best_candidate_path.is_file()
+    assert artifacts.result.val_aggregate_scores[artifacts.result.best_idx] == 0.5
+    assert {case.case_id for proposed, case, _ in runner.calls
+            if proposed.fingerprint == incumbent.fingerprint} == {
+        case.case_id for case in cases
+    }
+    assert oversized.fingerprint not in checked
+    assert all(proposed.fingerprint != oversized.fingerprint
+               for proposed, _, _ in runner.calls)
+    assert budget.proposals == 2
+    assert budget.evaluations == len(runner.calls) == artifacts.result.total_metric_calls
+    summary = json.loads(artifacts.summary_path.read_text(encoding="utf-8"))
+    assert summary["stop_reason"] == "proposal_rejected"
+    assert summary["invalid_proposals"] == 1
+    assert summary["distinct_proposals"] == 1
+    assert summary["provider_errors"] == 0
+    assert summary["error_labels"] == {"static_prompt_too_large": 1}
+    audit = json.loads(
+        (artifacts.invocation_dir / "proposals/0002.json").read_text(encoding="utf-8")
+    )
+    assert audit["status"] == "invalid"
+    assert audit["proposed_components"] == oversized.components
+
+
 def _worker_result(
     case: EvalCase,
     *,

@@ -213,6 +213,110 @@ def test_inspection_validates_candidate_pack_through_actual_prompt_grind(
     }
 
 
+@pytest.mark.parametrize(
+    ("text", "label"),
+    [("Use source evidence.", None), ("A" * 4000, "static_prompt_too_large")],
+    ids=["valid", "oversized"],
+)
+def test_candidate_validation_uses_original_composition_without_inference(
+    worker: ModuleType, monkeypatch: pytest.MonkeyPatch, text: str, label: str | None,
+) -> None:
+    from korvid.agent.model_policy import ResolvedAgentPolicy
+    from korvid.agent.prompt_harness import PromptHarness
+    from korvid.evals.scripted import ScriptedProvider
+
+    validations: list[ResolvedAgentPolicy] = []
+    validate = PromptHarness.validate
+
+    def record_validation(
+        self: PromptHarness, policy: ResolvedAgentPolicy,
+        user_rules: tuple[str, ...] = (),
+    ) -> None:
+        validations.append(policy)
+        validate(self, policy, user_rules)
+
+    monkeypatch.setattr(PromptHarness, "validate", record_validation)
+    monkeypatch.setattr(
+        ScriptedProvider, "complete",
+        lambda *_args, **_kwargs: pytest.fail("validation must not invoke a model"),
+    )
+    monkeypatch.setattr(
+        worker, "_load_reference",
+        lambda *_args: pytest.fail("static validation must not read any split"),
+    )
+    result = worker.run_request({
+        "protocol_version": 1, "operation": "validate_candidate",
+        "model": _model(), "script": [[{"type": "done"}]], "tier_pack": text,
+    })
+
+    assert len(validations) == 2  # Baseline before candidate-specific classification.
+    assert validations[0] is validations[1]
+    assert result == {
+        "protocol_version": 1, "operation": "validate_candidate",
+        "model": _model(), "tier_pack_sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "valid": label is None, "error_label": label,
+    }
+
+
+@pytest.mark.parametrize(
+    ("failing_call", "exception_name"),
+    [
+        (1, "StaticPromptTooLargeError"),
+        (2, "UnknownPromptPackError"),
+        (2, "UnknownPromptOverlayError"),
+        (2, "ValueError"),
+        (2, "TypeError"),
+        (2, "RuntimeError"),
+    ],
+)
+def test_candidate_validation_does_not_reject_source_or_programming_errors(
+    worker: ModuleType, monkeypatch: pytest.MonkeyPatch,
+    failing_call: int, exception_name: str,
+) -> None:
+    import builtins
+
+    from korvid.agent import prompt_harness
+
+    exception_type = getattr(prompt_harness, exception_name, None) or getattr(builtins, exception_name)
+    failure = exception_type("source failure")
+    calls = 0
+    validate = prompt_harness.PromptHarness.validate
+
+    def fail_validation(
+        self: Any, policy: Any, user_rules: tuple[str, ...] = (),
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == failing_call:
+            raise failure
+        validate(self, policy, user_rules)
+
+    monkeypatch.setattr(prompt_harness.PromptHarness, "validate", fail_validation)
+    with pytest.raises(exception_type) as error:
+        worker.run_request({
+            "protocol_version": 1, "operation": "validate_candidate",
+            "model": _model(), "script": [[{"type": "done"}]], "tier_pack": "Revised.",
+        })
+    assert error.value is failure
+
+
+def test_candidate_validation_preserves_provider_factory_failures(
+    worker: ModuleType, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = worker.UpstreamWorkerError("provider configuration failed")
+
+    def fail(*_args: Any) -> None:
+        raise failure
+
+    monkeypatch.setattr(worker, "_live_provider", fail)
+    with pytest.raises(worker.UpstreamWorkerError) as error:
+        worker.run_request({
+            "protocol_version": 1, "operation": "validate_candidate",
+            "model": _model(), "tier_pack": "Revised.",
+        })
+    assert error.value is failure
+
+
 def test_scenario_evaluation_calls_original_loader_runner_and_grader(
     worker: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
@@ -299,6 +403,7 @@ def test_scenario_evaluation_calls_original_loader_runner_and_grader(
 def test_evaluation_reloads_the_exported_prompt_file(
     worker: ModuleType,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from korvid.agent.prompt_packs import PROMPT_PACKS
 
@@ -315,15 +420,36 @@ def test_evaluation_reloads_the_exported_prompt_file(
         ],
     )
     payload["prompt_path"] = str(prompt_path)
+    loaded: list[str] = []
+    constructed: list[str] = []
+    read_text = Path.read_text
+    prompt_grind = worker.PromptGrind
+
+    def record_read(self: Path, *args: Any, **kwargs: Any) -> str:
+        text = read_text(self, *args, **kwargs)
+        if self == prompt_path:
+            loaded.append(text)
+        return text
+
+    def record_grind(**kwargs: Any) -> Any:
+        constructed.append(kwargs["tier_pack"])
+        return prompt_grind(**kwargs)
+
+    monkeypatch.setattr(Path, "read_text", record_read)
+    monkeypatch.setattr(worker, "PromptGrind", record_grind)
 
     result = worker.run_request(payload)
 
     assert result["prompt_path_verified"] is True
+    assert len(loaded) == 1
+    assert constructed[0] is loaded[0]
+    assert constructed[0] is not payload["tier_pack"]
 
 
 def test_evaluation_rejects_a_prompt_file_different_from_the_candidate(
     worker: ModuleType,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = _request(
         "evaluate",
@@ -334,8 +460,28 @@ def test_evaluation_rejects_a_prompt_file_different_from_the_candidate(
     prompt_path = tmp_path / "optimized-prompt.txt"
     prompt_path.write_text("different prompt", encoding="utf-8")
     payload["prompt_path"] = str(prompt_path)
+    monkeypatch.setattr(
+        worker, "_provider_factory",
+        lambda *_args: pytest.fail("mismatched reload must fail before evaluation"),
+    )
 
     with pytest.raises(ValueError, match="differs"):
+        worker.run_request(payload)
+
+
+def test_evaluation_rejects_a_missing_prompt_file(
+    worker: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _request(
+        "evaluate", "scenarios/image-pull-typo", "candidate prompt",
+        [[{"type": "done"}]],
+    )
+    payload["prompt_path"] = str(tmp_path / "missing.txt")
+    monkeypatch.setattr(
+        worker, "_provider_factory",
+        lambda *_args: pytest.fail("missing reload must fail before evaluation"),
+    )
+    with pytest.raises(FileNotFoundError):
         worker.run_request(payload)
 
 

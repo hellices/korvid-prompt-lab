@@ -5,9 +5,17 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from current_helpers import FakeRunner, candidate, case, fake_gepa_result
+from current_helpers import (
+    MODEL,
+    FakeRunner,
+    candidate,
+    case,
+    fake_gepa_result,
+    serving,
+)
 
-from korvid_prompt_lab.experiment_budget import ExperimentBudget
+from korvid_prompt_lab.contracts import Candidate, KorvidUpstreamServing
+from korvid_prompt_lab.experiment_budget import BudgetExhausted, ExperimentBudget
 from korvid_prompt_lab.optimize import optimize_campaign
 from korvid_prompt_lab.reflection import (
     AuditedProposalSource,
@@ -15,6 +23,15 @@ from korvid_prompt_lab.reflection import (
     ProposalProviderError,
     ProposalRejected,
 )
+from korvid_prompt_lab.runner import BridgeInvocationError
+
+
+@pytest.fixture(autouse=True)
+def stub_source_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "korvid_prompt_lab.reflection.validate_upstream_candidate",
+        lambda *_args: None,
+    )
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -33,6 +50,8 @@ def audited_source(
         invocation_dir=tmp_path,
         seed_candidate=candidate(),
         budget=budget or ExperimentBudget(0, 10, 30.0),
+        serving=serving(),
+        model=MODEL,
     )
 
 
@@ -139,6 +158,88 @@ def test_proposal_failures_are_persisted_and_propagated_unchanged(
     record = read_json(tmp_path / "proposals/0001.json")
     assert record["status"] == "provider_error"
     assert "programming bug" not in json.dumps(record)
+
+
+def test_source_validation_is_deadline_bounded_and_does_not_consume_evaluations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    budget = ExperimentBudget(0, 1, 5.0, clock=lambda: clock[0])
+    proposed = candidate("Keep exact text.\n")
+    validated: list[Candidate] = []
+
+    def propose(*_args: Any) -> dict[str, str]:
+        clock[0] = 2.0
+        return proposed.components
+
+    def validate(
+        bounded: KorvidUpstreamServing, model: str, value: Candidate,
+    ) -> None:
+        assert bounded.timeout_seconds == 3.0
+        assert model == MODEL
+        assert budget.proposals == 1
+        assert budget.evaluations == 0
+        validated.append(value)
+
+    monkeypatch.setattr("korvid_prompt_lab.reflection.validate_upstream_candidate", validate)
+    source = audited_source(tmp_path, propose, budget=budget)
+    assert source(candidate().components, {}, ["tier_pack"]) == proposed.components
+    assert validated[0].fingerprint == proposed.fingerprint
+    assert budget.evaluations == 0
+    assert source.summary()["distinct_proposals"] == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ValueError("broken source configuration"),
+        RuntimeError("programming error"),
+        BridgeInvocationError("worker timeout"),
+        ProposalProviderError("provider_timeout"),
+    ],
+)
+def test_composition_validation_failures_remain_fatal_and_are_audited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception,
+) -> None:
+    def fail(*_args: Any) -> None:
+        raise failure
+
+    monkeypatch.setattr("korvid_prompt_lab.reflection.validate_upstream_candidate", fail)
+    budget = ExperimentBudget(0, 1, 30)
+    source = audited_source(tmp_path, lambda *_args: {"tier_pack": "Revised."}, budget=budget)
+    with pytest.raises(type(failure)) as error:
+        source(candidate().components, {}, ["tier_pack"])
+    assert error.value is failure
+    assert source.pending_exception is failure
+    assert source.summary()["provider_errors"] == 1
+    assert source.summary()["invalid_proposals"] == 0
+    assert budget.proposals == 1
+    assert budget.evaluations == 0
+
+
+@pytest.mark.parametrize("verdict", [None, "static_prompt_too_large", "timeout"])
+def test_composition_deadline_expiry_is_fatal_not_a_rejected_proposal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verdict: str | None,
+) -> None:
+    clock = [0.0]
+    budget = ExperimentBudget(0, 1, 5, clock=lambda: clock[0])
+
+    def validate(*_args: Any) -> str | None:
+        clock[0] = 5.0
+        if verdict == "timeout":
+            raise BridgeInvocationError("worker timed out")
+        return verdict
+
+    monkeypatch.setattr("korvid_prompt_lab.reflection.validate_upstream_candidate", validate)
+    source = audited_source(tmp_path, lambda *_args: {"tier_pack": "Revised."}, budget=budget)
+    with pytest.raises(BudgetExhausted) as error:
+        source(candidate().components, {}, ["tier_pack"])
+    assert error.value.reason == "wall_clock"
+    assert source.pending_exception is error.value
+    assert source.summary()["error_labels"] == {"budget_wall_clock": 1}
+    assert source.summary()["invalid_proposals"] == 0
+    assert budget.proposals == 1
+    assert budget.evaluations == 0
 
 
 def test_optimizer_always_emits_current_proposal_audit_fields(

@@ -5,6 +5,7 @@ import math
 import sys
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -12,8 +13,9 @@ import dspy  # type: ignore[import-untyped]
 import litellm  # type: ignore[import-untyped]
 
 from .artifacts import write_json_artifact
-from .contracts import Candidate
+from .contracts import Candidate, KorvidUpstreamServing
 from .experiment_budget import BudgetExhausted, ExperimentBudget
+from .upstream import validate_upstream_candidate
 from .upstream_contract import tier_pack_from_candidate
 
 _LITELLM_PROVIDER_ERRORS: tuple[type[Exception], ...] = tuple(
@@ -122,12 +124,16 @@ class AuditedProposalSource:
         invocation_dir: Path,
         seed_candidate: Candidate,
         budget: ExperimentBudget,
+        serving: KorvidUpstreamServing,
+        model: str,
     ) -> None:
         self.proposer = proposer
         self.source = source
         self.invocation_dir = invocation_dir
         self.seed_candidate = seed_candidate
         self.budget = budget
+        self.serving = serving
+        self.model = model
         self.pending_exception: Exception | None = None
         tier_pack_from_candidate(seed_candidate)
         self._records: list[dict[str, Any]] = []
@@ -187,6 +193,23 @@ class AuditedProposalSource:
             record["status"] = "duplicate"
             self._persist(record)
             raise DuplicateProposal("duplicate proposal")
+
+        try:
+            self.budget.check()
+            serving = replace(
+                self.serving,
+                timeout_seconds=min(self.serving.timeout_seconds, self.budget.remaining_seconds),
+            )
+            try:
+                error_label = validate_upstream_candidate(serving, self.model, proposed)
+            finally:
+                self.budget.check()
+            if error_label is not None:
+                raise ProposalRejected(error_label)
+        finally:
+            failure = sys.exception()
+            if isinstance(failure, Exception):
+                self._record_source_failure(record, failure)
 
         self._seen_fingerprints.add(fingerprint)
         self._candidate_fingerprints.append(fingerprint)

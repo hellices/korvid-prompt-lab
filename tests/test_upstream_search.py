@@ -6,10 +6,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from current_helpers import MODEL, campaign, candidate, case
+from current_helpers import MODEL, campaign, candidate, case, serving
 
 from korvid_prompt_lab.runner import BridgeInvocationError
-from korvid_prompt_lab.upstream import KorvidUpstreamRunner
+from korvid_prompt_lab.upstream import KorvidUpstreamRunner, validate_upstream_candidate
 from korvid_prompt_lab.upstream_contract import (
     KORVID_REVISION,
     KORVID_VERSION,
@@ -241,4 +241,77 @@ def test_upstream_runner_propagates_source_runtime_failures(
             tmp_path,
         )
 
+    assert error.value is failure
+
+
+def validation_response() -> dict[str, Any]:
+    return {
+        "protocol_version": 1,
+        "operation": "validate_candidate",
+        "model": {
+            "reference": MODEL,
+            "endpoint": serving().base_url,
+            "options": {"temperature": 0.0, "seed": 0},
+        },
+        "tier_pack_sha256": hashlib.sha256(
+            candidate().components["tier_pack"].encode()
+        ).hexdigest(),
+        "valid": True,
+        "error_label": None,
+    }
+
+
+@pytest.mark.parametrize("label", [None, "static_prompt_too_large"])
+def test_upstream_candidate_validation_attests_the_exact_text_without_case_access(
+    monkeypatch: pytest.MonkeyPatch, label: str | None,
+) -> None:
+    def invoke(actual_serving: object, payload: dict[str, Any]) -> dict[str, Any]:
+        assert actual_serving == serving()
+        assert payload == {
+            "protocol_version": 1, "operation": "validate_candidate",
+            "model": validation_response()["model"],
+            "tier_pack": candidate().components["tier_pack"],
+        }
+        return {**validation_response(), "valid": label is None, "error_label": label}
+
+    monkeypatch.setattr("korvid_prompt_lab.upstream.run_upstream_request", invoke)
+    assert validate_upstream_candidate(serving(), MODEL, candidate()) == label
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"protocol_version": 2},
+        {"operation": "evaluate"},
+        {"model": {"reference": "different"}},
+        {"tier_pack_sha256": "0" * 64},
+        {"valid": 1},
+        {"valid": None},
+        {"valid": False, "error_label": None},
+        {"valid": False, "error_label": "unknown_prompt_pack"},
+        {"valid": True, "error_label": "static_prompt_too_large"},
+    ],
+)
+def test_upstream_candidate_validation_rejects_unattested_or_malformed_verdicts(
+    monkeypatch: pytest.MonkeyPatch, changed: dict[str, Any],
+) -> None:
+    monkeypatch.setattr(
+        "korvid_prompt_lab.upstream.run_upstream_request",
+        lambda *_args: {**validation_response(), **changed},
+    )
+    with pytest.raises(ValueError, match="candidate validation"):
+        validate_upstream_candidate(serving(), MODEL, candidate())
+
+
+def test_upstream_candidate_validation_never_reclassifies_bridge_error_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = BridgeInvocationError("StaticPromptTooLargeError: static prompt too large")
+
+    def fail(*_args: Any) -> dict[str, Any]:
+        raise failure
+
+    monkeypatch.setattr("korvid_prompt_lab.upstream.run_upstream_request", fail)
+    with pytest.raises(BridgeInvocationError) as error:
+        validate_upstream_candidate(serving(), MODEL, candidate())
     assert error.value is failure

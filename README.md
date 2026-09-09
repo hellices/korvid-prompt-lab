@@ -197,6 +197,13 @@ Resume 미지원. 기존 artifact 루트 거부.
 `PREFLIGHT_INCONCLUSIVE` ≠ 깨진 라우트 증명. holdout 실패 시 최적화 재진입 불가.
 Provider 실패 → 프롬프트 점수 없음. 자동 재시도·holdout 피드백 검색 없음.
 
+새 제안은 모델 평가 전에 **Korvid 원본 `PromptHarness.validate()`**로 정적 합성을 검사합니다.
+원본 길이 제한을 넘는 후보는 `static_prompt_too_large`로 기록하고 해당 탐색을 중단하되,
+이미 완전히 평가된 최선 후보는 보존합니다. Lab에 별도 길이 정책을 복제하지 않습니다.
+검사 자체는 모델·시나리오 호출 없이 전체 wall-clock 예산과 제한된 worker timeout을 사용하며,
+평가 호출 수를 차감하지 않습니다. 원본 baseline·소스·provider·프로그래밍 오류와 시간 초과는
+후보 거부로 바꾸지 않고 시스템/예산 오류로 전파합니다.
+
 ### 종료 코드
 
 | 코드 | 의미 |

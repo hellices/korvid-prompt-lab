@@ -20,6 +20,7 @@ from .contracts import (
     Campaign,
     Candidate,
     EvalCase,
+    KorvidUpstreamServing,
 )
 from .experiment_budget import BudgetExhausted, ExperimentBudget
 from .reflection import (
@@ -110,12 +111,17 @@ def optimize_campaign(
 
     if custom_candidate_proposer is None:
         raise ValueError("optimization requires a candidate proposal source")
+    serving = runner.campaign.serving
+    if not isinstance(serving, KorvidUpstreamServing):
+        raise ValueError("optimization requires upstream candidate validation")  # noqa: TRY004
     audited_proposer = AuditedProposalSource(
             proposer=custom_candidate_proposer,
             source=proposal_source,
             invocation_dir=invocation_dir,
             seed_candidate=seed_candidate,
             budget=budget,
+            serving=serving,
+            model=runner.campaign.models[0],
         )
     runner_for_adapter = _runner_with_budget(runner, budget)
     adapter = KorvidGEPAAdapter(
