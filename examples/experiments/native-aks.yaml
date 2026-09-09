@@ -1,6 +1,7 @@
 # Unified native experiment (schema_version 2) - AKS port-forward serving.
 #
-# Runs the complete native Korvid v0.4.1 campaign against an Ollama service inside
+# Runs a seven-case calibration subset of original Korvid v0.4.1 evaluations,
+# not the full 33-case corpus, against an Ollama service inside
 # the owner-specific `aks-shared-runners` cluster in `rg-pension-guard`, reached
 # through a single private port-forward for the whole campaign. The coordinates
 # below are owner-specific; the model/teacher digests are the captured values and

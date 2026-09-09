@@ -218,6 +218,8 @@ Provider 실패 → 프롬프트 점수 없음. 자동 재시도·holdout 피드
 
 AKS: 기본 변경 없음. `node_pool` 0일 때 `--allow-capacity-changes`로만 0→1.
 우리가 올린 풀만 정리 시 복원. **SIGKILL 시 정리 보장 불가** — artifact 확인 후 수동 회수.
+시작 시 활성 Azure 구독 ID를 고정해 discovery·credentials·scale·정리에 명시적으로 사용하고
+`model-session.json`에 기록합니다. 실행 중 CLI 기본 구독을 바꿔도 대상이 바뀌지 않습니다.
 
 현재 풀(`Standard_D32s_v5`)은 GPU 없음. 3.5 CPU/10 GiB 병목.
 14B teacher warm ~80–111초, cold 180초 초과 관측 → 360초 허용. 예산 선언 필수.

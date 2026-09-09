@@ -23,6 +23,7 @@ from korvid_prompt_lab.upstream_contract import KORVID_REVISION
 
 TARGET_DIGEST = f"sha256:{'1' * 64}"
 REFLECTION_DIGEST = f"sha256:{'2' * 64}"
+SUBSCRIPTION_ID = "11111111-1111-1111-1111-111111111111"
 
 
 def _spec(serving: LoopbackConnection | AKSConnection) -> ExperimentSpec:
@@ -184,6 +185,15 @@ class FakeForward:
         self.closed = True
 
 
+@pytest.fixture
+def resolved_subscription(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "korvid_prompt_lab.model_session._resolve_subscription",
+        lambda *, budget: SUBSCRIPTION_ID,
+    )
+
+
+@pytest.mark.usefixtures("resolved_subscription")
 def test_aks_session_composes_native_runtime_and_reuses_one_forward(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -222,6 +232,7 @@ def test_aks_session_composes_native_runtime_and_reuses_one_forward(
     assert FakeForward.instances[0].closed
 
 
+@pytest.mark.usefixtures("resolved_subscription")
 def test_aks_transient_preflight_is_retried_and_failed_listener_is_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -249,6 +260,103 @@ class Completed:
     stderr: str = ""
 
 
+@pytest.mark.parametrize("drift_at", ["discovery", "evaluation"])
+def test_aks_subscription_is_bound_across_startup_and_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift_at: str,
+) -> None:
+    other_subscription = "22222222-2222-2222-2222-222222222222"
+    default_subscription = SUBSCRIPTION_ID
+    counts = {SUBSCRIPTION_ID: 0, other_subscription: 3}
+    calls: list[tuple[str, ...]] = []
+    forward_subscriptions: list[str] = []
+
+    def run(args: tuple[str, ...], **kwargs: Any) -> Completed:
+        nonlocal default_subscription
+        calls.append(args)
+        if args[:3] == ("az", "account", "show"):
+            return Completed(stdout=f"{default_subscription}\n")
+        subscription = (
+            args[args.index("--subscription") + 1]
+            if "--subscription" in args else default_subscription
+        )
+        if args[:3] == ("az", "aks", "nodepool"):
+            if "show" in args:
+                count = counts[subscription]
+                if drift_at == "discovery":
+                    default_subscription = other_subscription
+                return Completed(stdout=f"{count}\n")
+            counts[subscription] = int(args[args.index("--node-count") + 1])
+        else:
+            forward_subscriptions.append(subscription)
+        return Completed()
+
+    class DiscoveringForward(FakeForward):
+        def __enter__(self) -> Self:
+            self.kwargs["command_runner"](("az", "aks", "show"))
+            self.kwargs["command_runner"](("az", "aks", "get-credentials"))
+            return super().__enter__()
+
+    FakeForward.instances.clear()
+    FakeForward.enter_effects = []
+    FakeHttpClient.payloads = [_model_payload(), {"version": "0.11.4"}]
+    monkeypatch.setattr("korvid_prompt_lab.model_session.subprocess.run", run)
+    monkeypatch.setattr("korvid_prompt_lab.model_session.AKSPortForward", DiscoveringForward)
+    monkeypatch.setattr("korvid_prompt_lab.model_session.httpx.Client", FakeHttpClient)
+    spec = _spec(
+        AKSConnection("aks_port_forward", "rg", "aks", "models", "ollama", node_pool="eval")
+    )
+
+    with model_session(spec, tmp_path, allow_capacity_changes=True):
+        default_subscription = other_subscription
+
+    assert counts == {SUBSCRIPTION_ID: 0, other_subscription: 3}
+    assert forward_subscriptions == [SUBSCRIPTION_ID, SUBSCRIPTION_ID]
+    account_calls = [call for call in calls if call[:2] == ("az", "account")]
+    assert len(account_calls) == 1
+    for call in calls:
+        if call[:2] == ("az", "aks"):
+            assert call[call.index("--subscription") + 1] == SUBSCRIPTION_ID
+    evidence = json.loads((tmp_path / "model-session.json").read_text())
+    assert evidence["connection"]["subscription_id"] == SUBSCRIPTION_ID
+    assert evidence["status"] == "closed"
+
+
+@pytest.mark.parametrize("result", [
+    Completed(stdout=""),
+    Completed(stdout="not-a-subscription\n"),
+    Completed(returncode=1),
+])
+def test_invalid_subscription_prevents_aks_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, result: Completed,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def run(args: tuple[str, ...], **kwargs: Any) -> Completed:
+        calls.append(args)
+        return result
+
+    FakeForward.instances.clear()
+    FakeForward.enter_effects = []
+    FakeHttpClient.payloads = [_model_payload(), {"version": "0.11.4"}]
+    monkeypatch.setattr("korvid_prompt_lab.model_session.subprocess.run", run)
+    monkeypatch.setattr("korvid_prompt_lab.model_session.AKSPortForward", FakeForward)
+    monkeypatch.setattr("korvid_prompt_lab.model_session.httpx.Client", FakeHttpClient)
+    spec = _spec(AKSConnection("aks_port_forward", "rg", "aks", "models", "ollama"))
+
+    with (
+        pytest.raises(ModelSessionError, match="subscription"),
+        model_session(spec, tmp_path),
+    ):
+        pass
+
+    assert len(calls) == 1
+    assert calls[0][:3] == ("az", "account", "show")
+    assert not FakeForward.instances
+    evidence = json.loads((tmp_path / "model-session.json").read_text())
+    assert evidence["status"] == "failed"
+
+
+@pytest.mark.usefixtures("resolved_subscription")
 def test_owned_zero_node_pool_is_restored_when_evaluation_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -295,6 +403,7 @@ def test_owned_zero_node_pool_is_restored_when_evaluation_fails(
     assert evidence["status"] == "failed"
 
 
+@pytest.mark.usefixtures("resolved_subscription")
 def test_zero_node_pool_requires_explicit_capacity_permission(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -323,6 +432,7 @@ def test_zero_node_pool_requires_explicit_capacity_permission(
     assert FakeForward.instances == []
 
 
+@pytest.mark.usefixtures("resolved_subscription")
 def test_running_node_pool_is_never_resized(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -362,6 +472,7 @@ def test_running_node_pool_is_never_resized(
     assert evidence["node_pool"]["capacity_changed"] is False
 
 
+@pytest.mark.usefixtures("resolved_subscription")
 def test_restore_failure_is_surfaced_without_hiding_primary_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -415,6 +526,7 @@ def test_restore_failure_is_surfaced_without_hiding_primary_error(
     assert FakeForward.instances[0].closed
 
 
+@pytest.mark.usefixtures("resolved_subscription")
 def test_permanent_aks_preflight_failure_is_not_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -434,6 +546,7 @@ def test_permanent_aks_preflight_failure_is_not_retried(
     assert len(FakeForward.instances) == 1
 
 
+@pytest.mark.usefixtures("resolved_subscription")
 def test_scale_timeout_still_restores_owned_zero_node_pool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -476,6 +589,7 @@ def test_scale_timeout_still_restores_owned_zero_node_pool(
     assert scale_counts == ["1", "0"]
 
 
+@pytest.mark.usefixtures("resolved_subscription")
 def test_session_cannot_close_when_owned_node_pool_was_not_restored(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -574,6 +688,8 @@ def test_budget_clips_bootstrap_subprocess_http_and_forward_timeouts(
 
     def run(args, **kwargs):
         subprocess_timeouts.append(kwargs["timeout"])
+        if args[:3] == ("az", "account", "show"):
+            return Completed(stdout=f"{SUBSCRIPTION_ID}\n")
         return Completed(stdout=next(show_results))
 
     monkeypatch.setattr("korvid_prompt_lab.model_session.subprocess.run", run)
@@ -587,7 +703,7 @@ def test_budget_clips_bootstrap_subprocess_http_and_forward_timeouts(
     with model_session(spec, tmp_path, budget=budget):
         pass
 
-    assert subprocess_timeouts[0] <= 0.25
+    assert all(timeout <= 0.25 for timeout in subprocess_timeouts[:-1])
     assert subprocess_timeouts[-1] == 30
     assert FakeForward.instances[0].kwargs["port_forward_ready_timeout_seconds"] <= 0.25
     assert FakeHttpClient.instances[0].kwargs["timeout"].connect <= 0.25

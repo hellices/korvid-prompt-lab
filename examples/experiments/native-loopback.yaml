@@ -1,7 +1,8 @@
 # Unified native experiment (schema_version 2) - loopback serving.
 #
-# Runs the complete native Korvid v0.4.1 campaign against a local Ollama endpoint
-# reached over a loopback URL (KORVID_NATIVE_MODEL_URL). The model/teacher digests
+# Runs a seven-case calibration subset of original Korvid v0.4.1 evaluations,
+# not the full 33-case corpus, against an Ollama endpoint reached over a loopback
+# URL (KORVID_NATIVE_MODEL_URL). The model/teacher digests
 # are the captured values and are re-verified live against /api/tags. This is an
 # EXAMPLE, not a recorded cloud run - point it at your own endpoint/models.
 #

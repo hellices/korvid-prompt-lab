@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import httpx
 
@@ -146,7 +147,9 @@ def _verify_endpoint(
     return {"models": models, "api_version": version}
 
 
-def _node_pool_command(connection: AKSConnection, *args: str) -> tuple[str, ...]:
+def _node_pool_command(
+    connection: AKSConnection, subscription_id: str, *args: str
+) -> tuple[str, ...]:
     assert connection.node_pool is not None
     return (
         "az",
@@ -159,6 +162,8 @@ def _node_pool_command(connection: AKSConnection, *args: str) -> tuple[str, ...]
         connection.cluster_name,
         "--name",
         connection.node_pool,
+        "--subscription",
+        subscription_id,
     )
 
 
@@ -184,11 +189,15 @@ def _run_az(
 
 
 def _node_pool_count(
-    connection: AKSConnection, *, budget: ExperimentBudget | None = None
+    connection: AKSConnection,
+    subscription_id: str,
+    *,
+    budget: ExperimentBudget | None = None,
 ) -> int:
     result = _run_az(
         _node_pool_command(
             connection,
+            subscription_id,
             "show",
             "--query",
             "count",
@@ -210,6 +219,7 @@ def _node_pool_count(
 
 def _scale_node_pool(
     connection: AKSConnection,
+    subscription_id: str,
     count: int,
     *,
     budget: ExperimentBudget | None = None,
@@ -217,6 +227,7 @@ def _scale_node_pool(
     _run_az(
         _node_pool_command(
             connection,
+            subscription_id,
             "scale",
             "--node-count",
             str(count),
@@ -242,6 +253,22 @@ def _run_aks_preflight_command(
         raise ModelSessionError("AKS preflight command failed") from exc
 
 
+def _resolve_subscription(*, budget: ExperimentBudget | None) -> str:
+    result = _run_aks_preflight_command(
+        (
+            "az", "account", "show", "--query", "id",
+            "--output", "tsv", "--only-show-errors",
+        ),
+        budget=budget,
+    )
+    if result.returncode != 0:
+        raise ModelSessionError("AKS subscription lookup failed")
+    try:
+        return str(UUID(result.stdout.strip()))
+    except ValueError as exc:
+        raise ModelSessionError("AKS subscription lookup returned an invalid ID") from exc
+
+
 def _aks_preflight_http(
     url: str, *, budget: ExperimentBudget | None
 ) -> Mapping[str, Any]:
@@ -260,6 +287,7 @@ def _open_aks_forward(
     connection: AKSConnection,
     work_dir: Path,
     *,
+    subscription_id: str,
     budget: ExperimentBudget | None = None,
 ) -> AKSPortForward:
     serving = AKSForwardTarget(
@@ -281,7 +309,8 @@ def _open_aks_forward(
             serving,
             workspace_dir=work_dir,
             command_runner=lambda args: _run_aks_preflight_command(
-                args, budget=budget
+                (*args, "--subscription", subscription_id) if args[0] == "az" else args,
+                budget=budget,
             ),
             http_get_json=lambda url: _aks_preflight_http(url, budget=budget),
             port_forward_ready_timeout_seconds=_bounded_timeout(
@@ -346,13 +375,19 @@ def model_session(
     forward: AKSPortForward | None = None
     base_url: str | None = None
     original_count: int | None = None
+    subscription_id: str | None = None
     scaled_from_zero = False
     cleanup_errors: list[Exception] = []
 
     try:
         if isinstance(connection, AKSConnection):
+            subscription_id = _resolve_subscription(budget=budget)
+            evidence["connection"]["subscription_id"] = subscription_id
+            write_json_artifact(artifact_path, evidence)
             if connection.node_pool is not None:
-                original_count = _node_pool_count(connection, budget=budget)
+                original_count = _node_pool_count(
+                    connection, subscription_id, budget=budget
+                )
                 evidence["node_pool"] = {
                     "name": connection.node_pool,
                     "original_count": original_count,
@@ -366,9 +401,10 @@ def model_session(
                         )
                     scaled_from_zero = True
                     evidence["node_pool"]["capacity_changed"] = True
-                    _scale_node_pool(connection, 1, budget=budget)
+                    _scale_node_pool(connection, subscription_id, 1, budget=budget)
             forward = _open_aks_forward(
-                spec, connection, directory, budget=budget
+                spec, connection, directory,
+                subscription_id=subscription_id, budget=budget,
             )
             base_url = forward.base_url
             evidence["connection"]["resolved_base_url"] = base_url
@@ -426,24 +462,30 @@ def model_session(
                 )
             except (AKSPortForwardError, OSError, subprocess.SubprocessError) as exc:
                 cleanup_errors.append(exc)
-        if isinstance(connection, AKSConnection) and connection.node_pool is not None:
+        if (
+            isinstance(connection, AKSConnection)
+            and connection.node_pool is not None
+            and original_count is not None
+        ):
+            assert subscription_id is not None
             if scaled_from_zero:
                 try:
-                    _scale_node_pool(connection, 0)
+                    _scale_node_pool(connection, subscription_id, 0)
                 except ModelSessionError as exc:
                     cleanup_errors.append(exc)
-            if original_count is not None:
-                try:
-                    evidence["node_pool"]["final_count"] = _node_pool_count(connection)
-                except ModelSessionError as exc:
-                    cleanup_errors.append(exc)
-                else:
-                    if evidence["node_pool"]["final_count"] != original_count:
-                        cleanup_errors.append(
-                            ModelSessionError(
-                                "AKS node pool was not restored to its original count"
-                            )
+            try:
+                evidence["node_pool"]["final_count"] = _node_pool_count(
+                    connection, subscription_id
+                )
+            except ModelSessionError as exc:
+                cleanup_errors.append(exc)
+            else:
+                if evidence["node_pool"]["final_count"] != original_count:
+                    cleanup_errors.append(
+                        ModelSessionError(
+                            "AKS node pool was not restored to its original count"
                         )
+                    )
         if primary is None and not cleanup_errors:
             evidence["status"] = "closed"
         elif primary is None:
